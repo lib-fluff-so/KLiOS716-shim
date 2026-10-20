@@ -276,6 +276,12 @@ void shim_main(u64 dtb, u64 x1, u64 x2, u64 x3, u64 base)
     u64 freq = RD(cntfrq_el0);
     if (!freq) freq = 13000000;
 
+#ifdef EMULATOR_COMPAT
+    /* The Unicorn harness is not a secure monitor: emulate the two PSCI
+     * return values so the framebuffer path can be tested independently. */
+    u64 psci_ver = 0x00010001UL;
+    u64 psci_cpu_on_features = 0;
+#else
     /* Query PSCI_VERSION through the SMC conduit advertised by the DTB. */
     register u64 psci_ver __asm__("x0") = 0x84000000UL;
     __asm__ volatile(
@@ -297,6 +303,7 @@ void shim_main(u64 dtb, u64 x1, u64 x2, u64 x3, u64 base)
         : "x2", "x3", "memory", "cc"
     );
     u64 psci_cpu_on_features = psci_features_fid;
+#endif
 
     const u8 *d = (const u8 *)dtb;
     u32 magic = 0, size = 0;
@@ -377,9 +384,16 @@ void shim_main(u64 dtb, u64 x1, u64 x2, u64 x3, u64 base)
     }
     show(freq, 4);
 
-    /* PSCI SYSTEM_RESET (smc conduit per DTB), then MTK TOPRGU software reset as fallback */
+#ifdef EMULATOR_COMPAT
+    /* Let the Unicorn harness stop after page 4 and write its PNG snapshots.
+     * This BRK is never present in a normal hardware build. */
+    __asm__ volatile("brk #0");
+    for (;;) __asm__ volatile("wfe");
+#else
+    /* PSCI SYSTEM_RESET (smc conduit per DTB), then MTK TOPRGU fallback. */
     register u64 r0 __asm__("x0") = 0x84000009UL;
     __asm__ volatile("smc #0" : "+r"(r0) : : "x1", "x2", "x3", "memory");
     *(volatile u32 *)(WDT_BASE + 0x14) = 0x1209;
     for (;;) __asm__ volatile("wfe");
+#endif
 }

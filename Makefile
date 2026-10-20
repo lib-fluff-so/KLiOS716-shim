@@ -3,11 +3,15 @@ CFLAGS  = -O2 -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector
           -mgeneral-regs-only -mstrict-align -Wall -Wextra -Wno-unused-parameter
 LD      = ld.lld
 OBJCOPY = llvm-objcopy
-OUT     = out
+OUT     ?= out
 TEST_EXCEPTION_VECTORS ?= 0
 
-# Set TEST_EXCEPTION_VECTORS=1 for a deliberate UDF exception test. Always
-# rebuild after changing this option: make clean && make TEST_EXCEPTION_VECTORS=1.
+ifeq ($(EMULATOR_COMPAT),1)
+CFLAGS += -DEMULATOR_COMPAT=1
+endif
+
+# Build the deliberate UDF exception test into its own output directory with
+# OUT=out-exception TEST_EXCEPTION_VECTORS=1 to keep it separate from normal images.
 $(OUT)/main.o: CFLAGS += -DTEST_EXCEPTION_VECTORS=$(TEST_EXCEPTION_VECTORS)
 
 all: $(OUT)/shim_b.img $(OUT)/shim_raw_b.img
@@ -32,6 +36,10 @@ $(OUT)/shim_raw_b.img: $(OUT)/Image $(OUT)/ramdisk.cpio.gz
 	python3 tools/mkboot.py $(OUT)/Image $(OUT)/ramdisk.cpio.gz $@
 $(OUT):
 	mkdir -p $(OUT)
+emutest:
+	$(MAKE) OUT=out-emu clean
+	$(MAKE) OUT=out-emu EMULATOR_COMPAT=1 all
+	python3 tools/emutest.py out-emu/Image fdt.dtb
 clean:
 	rm -f $(OUT)/*
-.PHONY: all clean
+.PHONY: all clean emutest

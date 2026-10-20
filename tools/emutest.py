@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Run out/Image in Unicorn (AArch64) with fake sysregs, dump the framebuffer to PNG (both strides)."""
+"""Run an EMULATOR_COMPAT AArch64 image in Unicorn and capture the visible framebuffer pages."""
 import sys, struct
+from pathlib import Path
 from unicorn import *
 from unicorn.arm64_const import *
 from PIL import Image
@@ -8,6 +9,9 @@ from PIL import Image
 img = open(sys.argv[1] if len(sys.argv) > 1 else 'out/Image', 'rb').read()
 BASE = 0x48000000
 FB = 0xFDFFF000
+FB_W, FB_H = 1080, 2436
+STRIDE_A, STRIDE_B = 4320, 4352
+VISIBLE_OFF = 1230 * STRIDE_B  # visible region proved on the physical device
 DTB = 0x4F000000
 mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
 mu.mem_map(0x40000000, 0x10000000)          # RAM 0x40000000..0x50000000
@@ -36,10 +40,8 @@ regs = {
 }
 tick = [0]
 SNAPS = {}
-snap_times = [6, 18, 30, 42]
-def on_insn(uc, reg, cp_reg, user):
-    # unicorn passes the sysreg description; fall back to counting
-    return False
+# Four 4-second pages; capture each page near its midpoint.
+snap_times = [2, 6, 10, 14]
 log = []
 def hook_mrs(uc, reg, cp_reg, user_data):
     # cp_reg is a tuple (crn, crm, op0, op1, op2) in unicorn 2.x
@@ -56,7 +58,7 @@ def hook_mrs(uc, reg, cp_reg, user_data):
         val = tick[0]
         for n, st in enumerate(snap_times):
             if n not in SNAPS and tick[0] >= st * 13000000:
-                SNAPS[n] = bytes(uc.mem_read(FB, 2436 * 4320))
+                SNAPS[n] = bytes(uc.mem_read(FB + VISIBLE_OFF, FB_H * STRIDE_B))
     elif key in table:
         val = table[key]
     else:
@@ -64,10 +66,6 @@ def hook_mrs(uc, reg, cp_reg, user_data):
     uc.reg_write(reg, val)
     return True
 mu.hook_add(UC_HOOK_INSN, hook_mrs, None, 1, 0, UC_ARM64_INS_MRS)
-hit_smc = []
-def hook_smc(uc, *a):
-    hit_smc.append(uc.reg_read(UC_ARM64_REG_X0)); uc.emu_stop()
-mu.hook_add(UC_HOOK_INSN, hook_smc, None, 1, 0, UC_ARM64_INS_SVC) if False else None
 mu.reg_write(UC_ARM64_REG_X0, DTB)
 try:
     mu.emu_start(BASE, 0, count=400_000_000)
@@ -75,21 +73,22 @@ except UcError as e:
     pc = mu.reg_read(UC_ARM64_REG_PC)
     print('stopped:', e, 'pc=', hex(pc), 'off=', hex(pc - BASE), 'x0=', hex(mu.reg_read(UC_ARM64_REG_X0)))
 print('unknown sysregs:', set(log))
-fb = bytes(mu.mem_read(FB, 2436 * 4352))
+fb = bytes(mu.mem_read(FB + VISIBLE_OFF, FB_H * STRIDE_B))
 from PIL import Image as _I
+Path('out').mkdir(parents=True, exist_ok=True)
 for n, raw in SNAPS.items():
-    im = _I.frombuffer('RGBA', (1080, 2436), raw, 'raw', 'BGRA', 0, 1).convert('RGB')
+    # The actual framebuffer stride is 4352, not tightly packed 1080*4=4320.
+    im = _I.frombuffer('RGBA', (FB_W, FB_H), raw, 'raw', 'BGRA', STRIDE_B, 1).convert('RGB')
     im.save(f'out/emu_page{n+1}.png'); print('saved page', n+1)
-for name, stride in (('A4320', 4320), ('B4352', 4352)):
-    im = Image.new('RGB', (1080, 2436))
-    px = im.load()
-    row = [fb[y*stride:(y*stride)+4320] for y in range(2436)]
+for name, stride in (('A4320', STRIDE_A), ('B4352', STRIDE_B)):
+    im = Image.new('RGB', (FB_W, FB_H))
+    row = [fb[y*stride:(y*stride)+FB_W*4] for y in range(FB_H)]
     # fast path: build from bytes (little endian XRGB: B,G,R,X)
     data = bytearray()
     for r in row:
-        for x in range(1080):
+        for x in range(FB_W):
             b, g, rr = r[x*4], r[x*4+1], r[x*4+2]
             data += bytes((rr, g, b))
-    im = Image.frombytes('RGB', (1080, 2436), bytes(data))
+    im = Image.frombytes('RGB', (FB_W, FB_H), bytes(data))
     im.save(f'out/emu_{name}.png')
     print('saved', f'out/emu_{name}.png')
