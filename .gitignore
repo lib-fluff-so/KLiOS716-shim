@@ -1,0 +1,39 @@
+# Build and emulator outputs
+/out/
+/build/
+/dist/
+
+# Compiled objects and linker output
+*.o
+*.elf
+*.map
+*.d
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Device partition dumps and generated phone images
+/phone/partitions/
+/phone/dumps/
+/phone/*.img
+/phone/*.bin
+/phone/*.dump
+/phone/*.raw
+/pc/*.img
+/pc/*.bin
+
+# Temporary logs and files
+*.log
+*.tmp
+*~
+*.swp
+*.swo
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
