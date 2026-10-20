@@ -17,16 +17,23 @@ _start:
     mov     x21, x2
     mov     x22, x3
 
-    /* Set the banked EL1 stack explicitly, regardless of the incoming SPSel. */
     adr     x9, stack_top
-    msr     sp_el1, x9
+#ifndef EMULATOR_COMPAT
+    /* Select SP_EL1 and set it through MOV SP. An explicit MSR SP_EL1 is
+     * UNDEFINED at EL1 on normal ARMv8-A implementations. */
     msr     spsel, #1
+#endif
+    mov     sp, x9
     isb
 
-    /* Install the 2 KiB-aligned vector table before entering C. */
+#ifndef EMULATOR_COMPAT
+    /* Install the 2 KiB-aligned vector table before entering C. The Unicorn
+     * harness is instruction-level, not an EL1 system emulator, so it skips
+     * privileged system-register setup in its separate compatibility build. */
     adr     x9, exception_vectors
     msr     vbar_el1, x9
     isb
+#endif
 
     mov     x0, x19
     mov     x1, x20
