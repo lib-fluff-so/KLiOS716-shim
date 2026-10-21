@@ -1,8 +1,7 @@
-/* ios-kl7 diagnostic shim: framebuffer + register/DTB diagnostics + reset.
- * v0.5.2 adds a persistent_ram-compatible ramoops console log.
- * v0.6.3 adds the DTB memory map, a 16 KiB-granule identity map, MMU enable
- * and PSCI CPU_ON bring-up of all secondary cores (see mm.c, start.S).
- * Runs with MMU off: no libc and no SIMD; use aligned accesses only. */
+/* ios-kl7 v0.7.0: ramoops-first diagnostics, bottom-only progress UI, and a
+ * controlled high-RAM test-payload handoff. v0.6.3 proved secondary CPU_ON;
+ * this stage leaves secondaries off so a future XNU entry can own their startup.
+ * No libc or SIMD. The MMU stage intentionally keeps caches disabled. */
 typedef unsigned char u8;
 typedef unsigned int u32;
 typedef unsigned long u64;
@@ -13,6 +12,7 @@ typedef __builtin_va_list va_list;
 
 #include "font.h"
 #include "mm.h"
+#include "loader.h"
 
 #ifndef TEST_EXCEPTION_VECTORS
 #define TEST_EXCEPTION_VECTORS 0
@@ -27,7 +27,16 @@ typedef __builtin_va_list va_list;
 #define MMU_FAULT_TEST 0 /* 1: after the MMU is on, read a no-map address on purpose */
 #endif
 #ifndef CPU_BRINGUP
-#define CPU_BRINGUP 1    /* 0: do not PSCI CPU_ON the secondary cores */
+#define CPU_BRINGUP 0    /* v0.7.0: leave secondaries OFF for XNU to start */
+#endif
+#ifndef LOADER_HANDOFF
+#define LOADER_HANDOFF 1 /* 0: stop after diagnostics, without payload handoff */
+#endif
+#if LOADER_HANDOFF && CPU_BRINGUP
+#error "LOADER_HANDOFF requires CPU_BRINGUP=0; XNU must start its own secondary CPUs"
+#endif
+#if LOADER_HANDOFF && !MMU_STAGE
+#error "LOADER_HANDOFF requires MMU_STAGE=1"
 #endif
 
 #define FB_BASE   0xFDFFF000UL
@@ -39,6 +48,17 @@ typedef __builtin_va_list va_list;
 #define LINE_H    (16 * SCALE)
 #define WDT_BASE  0x10007000UL
 #define BG        0xFF101010u
+#define VISIBLE_FB_OFF (1230UL * STRIDE_B)
+#define PROGRESS_Y 1118
+#define PROGRESS_H 88
+#define PROGRESS_BAR_X 80
+#define PROGRESS_BAR_Y (PROGRESS_Y + 58)
+#define PROGRESS_BAR_W (FB_W - 2 * PROGRESS_BAR_X)
+#define PROGRESS_BAR_H 14
+#define TEST_PAYLOAD_BASE 0x140000000UL
+#define TEST_PAYLOAD_NAME "ios-kl7-test.bin"
+#define TEST_PAYLOAD_RESULT 0x3054534554374c4bUL /* bytes: KL7TEST0 */
+#define BOOT_ARGS_MAGIC 0x30544f4f42374c4bUL /* bytes: KL7BOOT0 */
 
 /* Confirmed from KL7's live Linux 5.10 ramoops mapping via /proc/iomem:
  * mem_address=0x48090000, mem_size=0xe0000, console_size=0x40000,
@@ -75,11 +95,8 @@ static void draw_char(u64 base_off, u32 stride, int x, int y, char c, u32 fg)
         }
 }
 
-/* text buffer: lines rendered at the end so both strides get identical output */
-#define MAX_LINES 25
-#define MAX_COLS  44
-static char lines[MAX_LINES][64];
-static int nlines;
+static void fill_range(u64 off, u64 bytes, u32 col);
+
 
 /* Linux 5.10 struct persistent_ram_buffer: 3 x 32-bit words then data[];
  * ramoops console has sig argument 0, hence PERSISTENT_RAM_SIG ^ 0.
@@ -157,43 +174,40 @@ static void ramoops_init(void)
     b->sig = PERSISTENT_RAM_SIG;
     ramoops_barrier();
     ramoops_ready = 1;
-    ramoops_append_cstr("ios-kl7 v0.6.3: shim entered\n");
+    ramoops_append_cstr("ios-kl7 v0.7.0: shim entered\n");
 }
 
-static void ramoops_record_lines(void)
-{
-    for (int i = 0; i < nlines; i++) {
-        u32 n = 0;
-        while (lines[i][n]) n++;
-        ramoops_append(lines[i], n);
-        ramoops_append_cstr("\n");
-    }
-}
 #else
 static volatile u32 ramoops_ready;
 static void ramoops_init(void) { ramoops_ready = 0; }
-static void ramoops_record_lines(void) {}
 #endif
 
-static void fmt_u64(char **o, u64 v, int base, int minw)
+static void fmt_u64(char **o, char *end, u64 v, int base, int minw)
 {
     char tmp[24]; int n = 0;
     do { int d = v % base; tmp[n++] = d < 10 ? '0' + d : 'a' + d - 10; v /= base; } while (v);
     while (n < minw) tmp[n++] = '0';
-    while (n) *(*o)++ = tmp[--n];
+    while (n && *o < end) *(*o)++ = tmp[--n];
 }
 
-/* format into o (at most cap chars + NUL); %x hex, %w 8-digit hex, %d decimal, %s string */
+/* Bounded formatter: always reserves one byte for NUL, even for several
+ * 64-bit conversions in one record. */
 static int vfmt(char *o, int cap, const char *f, va_list ap)
 {
     char *start = o;
-    for (; *f && (o - start) < cap; f++) {
+    if (cap <= 0) return 0;
+    char *end = o + cap - 1;
+    for (; *f && o < end; f++) {
         if (*f != '%') { *o++ = *f; continue; }
         f++;
-        if (*f == 'x') fmt_u64(&o, va_arg(ap, u64), 16, 1);
-        else if (*f == 'w') fmt_u64(&o, va_arg(ap, u64), 16, 8);
-        else if (*f == 'd') fmt_u64(&o, va_arg(ap, u64), 10, 1);
-        else if (*f == 's') { const char *s = va_arg(ap, const char *); while (*s && (o - start) < MAX_COLS) *o++ = *s++; }
+        if (!*f) break;
+        if (*f == 'x') fmt_u64(&o, end, va_arg(ap, u64), 16, 1);
+        else if (*f == 'w') fmt_u64(&o, end, va_arg(ap, u64), 16, 8);
+        else if (*f == 'd') fmt_u64(&o, end, va_arg(ap, u64), 10, 1);
+        else if (*f == 's') {
+            const char *s = va_arg(ap, const char *);
+            while (*s && o < end) *o++ = *s++;
+        } else if (o < end) *o++ = *f;
     }
     *o = 0;
     return (int)(o - start);
@@ -201,25 +215,85 @@ static int vfmt(char *o, int cap, const char *f, va_list ap)
 
 static void logf(const char *f, ...)
 {
-    if (nlines >= MAX_LINES) return;
-    va_list ap; va_start(ap, f);
-    vfmt(lines[nlines++], 40, f, ap);
-    va_end(ap);
-}
-
-/* log straight to the ramoops console (not the screen); long lines are fine */
-__attribute__((unused)) static void klog(const char *f, ...)
-{
     char b[112];
     va_list ap; va_start(ap, f);
     int n = vfmt(b, 100, f, ap);
     va_end(ap);
+    if (n < 0) return;
     b[n++] = '\n';
 #if RAMOOPS_LOG
     ramoops_append(b, (u32)n);
 #else
-    (void)n;
+    (void)b; (void)n;
 #endif
+}
+
+/* Legacy MMU/CPU diagnostics use klog; both paths now stream to ramoops. */
+#define klog logf
+
+static int progress_percent;
+static int progress_failed;
+
+static void fill_rect(int x, int y, int w, int h, u32 col)
+{
+    for (int yy = 0; yy < h; yy++)
+        for (int xx = 0; xx < w; xx++)
+            put_px(VISIBLE_FB_OFF, STRIDE_B, x + xx, y + yy, col);
+}
+
+/* Only this 88-pixel strip is touched. The rest of the boot screen is left
+ * exactly as the Android bootloader handed it to us. */
+static void progress_redraw(void)
+{
+    fill_range(VISIBLE_FB_OFF + (u64)PROGRESS_Y * STRIDE_B,
+               (u64)PROGRESS_H * STRIDE_B, BG);
+
+    char pct[4];
+    int n = 0;
+    if (progress_percent >= 100) {
+        pct[n++] = '1'; pct[n++] = '0'; pct[n++] = '0';
+    } else if (progress_percent >= 10) {
+        pct[n++] = (char)('0' + progress_percent / 10);
+        pct[n++] = (char)('0' + progress_percent % 10);
+    } else {
+        pct[n++] = (char)('0' + progress_percent);
+    }
+    pct[n++] = '%';
+    int tx = (FB_W - n * 8 * SCALE) / 2;
+    u32 text_col = progress_failed ? 0xFFFF7070u : 0xFFFFFFFFu;
+    for (int i = 0; i < n; i++)
+        draw_char(VISIBLE_FB_OFF, STRIDE_B, tx + i * 8 * SCALE,
+                  PROGRESS_Y + 2, pct[i], text_col);
+
+    u32 edge = progress_failed ? 0xFFFF5555u : 0xFF909090u;
+    u32 track = 0xFF303030u;
+    u32 fill = progress_failed ? 0xFFB02020u : 0xFF20E060u;
+    fill_rect(PROGRESS_BAR_X, PROGRESS_BAR_Y,
+              PROGRESS_BAR_W, PROGRESS_BAR_H, edge);
+    fill_rect(PROGRESS_BAR_X + 2, PROGRESS_BAR_Y + 2,
+              PROGRESS_BAR_W - 4, PROGRESS_BAR_H - 4, track);
+    int usable = PROGRESS_BAR_W - 4;
+    int filled = usable * progress_percent / 100;
+    if (filled > 0)
+        fill_rect(PROGRESS_BAR_X + 2, PROGRESS_BAR_Y + 2,
+                  filled, PROGRESS_BAR_H - 4, fill);
+}
+
+static void progress_set(int p, const char *what)
+{
+    if (p < 0) p = 0;
+    if (p > 100) p = 100;
+    if (p < progress_percent) p = progress_percent;
+    progress_percent = p;
+    logf("progress %d%%: %s", (u64)p, what);
+    progress_redraw();
+}
+
+static void progress_fail(const char *why)
+{
+    progress_failed = 1;
+    logf("FAIL: %s", why);
+    progress_redraw();
 }
 
 static int str_eq_n(const u8 *a, const char *b, int n)
@@ -301,15 +375,6 @@ static void fill_range(u64 off, u64 bytes, u32 col)
     for (u64 i = 0; i < bytes / 8; i++) p[i] = v;
 }
 
-static void render(u64 base_off, u32 stride)
-{
-    for (int l = 0; l < nlines; l++)
-        for (int c = 0; lines[l][c] && c < MAX_COLS; c++)
-            draw_char(base_off, stride, 8 + c * 8 * SCALE, 8 + l * LINE_H, lines[l][c], 0xFFFFFFFFu);
-}
-
-static void clear_screen(void);
-
 /* Layout must match src/vectors.S (304-byte frame). */
 struct exception_frame {
     u64 x[31];
@@ -330,8 +395,8 @@ _Static_assert(sizeof(struct exception_frame) == 304,
 
 static volatile u32 exception_depth;
 
-/* Best-effort fatal exception screen. Never return to the faulting context
- * and never issue a watchdog/PSCI reset, so the screen stays available. */
+/* Fatal exception report: write registers to ramoops, paint only the bottom
+ * progress strip red, and never return to the faulting context. */
 __attribute__((noreturn)) void exception_c_entry(struct exception_frame *f)
 {
     __asm__ volatile("msr daifset, #0xf" ::: "memory");
@@ -339,8 +404,7 @@ __attribute__((noreturn)) void exception_c_entry(struct exception_frame *f)
         for (;;) __asm__ volatile("wfe");
     }
 
-    nlines = 0;
-    logf("KL7 EXCEPTION v0.6.3");
+    logf("KL7 EXCEPTION v0.7.0");
     logf("ESR=%w", f->esr);
     logf("EC=%x", (f->esr >> 26) & 0x3f);
     logf("ISS=%x", f->esr & 0x1ffffffUL);
@@ -355,60 +419,44 @@ __attribute__((noreturn)) void exception_c_entry(struct exception_frame *f)
     logf("X30=%w", f->x[30]);
     logf("CPU=%x", RD(mpidr_el1) & 0xFFFFFFUL);
     logf("HALTED - no reset");
-#if RAMOOPS_LOG
-    if (ramoops_ready) ramoops_record_lines();
-#endif
-
-    clear_screen();
-    render(1230UL * STRIDE_B, STRIDE_B);
+    progress_fail("fatal exception; registers are in ramoops");
     for (;;) __asm__ volatile("wfe");
 }
 
-/* append text (\n, ';' and NUL separate entries) to the line buffer, wrapping at 42 columns */
-static void add_wrapped(const u8 *p, u32 n)
+/* Stream full DTB text properties to ramoops in bounded lines; none of this
+ * data is painted on the framebuffer. Long bootargs/bootconfig are not capped
+ * by the old 25-line diagnostic-page buffer. */
+static void log_text_blob(const char *label, const u8 *p, u32 len)
 {
-    int col = 0, open_line = 0;
-    for (u32 i = 0; i < n && nlines < MAX_LINES; i++) {
+    logf("%s BEGIN bytes=%d", label, (u64)len);
+#if RAMOOPS_LOG
+    char line[96];
+    u32 used = 0;
+    for (u32 i = 0; i < len; i++) {
         u8 c = p[i];
-        if (c == '\n' || c == ';' || c == 0) {
-            if (open_line) { lines[nlines][col] = 0; nlines++; open_line = 0; col = 0; }
-            continue;
+        if (c == 0 || c == '\n' || c == ';' || used >= 88) {
+            if (used) {
+                line[used++] = '\n';
+                ramoops_append(line, used);
+                used = 0;
+            }
+            if (c == 0) break;
+            if (c == '\n' || c == ';') continue;
         }
         if (c < 32 || c > 126) c = '?';
-        if (col >= 42) { lines[nlines][col] = 0; nlines++; col = 0; if (nlines >= MAX_LINES) return; }
-        lines[nlines][col++] = (char)c; open_line = 1;
+        line[used++] = (char)c;
     }
-    if (open_line && nlines < MAX_LINES) { lines[nlines][col] = 0; nlines++; }
+    if (used) {
+        line[used++] = '\n';
+        ramoops_append(line, used);
+    }
+#endif
+    logf("%s END", label);
 }
 
+#ifndef EMULATOR_COMPAT
 static u64 cnt(void) { return RD(cntvct_el0); }
-
-static void clear_screen(void)
-{
-    /* The tested visible region uses the 4352-byte stride. */
-    fill_range(1230UL * STRIDE_B, 1206UL * STRIDE_B, BG);
-}
-
-/* Show the current page for `secs` seconds using the tested 4352-byte stride. */
-static void show(u64 freq, int secs)
-{
-    /* Preserve each diagnostic page before its line buffer is cleared. */
-    ramoops_record_lines();
-    clear_screen();
-    render(1230UL * STRIDE_B, STRIDE_B);
-    u64 t0 = cnt(); int on = 0; u64 last = (u64)-1;
-    while (cnt() - t0 < (u64)secs * freq) {
-        u64 sec = (cnt() - t0) / freq;
-        if (sec != last) {
-            last = sec; on ^= 1;
-            u32 col = on ? 0xFFFFFF00u : 0xFFFF00FFu;
-            for (int y = 0; y < 48; y++)
-                for (int x = 0; x < 48; x++)
-                    put_px(1230UL * STRIDE_B, STRIDE_B, FB_W - 60 + x, 8 + y, col);
-        }
-    }
-    nlines = 0;
-}
+#endif
 
 extern char _start[], _end[];
 
@@ -436,6 +484,7 @@ __attribute__((unused)) static u64 psci_cpu_on(u64 mpidr, u64 entry, u64 ctx)
     return x0;
 }
 
+#if CPU_BRINGUP
 /* PSCI AFFINITY_INFO(mpidr, level 0): 0 ON, 1 OFF, 2 ON_PENDING */
 static u64 psci_affinity(u64 mpidr)
 {
@@ -454,6 +503,7 @@ static void line_inval(const volatile void *p)
 {
     __asm__ volatile("dc civac, %0\n dsb sy" :: "r"(p) : "memory");
 }
+#endif
 
 static int overlaps(u64 a, u64 as, u64 b, u64 bs) { return a < b + bs && b < a + as; }
 
@@ -467,16 +517,20 @@ static int region_free(u64 a, u64 sz, u64 dtb, u32 dsz, u64 is, u64 ie)
     return 1;
 }
 
-/* DTB memory map -> 16 KiB identity map -> MMU on -> PSCI CPU_ON of every other core.
- * Every step is written to the ramoops console before it runs, so the last
- * line in console-ramoops-0 says exactly how far a failed boot got. */
-__attribute__((unused)) static void mmu_stage(const u8 *d, u32 dsz, u64 base, u64 freq)
+/* Parse the live DTB, build/verify the 16 KiB identity map, then enable the
+ * MMU. Optional CPU_ON remains available for diagnostic-only builds, but the
+ * payload-handoff build keeps all secondary CPUs OFF for XNU. Every detail is
+ * streamed to ramoops; the display gets only the bottom progress bar. */
+static int mmu_stage(const u8 *d, u32 dsz, u64 base, u64 freq)
 {
-    nlines = 0;
-    logf("MMU + CPU  5/5");
-
+    logf("stage: memory-map/MMU begin");
     int rc = mm_parse_dtb(d, &dinfo);
-    if (rc) { klog("mm: DTB parse FAILED code -%d", (u64)(-rc)); logf("PARSE FAIL -%d", (u64)(-rc)); show(freq, 6); return; }
+    if (rc) {
+        klog("mm: DTB parse FAILED code -%d", (u64)(-rc));
+        progress_fail("DTB memory map parse failed");
+        return rc;
+    }
+    progress_set(30, "DTB RAM/reservations parsed");
     klog("mm: parse ok ram=%d nomap=%d rsv_mapped=%d memrsv=%d cpus=%d",
          (u64)dinfo.nram, (u64)dinfo.nnomap, (u64)dinfo.nrsv_mapped, (u64)dinfo.nrsvmap, (u64)dinfo.ncpu);
     for (u32 k = 0; k < dinfo.nram; k++) klog("mm: ram %x +%x", dinfo.ram[k].base, dinfo.ram[k].size);
@@ -494,14 +548,17 @@ __attribute__((unused)) static void mmu_stage(const u8 *d, u32 dsz, u64 base, u6
     klog("mm: image %x +%x  pool %x +%x  seccpu %x +%x", base, img_sz, pool, pool_sz, sec, sec_sz);
     if (!region_free(base, img_sz, (u64)d, dsz, is, ie) || !region_free(pool, pool_sz + sec_sz, (u64)d, dsz, is, ie)) {
         klog("mm: ABORT image/pool overlaps DTB, initrd or a no-map region");
-        logf("ABORT: POOL OVERLAP"); show(freq, 6); return;
+        progress_fail("shim/page-table memory overlaps live boot data");
+        return -10;
     }
+    progress_set(36, "live RAM ranges checked for overlap");
 
     struct mm_range forced = { RAMOOPS_BASE, RAMOOPS_SIZE };
     struct mm_range image = { base, img_sz };
     rc = mm_build(&dinfo, pool, pool_sz, &forced, &image, RD(id_aa64mmfr0_el1) & 0xf, &mtab);
     klog("mm: build rc=%d tables=%d oom=%d", (u64)(rc < 0 ? -rc : rc), (u64)mtab.tables_used, (u64)mtab.oom);
-    if (rc) { logf("BUILD FAIL"); show(freq, 6); return; }
+    if (rc) { logf("BUILD FAIL"); progress_fail("translation-table build failed"); return rc; }
+    progress_set(48, "16 KiB identity page tables built");
 
     /* Software-walk the new tables for everything the shim touches next. */
     u64 sp_now; __asm__ volatile("mov %0, sp" : "=r"(sp_now));
@@ -517,10 +574,13 @@ __attribute__((unused)) static void mmu_stage(const u8 *d, u32 dsz, u64 base, u6
         int ok = mm_translate(&mtab, need[k].va, &pa, &desc) && pa == need[k].va;
         if (!ok) {
             klog("mm: VERIFY FAIL %s va=%x", need[k].what, need[k].va);
-            logf("VERIFY FAIL %s", need[k].what); show(freq, 6); return;
+            logf("VERIFY FAIL %s", need[k].what);
+            progress_fail("identity-map verification failed");
+            return -11;
         }
     }
     klog("mm: verify ok (%d addresses)", (u64)(sizeof need / sizeof need[0]));
+    progress_set(58, "image/DTB/stack/ramoops/MMIO translations verified");
 
     klog("mm: ttbr0=%x tcr=%x mair=%x", mtab.ttbr0, mtab.tcr, mtab.mair);
     klog("mm: enabling MMU, SCTLR=%x", RD(sctlr_el1));
@@ -528,11 +588,17 @@ __attribute__((unused)) static void mmu_stage(const u8 *d, u32 dsz, u64 base, u6
     u64 sctlr_on = RD(sctlr_el1);
     klog("mm: MMU ON SCTLR=%x", sctlr_on);
     logf("MMU ON SCTLR=%x", sctlr_on);
+    progress_set(66, "MMU enabled with caches still off");
 
     /* MMIO through the Device mapping: GICv3 distributor ID registers */
     u32 typer = *(volatile u32 *)(0x0C000000UL + 0x0004), pidr2 = *(volatile u32 *)(0x0C000000UL + 0xFFE8);
     klog("mm: GICD_TYPER=%x GICD_PIDR2=%x arch=%d", (u64)typer, (u64)pidr2, (u64)((pidr2 >> 4) & 0xf));
     logf("GICD PIDR2=%x ARCH=%d", (u64)pidr2, (u64)((pidr2 >> 4) & 0xf));
+    if (((pidr2 >> 4) & 0xf) != 3) {
+        progress_fail("GIC distributor is not identified as GICv3");
+        return -12;
+    }
+    progress_set(72, "GICv3 distributor identified");
     /* RAM through the Normal mapping */
     volatile u64 *tw = (volatile u64 *)(sec + 0x800);
     *tw = 0x0123456789abcdefUL;
@@ -540,6 +606,11 @@ __attribute__((unused)) static void mmu_stage(const u8 *d, u32 dsz, u64 base, u6
     u64 rb = *tw;
     klog("mm: ram rw test %s", rb == 0x0123456789abcdefUL ? "ok" : "FAIL");
     logf("RAM RW %s", rb == 0x0123456789abcdefUL ? "OK" : "FAIL");
+    if (rb != 0x0123456789abcdefUL) {
+        progress_fail("high-level RAM read/write test failed");
+        return -13;
+    }
+    progress_set(78, "normal-memory read/write verified");
 
 #if MMU_FAULT_TEST
     klog("mm: FAULT TEST reading no-map 0x70000000 (expect translation fault)");
@@ -578,19 +649,211 @@ __attribute__((unused)) static void mmu_stage(const u8 *d, u32 dsz, u64 base, u6
              *(volatile u64 *)&c->mpidr, *(volatile u64 *)&c->el, *(volatile u64 *)&c->sctlr, *(volatile u64 *)&c->x0_seen, (u64)c);
         logf("CPU%d %x R=%x ST=%d A=%x", (u64)k, m, r, st, aff);
         if (st == 2) up++;
+        progress_set(78 + (tried * 2 / (dinfo.ncpu ? dinfo.ncpu : 1)), "secondary CPU_ON checks running");
     }
     klog("cpu: %d of %d secondary cores reached MMU-on", (u64)up, (u64)tried);
-    klog("cpu: framebuffer squares: orange = entered, orange = entered, blue = enabling MMU, green = MMU on");
     logf("SECONDARY UP %d/%d", (u64)up, (u64)tried);
+    progress_set(78 + (tried * 2 / (dinfo.ncpu ? dinfo.ncpu : 1)), "secondary CPU_ON checks complete");
+#else
+    klog("cpu: CPU_ON intentionally skipped; XNU must start secondaries");
 #endif
-    show(freq, 8);
+    return 0;
+}
+#endif
+
+#ifndef EMULATOR_COMPAT
+struct test_boot_args {
+    u64 signature;             /* 0 */
+    u64 version;               /* 8 */
+    u64 dtb;                   /* 16 */
+    u64 dtb_size;              /* 24 */
+    u64 initrd_start;          /* 32 */
+    u64 initrd_end;            /* 40 */
+    u64 payload_start;         /* 48 */
+    u64 payload_size;          /* 56 */
+    u64 return_address;        /* 64 */
+    u64 payload_magic;         /* 72: written by test payload */
+    u64 payload_pc;            /* 80 */
+    u64 payload_sctlr;         /* 88 */
+    u64 payload_currentel;     /* 96 */
+    u64 payload_x0;            /* 104 */
+    u64 reserved;              /* 112 */
+};
+_Static_assert(__builtin_offsetof(struct test_boot_args, return_address) == 64,
+               "test payload return-address offset mismatch");
+_Static_assert(__builtin_offsetof(struct test_boot_args, payload_magic) == 72,
+               "test payload result offset mismatch");
+_Static_assert(__builtin_offsetof(struct test_boot_args, payload_x0) == 104,
+               "test payload x0 offset mismatch");
+
+static struct test_boot_args handoff_args __attribute__((aligned(16)));
+static u64 boot_timer_freq;
+extern void transfer_to_payload(u64 target, u64 boot_args) __attribute__((noreturn));
+
+static int range_in_ram(u64 a, u64 sz)
+{
+    if (!sz || a + sz < a) return 0;
+    for (u32 k = 0; k < dinfo.nram; k++) {
+        u64 rb = dinfo.ram[k].base, rs = dinfo.ram[k].size;
+        if (rs > (u64)-1 - rb) continue;
+        u64 re = rb + rs;
+        if (a >= rb && a < re && sz <= re - a) return 1;
+    }
+    return 0;
+}
+
+static int payload_destination_ok(u64 dst, u64 sz, u64 dtb, u32 dsz,
+                                  u64 initrd_start, u64 initrd_end, u64 base)
+{
+    u64 image_sz = (u64)(_end - _start);
+    u64 pool = (u64)__pgtbl_start;
+    u64 pool_sz = (u64)(__pgtbl_end - __pgtbl_start);
+    u64 sec = (u64)__seccpu_start;
+    u64 sec_sz = (u64)(__seccpu_end - __seccpu_start);
+    if (!range_in_ram(dst, sz)) return 0;
+    if (!region_free(dst, sz, dtb, dsz, initrd_start, initrd_end)) return 0;
+    if (overlaps(dst, sz, base, image_sz)) return 0;
+    if (overlaps(dst, sz, pool, pool_sz)) return 0;
+    if (overlaps(dst, sz, sec, sec_sz)) return 0;
+    if (overlaps(dst, sz, RAMOOPS_BASE, RAMOOPS_SIZE)) return 0;
+    return 1;
+}
+
+static __attribute__((noreturn)) void reset_after(u64 freq, u32 seconds)
+{
+    if (!freq) freq = 13000000;
+    u64 t0 = cnt();
+    while (cnt() - t0 < freq * seconds) __asm__ volatile("yield");
+    register u64 r0 __asm__("x0") = 0x84000009UL; /* PSCI SYSTEM_RESET */
+    __asm__ volatile("smc #0" : "+r"(r0) : : "x1", "x2", "x3", "memory", "cc");
+    *(volatile u32 *)(WDT_BASE + 0x14) = 0x1209;
+    for (;;) __asm__ volatile("wfe");
+}
+
+static __attribute__((noreturn)) void payload_return(struct test_boot_args *a)
+{
+    logf("handoff: test payload returned to shim at EL=%x", RD(CurrentEL));
+    if (!a || a != &handoff_args) {
+        progress_fail("payload returned with an invalid boot_args pointer");
+        reset_after(boot_timer_freq, 3);
+    }
+    logf("handoff: args=%x sig=%w x0=%x payload_pc=%x", (u64)a,
+         a->signature, a->payload_x0, a->payload_pc);
+    logf("handoff: payload_magic=%w sctlr=%x currentel=%x",
+         a->payload_magic, a->payload_sctlr, a->payload_currentel);
+    int ok = a->signature == BOOT_ARGS_MAGIC &&
+             a->payload_magic == TEST_PAYLOAD_RESULT &&
+             a->payload_x0 == (u64)a &&
+             a->payload_pc >= a->payload_start &&
+             a->payload_pc < a->payload_start + a->payload_size &&
+             (a->payload_sctlr & (1UL | 4UL | 0x1000UL)) == 0 &&
+             a->payload_currentel == 4 &&
+             a->payload_start == TEST_PAYLOAD_BASE;
+    if (!ok) {
+        progress_fail("test payload did not confirm MMU-off x0=boot_args handoff");
+        reset_after(boot_timer_freq, 3);
+    }
+    logf("handoff: PASS; payload executed above 4 GiB, MMU off, x0=boot_args");
+    progress_set(100, "payload execution and handoff ABI verified");
+    reset_after(boot_timer_freq, 3);
+}
+
+static int loader_handoff(const u8 *d, u32 dsz, u64 base)
+{
+    u32 ls = 0, le = 0;
+    const u8 *vs = fdt_prop(d, "chosen", "linux,initrd-start", &ls);
+    const u8 *ve = fdt_prop(d, "chosen", "linux,initrd-end", &le);
+    if (!vs || !ve) {
+        progress_fail("DTB does not provide initrd bounds");
+        return -20;
+    }
+    u64 is = be_val(vs, ls), ie = be_val(ve, le);
+    if (ie <= is || ie - is > 0x10000000UL || !range_in_ram(is, ie - is)) {
+        logf("loader: invalid initrd range %x..%x", is, ie);
+        progress_fail("initrd range is invalid or outside RAM");
+        return -21;
+    }
+    logf("loader: initrd %x..%x bytes=%x", is, ie, ie - is);
+    progress_set(80, "initrd bounds located and validated");
+
+    const loader_u8 *file = 0;
+    u32 file_size = 0;
+    int rc = loader_cpio_find_file((const loader_u8 *)is, ie - is,
+                                   TEST_PAYLOAD_NAME, &file, &file_size);
+    if (rc || !file) {
+        logf("loader: CPIO payload search failed rc=%d", (u64)(-rc));
+        progress_fail("test payload is absent from the live initrd");
+        return -22;
+    }
+    logf("loader: CPIO file %s at %x size=%d", TEST_PAYLOAD_NAME, (u64)file, (u64)file_size);
+    progress_set(84, "test payload found in ramdisk CPIO");
+
+    const loader_u8 *payload = 0;
+    u32 payload_size = 0, expected_crc = 0;
+    rc = loader_parse_payload((const loader_u8 *)file, file_size,
+                              &payload, &payload_size, &expected_crc);
+    if (rc) {
+        logf("loader: payload header/CRC rejected rc=%d", (u64)(-rc));
+        progress_fail("payload header, size, or CRC32 is invalid");
+        return -23;
+    }
+    u32 found_crc = loader_crc32(payload, payload_size);
+    logf("loader: payload bytes=%d crc expected=%x actual=%x", (u64)payload_size,
+         (u64)expected_crc, (u64)found_crc);
+    progress_set(88, "payload header and CRC32 validated");
+
+    u64 dst = TEST_PAYLOAD_BASE;
+    if (!payload_destination_ok(dst, payload_size, (u64)d, dsz, is, ie, base)) {
+        logf("loader: target range rejected base=%x size=%x", dst, (u64)payload_size);
+        progress_fail("high-RAM target overlaps a reserved or live region");
+        return -26;
+    }
+    u64 pa0 = 0, pa1 = 0;
+    if (!mm_translate(&mtab, dst, &pa0, 0) || pa0 != dst ||
+        !mm_translate(&mtab, dst + payload_size - 1, &pa1, 0) || pa1 != dst + payload_size - 1) {
+        progress_fail("target payload pages are not identity-mapped");
+        return -27;
+    }
+    logf("loader: target validated in DRAM rank 1 at %x", dst);
+    progress_set(91, "high-RAM destination validated");
+
+    memcpy((void *)dst, payload, payload_size);
+    __asm__ volatile("dsb sy" ::: "memory");
+    u32 copied_crc = loader_crc32((const loader_u8 *)dst, payload_size);
+    logf("loader: copy dst=%x size=%d crc=%x", dst, (u64)payload_size, (u64)copied_crc);
+    if (copied_crc != expected_crc) {
+        progress_fail("payload copy verification failed");
+        return -28;
+    }
+    progress_set(94, "payload copied above 4 GiB and read-back verified");
+
+    memset(&handoff_args, 0, sizeof handoff_args);
+    handoff_args.signature = BOOT_ARGS_MAGIC;
+    handoff_args.version = 1;
+    handoff_args.dtb = (u64)d;
+    handoff_args.dtb_size = dsz;
+    handoff_args.initrd_start = is;
+    handoff_args.initrd_end = ie;
+    handoff_args.payload_start = dst;
+    handoff_args.payload_size = payload_size;
+    handoff_args.return_address = (u64)payload_return;
+    logf("loader: boot_args=%x sig=%w dtb=%x initrd=%x..%x payload=%x+%x return=%x",
+         (u64)&handoff_args, handoff_args.signature, handoff_args.dtb,
+         is, ie, dst, (u64)payload_size, handoff_args.return_address);
+    progress_set(97, "boot_args assembled with DTB/initrd/return entry");
+    logf("handoff: secondary CPUs left OFF; disabling MMU/caches before branch");
+    progress_set(99, "entering copied test payload with x0=boot_args");
+    transfer_to_payload(dst, (u64)&handoff_args);
 }
 #endif
 
 void shim_main(u64 dtb, u64 x1, u64 x2, u64 x3, u64 base)
 {
     exception_depth = 0;
+    progress_percent = 0;
+    progress_failed = 0;
     ramoops_init();
+    progress_set(1, "persistent ramoops console initialized");
 #if TEST_EXCEPTION_VECTORS
     /* Deliberate synchronous exception used only to validate VBAR_EL1. */
     __asm__ volatile("udf #0");
@@ -598,82 +861,62 @@ void shim_main(u64 dtb, u64 x1, u64 x2, u64 x3, u64 base)
     u64 el = (RD(CurrentEL) >> 2) & 3;
     u64 freq = RD(cntfrq_el0);
     if (!freq) freq = 13000000;
+#ifndef EMULATOR_COMPAT
+    boot_timer_freq = freq;
+#endif
 
 #ifdef EMULATOR_COMPAT
-    /* The Unicorn harness is not a secure monitor: emulate the two PSCI
-     * return values so the framebuffer path can be tested independently. */
+    /* The Unicorn harness is not a secure monitor: emulate PSCI query values. */
     u64 psci_ver = 0x00010001UL;
     u64 psci_cpu_on_features = 0;
 #else
-    /* Query PSCI_VERSION through the SMC conduit advertised by the DTB. */
     register u64 psci_ver __asm__("x0") = 0x84000000UL;
-    __asm__ volatile(
-        "smc #0"
-        : "+r"(psci_ver)
-        :
-        : "x1", "x2", "x3", "memory", "cc"
-    );
-
-    /* Query whether PSCI_CPU_ON_AARCH64 is implemented.
-     * PSCI_FEATURES: x0 = 0x8400000A, x1 = queried function ID.
-     * This only queries support; it does not start another CPU. */
+    __asm__ volatile("smc #0" : "+r"(psci_ver) : : "x1", "x2", "x3", "memory", "cc");
     register u64 psci_features_fid __asm__("x0") = 0x8400000AUL;
     register u64 psci_cpu_on_fid __asm__("x1") = 0xC4000003UL;
-    __asm__ volatile(
-        "smc #0"
-        : "+r"(psci_features_fid), "+r"(psci_cpu_on_fid)
-        :
-        : "x2", "x3", "memory", "cc"
-    );
+    __asm__ volatile("smc #0" : "+r"(psci_features_fid), "+r"(psci_cpu_on_fid)
+                     : : "x2", "x3", "memory", "cc");
     u64 psci_cpu_on_features = psci_features_fid;
 #endif
 
     const u8 *d = (const u8 *)dtb;
     u32 magic = 0, size = 0;
     if (dtb) { magic = be32(d); size = be32(d + 4); }
-    int dtb_ok = (magic == 0xd00dfeed && size < 0x800000);
+    int dtb_ok = (magic == 0xd00dfeed && size >= 40 && size < 0x800000);
 
-    /* page 1: CPU / entry state */
-    logf("KL7 SHIM v0.6.3  1/5");
-    logf("EL=%d MPIDR=%x", el, RD(mpidr_el1));
-    logf("MIDR=%w", RD(midr_el1));
-    logf("PFR0=%x", RD(id_aa64pfr0_el1));
-    logf("MMFR0=%x", RD(id_aa64mmfr0_el1));
-    logf("ISAR0=%x", RD(id_aa64isar0_el1));
-    logf("ISAR1=%x", RD(id_aa64isar1_el1));
-    logf("CNTFRQ=%d", freq);
-    logf("PSCI_VER=%w", psci_ver);
-    logf("PSCI_CPU_ON=%w", psci_cpu_on_features);
-    logf("BASE=%x", base);
-    logf("SIZE=%x", (u64)(_end - _start));
-    if (el == 2) logf("SCTLR_EL2=%x HCR=%x", RD(sctlr_el2), RD(hcr_el2));
-    else         logf("SCTLR_EL1=%x", RD(sctlr_el1));
-    logf("VBAR_EL1=%w", RD(vbar_el1));
-    logf("X0=%x", dtb);
-    logf("X1=%x X2=%x X3=%x", x1, x2, x3);
-    logf("DTB MAGIC=%w SIZE=%x", magic, size);
-    show(freq, 4);
+    logf("ios-kl7 SHIM v0.7.0");
+    logf("entry: EL=%d MPIDR=%x MIDR=%w", el, RD(mpidr_el1), RD(midr_el1));
+    logf("cpu: PFR0=%x MMFR0=%x ISAR0=%x ISAR1=%x", RD(id_aa64pfr0_el1),
+         RD(id_aa64mmfr0_el1), RD(id_aa64isar0_el1), RD(id_aa64isar1_el1));
+    logf("timer: CNTFRQ=%d", freq);
+    logf("psci: version=%w CPU_ON_FEATURES=%w", psci_ver, psci_cpu_on_features);
+    logf("entry: base=%x image_size=%x", base, (u64)(_end - _start));
+    if (el == 2) logf("entry: SCTLR_EL2=%x HCR=%x", RD(sctlr_el2), RD(hcr_el2));
+    else         logf("entry: SCTLR_EL1=%x", RD(sctlr_el1));
+    logf("entry: VBAR_EL1=%w x0(DTB)=%x x1=%x x2=%x x3=%x", RD(vbar_el1), dtb, x1, x2, x3);
+    logf("dtb: magic=%w size=%x valid=%d", (u64)magic, (u64)size, (u64)dtb_ok);
+    progress_set(7, "entry registers and PSCI queries recorded");
 
-    /* page 2: boot mode keys + memory layout from DTB */
-    logf("DTB INFO  2/5");
+    logf("stage: DTB/boot environment begin");
     if (dtb_ok) {
         find_kv(d, size, "bootopt=", 8, "BOOTOPT");
-        u32 l;
+        u32 l = 0;
         const u8 *v;
-        if ((v = fdt_prop(d, "chosen", "linux,initrd-start", &l))) logf("INITRD S=%x", be_val(v, l));
-        if ((v = fdt_prop(d, "chosen", "linux,initrd-end", &l)))   logf("INITRD E=%x", be_val(v, l));
+        if ((v = fdt_prop(d, "chosen", "linux,initrd-start", &l)))
+            logf("initrd: start=%x", be_val(v, l));
+        if ((v = fdt_prop(d, "chosen", "linux,initrd-end", &l)))
+            logf("initrd: end=%x", be_val(v, l));
         if ((v = fdt_prop(d, "memory", "reg", &l))) {
-            logf("MEM LEN=%d", (u64)l);
-            if (l >= 16) logf("MEM %x +%x", be_val(v, 8), be_val(v + 8, 8));
+            logf("memory: reg_len=%d", (u64)l);
+            if (l >= 16) logf("memory: %x +%x", be_val(v, 8), be_val(v + 8, 8));
         }
-        logf("DTB END=%x", dtb + size);
+        logf("dtb: address=%x end=%x", dtb, dtb + size);
     } else {
-        logf("DTB BAD");
+        logf("dtb: BAD header or size");
     }
-    show(freq, 4);
+    progress_set(11, "DTB header and boot memory properties checked");
 
-    /* page 3: bootconfig appended to the initrd by LK (androidboot.* live here, not in bootargs) */
-    logf("BOOTCONFIG  3/5");
+    logf("stage: bootconfig begin");
     if (dtb_ok) {
         u32 l1 = 0, l2 = 0;
         const u8 *vs = fdt_prop(d, "chosen", "linux,initrd-start", &l1);
@@ -682,45 +925,49 @@ void shim_main(u64 dtb, u64 x1, u64 x2, u64 x3, u64 base)
         if (is && ie > is + 32 && ie - is < 0x10000000UL) {
             const u8 *t = (const u8 *)ie;
             if (str_eq_n(t - 12, "#BOOTCONFIG\n", 12)) {
-                u32 sz = (u32)t[-20] | ((u32)t[-19] << 8) | ((u32)t[-18] << 16) | ((u32)t[-17] << 24);
-                if (sz < 0x4000) add_wrapped(t - 20 - sz, sz);
-                else logf("BC SIZE BAD %x", (u64)sz);
-            } else logf("NO #BOOTCONFIG TAIL");
-        } else logf("NO INITRD");
+                u32 sz = (u32)t[-20] | ((u32)t[-19] << 8) |
+                         ((u32)t[-18] << 16) | ((u32)t[-17] << 24);
+                if (sz < 0x4000 && (u64)sz + 20 <= ie - is)
+                    log_text_blob("bootconfig", t - 20 - sz, sz);
+                else logf("bootconfig: size rejected (%x)", (u64)sz);
+            } else logf("bootconfig: no #BOOTCONFIG tail");
+        } else logf("bootconfig: initrd absent or invalid");
     }
-    show(freq, 4);
+    progress_set(15, "bootconfig inspected and streamed to ramoops");
 
-    /* page 4: /chosen/bootargs, 42 chars per line */
-    logf("BOOTARGS  4/5");
+    logf("stage: bootargs begin");
     if (dtb_ok) {
         u32 l = 0;
         const u8 *v = fdt_prop(d, "chosen", "bootargs", &l);
-        if (v) {
-            u32 pos = 0;
-            while (pos < l && v[pos] && nlines < MAX_LINES) {
-                char *o = lines[nlines++];
-                int n = 0;
-                while (n < 42 && pos < l && v[pos]) o[n++] = (char)v[pos++];
-                o[n] = 0;
-            }
-        } else logf("NO BOOTARGS");
+        if (v) log_text_blob("bootargs", v, l);
+        else logf("bootargs: property absent");
     }
-    show(freq, 4);
-
-#if MMU_STAGE && !defined(EMULATOR_COMPAT)
-    if (dtb_ok) mmu_stage(d, size, base, freq);
-#endif
+    progress_set(20, "bootargs streamed to ramoops");
 
 #ifdef EMULATOR_COMPAT
-    /* Let the Unicorn harness stop after page 4 and write its PNG snapshots.
-     * This BRK is never present in a normal hardware build. */
+    /* This build validates the bottom-strip UI and log flow only. */
     __asm__ volatile("brk #0");
     for (;;) __asm__ volatile("wfe");
 #else
-    /* PSCI SYSTEM_RESET (smc conduit per DTB), then MTK TOPRGU fallback. */
-    register u64 r0 __asm__("x0") = 0x84000009UL;
-    __asm__ volatile("smc #0" : "+r"(r0) : : "x1", "x2", "x3", "memory");
-    *(volatile u32 *)(WDT_BASE + 0x14) = 0x1209;
-    for (;;) __asm__ volatile("wfe");
+#if MMU_STAGE
+    if (!dtb_ok) {
+        progress_fail("invalid DTB; refusing MMU setup and payload load");
+        reset_after(freq, 3);
+    }
+    int mmrc = mmu_stage(d, size, base, freq);
+    if (mmrc) reset_after(freq, 3);
+#if LOADER_HANDOFF
+    int hrc = loader_handoff(d, size, base);
+    if (hrc) reset_after(freq, 3);
+    progress_fail("unexpected return from loader_handoff");
+    reset_after(freq, 3);
+#else
+    progress_set(90, "MMU test complete; loader handoff disabled");
+    reset_after(freq, 3);
+#endif
+#else
+    progress_fail("MMU_STAGE=0; loader handoff cannot run");
+    reset_after(freq, 3);
+#endif
 #endif
 }

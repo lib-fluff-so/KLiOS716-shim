@@ -48,36 +48,8 @@ _start:
 /* PSCI CPU_ON entry for secondary cores: MMU off, x0 = &struct sec_ctx (context_id).
  * ctx (128 bytes): +0 stack_top +8 mair +16 tcr +24 ttbr0 +32 state +40 mpidr +48 sctlr +56 el +64 x0_seen
  * state 1 = entered, 2 = MMU on with the same tables as the boot CPU.
- *
- * Besides the shared-memory report, every core paints a 32x32 square on the
- * framebuffer (column = Aff1, so cpu1..7 -> 8 slots): orange as the very first
- * thing it does, red + park if its context reads as zeros, blue just before the
- * MMU enable, green once the MMU is on, then keeps repainting. That proof does
- * not depend on cache coherence with the boot CPU. FB row 900 of the visible area,
- * stride 4352. */
-    .equ FB_SQ, 0xFDFFF000 + (1230 + 900) * 4352
-    .equ FB_STRIDE, 4352
-
-    .macro PAINT color
-        mrs     x5, mpidr_el1
-        ubfx    x5, x5, #8, #8
-        ldr     x7, =FB_SQ
-        mov     x8, #288
-        madd    x7, x5, x8, x7
-        add     x7, x7, #160
-        ldr     w6, =\color
-        mov     w9, #32
-        mov     x12, #FB_STRIDE
-    1:  mov     x10, x7
-        mov     w11, #32
-    2:  str     w6, [x10], #4
-        subs    w11, w11, #1
-        b.ne    2b
-        add     x7, x7, x12
-        subs    w9, w9, #1
-        b.ne    1b
-    .endm
-
+ * Diagnostic results are stored in shared context memory; no diagnostic UI is
+ * painted by secondary CPUs, so the screen remains limited to the bottom bar. */
     .text
     .balign 4
     .globl secondary_entry
@@ -87,8 +59,7 @@ _start:
  * It stores the x0 it was given at ctx+64 so the boot CPU can log it. */
 secondary_entry:
     msr     daifset, #0xf
-    mov     x4, x0                  /* PAINT clobbers x5-x12, not x4 */
-    PAINT   0xFFFFA500              /* orange: entered */
+    mov     x4, x0                  /* preserve incoming context_id */
 
     mrs     x2, mpidr_el1
     ubfx    x5, x2, #8, #8          /* idx = Aff1 */
@@ -138,7 +109,6 @@ secondary_entry:
     bic     x2, x2, x3
     msr     ttbr0_el1, x2
     isb
-    PAINT   0xFF0000FF              /* blue: about to enable the MMU */
     tlbi    vmalle1
     dsb     nsh
     isb
@@ -158,9 +128,9 @@ secondary_entry:
     str     x3, [x0, #32]           /* state = 2 */
     dsb     sy
     sev
-.Lrepaint:
-    PAINT   0xFF00FF00              /* green: MMU on, keep repainting */
-    b       .Lrepaint
+.Lpark:
+    wfe
+    b       .Lpark
     .ltorg
     .size secondary_entry, . - secondary_entry
 

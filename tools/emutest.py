@@ -1,29 +1,28 @@
-#!/usr/bin/env python3
-"""Run an EMULATOR_COMPAT AArch64 image in Unicorn and capture the visible framebuffer pages."""
-import sys, struct
+"""Run the EMULATOR_COMPAT AArch64 image and capture its bottom progress strip."""
+import sys
 from pathlib import Path
 from unicorn import *
 from unicorn.arm64_const import *
 from PIL import Image
+import fdt as _fdt
+import struct
 
-img = open(sys.argv[1] if len(sys.argv) > 1 else 'out/Image', 'rb').read()
+img = open(sys.argv[1] if len(sys.argv) > 1 else 'out-emu/Image', 'rb').read()
 BASE = 0x48000000
 FB = 0xFDFFF000
 FB_W, FB_H = 1080, 2436
-STRIDE_A, STRIDE_B = 4320, 4352
-VISIBLE_OFF = 1230 * STRIDE_B  # visible region proved on the physical device
+STRIDE_B = 4352
+VISIBLE_OFF = 1230 * STRIDE_B
 DTB = 0x4F000000
 mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
-mu.mem_map(0x40000000, 0x10000000)          # RAM 0x40000000..0x50000000
-mu.mem_map(0xFD000000, 0x03000000)          # RAM incl. framebuffer
-mu.mem_map(0x10007000, 0x1000)              # WDT
+mu.mem_map(0x40000000, 0x10000000)  # RAM 0x40000000..0x50000000
+mu.mem_map(0xFD000000, 0x03000000)  # includes framebuffer
+mu.mem_map(0x10007000, 0x1000)      # WDT
 mu.mem_write(BASE, img)
-dtb = open(sys.argv[2], 'rb').read() if len(sys.argv) > 2 else None
-# BOOTCFG: fake initrd with bootconfig tail; patch /chosen/linux,initrd-start/end in the real DTB
-import fdt as _fdt
+dtb = open(sys.argv[2] if len(sys.argv) > 2 else 'fdt.dtb', 'rb').read()
 fd = _fdt.parse_dtb(dtb)
 INITRD = 0x4E000000
-bc = open('proc_bootconfig.txt','rb').read().replace(b' = ', b'=').replace(b'\n', b'\n')
+bc = open('proc_bootconfig.txt', 'rb').read().replace(b' = ', b'=')
 payload = b'\0' * 4096 + bc + struct.pack('<II', len(bc), 0) + b'#BOOTCONFIG\n'
 mu.mem_write(INITRD, payload)
 ch = fd.get_node('chosen')
@@ -39,9 +38,6 @@ regs = {
  'CNTFRQ_EL0': 13000000, 'SCTLR_EL1': 0x30d00800,
 }
 tick = [0]
-SNAPS = {}
-# Four 4-second pages; capture each page near its midpoint.
-snap_times = [2, 6, 10, 14]
 log = []
 def hook_mrs(uc, reg, cp_reg, user_data):
     # cp_reg is a tuple (crn, crm, op0, op1, op2) in unicorn 2.x
@@ -56,9 +52,6 @@ def hook_mrs(uc, reg, cp_reg, user_data):
     if key == (3,3,14,0,2):   # CNTVCT_EL0
         tick[0] += 13000000 // 20
         val = tick[0]
-        for n, st in enumerate(snap_times):
-            if n not in SNAPS and tick[0] >= st * 13000000:
-                SNAPS[n] = bytes(uc.mem_read(FB + VISIBLE_OFF, FB_H * STRIDE_B))
     elif key in table:
         val = table[key]
     else:
@@ -73,22 +66,11 @@ except UcError as e:
     pc = mu.reg_read(UC_ARM64_REG_PC)
     print('stopped:', e, 'pc=', hex(pc), 'off=', hex(pc - BASE), 'x0=', hex(mu.reg_read(UC_ARM64_REG_X0)))
 print('unknown sysregs:', set(log))
-fb = bytes(mu.mem_read(FB + VISIBLE_OFF, FB_H * STRIDE_B))
-from PIL import Image as _I
-Path('out').mkdir(parents=True, exist_ok=True)
-for n, raw in SNAPS.items():
-    # The actual framebuffer stride is 4352, not tightly packed 1080*4=4320.
-    im = _I.frombuffer('RGBA', (FB_W, FB_H), raw, 'raw', 'BGRA', STRIDE_B, 1).convert('RGB')
-    im.save(f'out/emu_page{n+1}.png'); print('saved page', n+1)
-for name, stride in (('A4320', STRIDE_A), ('B4352', STRIDE_B)):
-    im = Image.new('RGB', (FB_W, FB_H))
-    row = [fb[y*stride:(y*stride)+FB_W*4] for y in range(FB_H)]
-    # fast path: build from bytes (little endian XRGB: B,G,R,X)
-    data = bytearray()
-    for r in row:
-        for x in range(FB_W):
-            b, g, rr = r[x*4], r[x*4+1], r[x*4+2]
-            data += bytes((rr, g, b))
-    im = Image.frombytes('RGB', (FB_W, FB_H), bytes(data))
-    im.save(f'out/emu_{name}.png')
-    print('saved', f'out/emu_{name}.png')
+raw = bytes(mu.mem_read(FB + VISIBLE_OFF, FB_H * STRIDE_B))
+out = Path(sys.argv[3] if len(sys.argv) > 3 else 'out-emu/emu_progress.png')
+out.parent.mkdir(parents=True, exist_ok=True)
+# The framebuffer's physical pitch is 4352 bytes; only its first 1080 pixels
+# per line are visible. This image intentionally captures the current UI once.
+im = Image.frombuffer('RGBA', (FB_W, FB_H), raw, 'raw', 'BGRA', STRIDE_B, 1).convert('RGB')
+im.save(out)
+print('saved progress UI:', out)
