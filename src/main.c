@@ -1,6 +1,6 @@
 /* ios-kl7 diagnostic shim: framebuffer + register/DTB diagnostics + reset.
  * v0.5.2 adds a persistent_ram-compatible ramoops console log.
- * v0.6.1 adds the DTB memory map, a 16 KiB-granule identity map, MMU enable
+ * v0.6.2 adds the DTB memory map, a 16 KiB-granule identity map, MMU enable
  * and PSCI CPU_ON bring-up of all secondary cores (see mm.c, start.S).
  * Runs with MMU off: no libc and no SIMD; use aligned accesses only. */
 typedef unsigned char u8;
@@ -157,7 +157,7 @@ static void ramoops_init(void)
     b->sig = PERSISTENT_RAM_SIG;
     ramoops_barrier();
     ramoops_ready = 1;
-    ramoops_append_cstr("ios-kl7 v0.6.1: shim entered\n");
+    ramoops_append_cstr("ios-kl7 v0.6.2: shim entered\n");
 }
 
 static void ramoops_record_lines(void)
@@ -340,7 +340,7 @@ __attribute__((noreturn)) void exception_c_entry(struct exception_frame *f)
     }
 
     nlines = 0;
-    logf("KL7 EXCEPTION v0.6.1");
+    logf("KL7 EXCEPTION v0.6.2");
     logf("ESR=%w", f->esr);
     logf("EC=%x", (f->esr >> 26) & 0x3f);
     logf("ISS=%x", f->esr & 0x1ffffffUL);
@@ -559,7 +559,11 @@ __attribute__((unused)) static void mmu_stage(const u8 *d, u32 dsz, u64 base, u6
         ctx[k].stack_top = (u64)(stacks + (u64)(k + 1) * 0x2000);
         ctx[k].mair = mtab.mair; ctx[k].tcr = mtab.tcr; ctx[k].ttbr0 = mtab.ttbr0;
         ctx[k].state = 0; ctx[k].mpidr = 0; ctx[k].sctlr = 0; ctx[k].el = 0;
-        __asm__ volatile("dsb sy" ::: "memory");
+        /* The context was written through a Non-cacheable mapping but may still sit in
+         * (or be shadowed by) a cache line; the secondary reads DRAM with its MMU off.
+         * Clean+invalidate both ends of the 64-byte struct before CPU_ON. */
+        line_inval(&ctx[k]);
+        line_inval((volatile u8 *)&ctx[k] + 63);
         u64 r = psci_cpu_on(m, (u64)secondary_entry, (u64)&ctx[k]);
         tried++;
         u64 t0 = cnt(), st = 0;
@@ -576,7 +580,7 @@ __attribute__((unused)) static void mmu_stage(const u8 *d, u32 dsz, u64 base, u6
         if (st == 2) up++;
     }
     klog("cpu: %d of %d secondary cores reached MMU-on", (u64)up, (u64)tried);
-    klog("cpu: framebuffer squares: orange = core entered, green = core has MMU on");
+    klog("cpu: framebuffer squares: orange = entered, red = zero context (cache), blue = enabling MMU, green = MMU on");
     logf("SECONDARY UP %d/%d", (u64)up, (u64)tried);
 #endif
     show(freq, 8);
@@ -630,7 +634,7 @@ void shim_main(u64 dtb, u64 x1, u64 x2, u64 x3, u64 base)
     int dtb_ok = (magic == 0xd00dfeed && size < 0x800000);
 
     /* page 1: CPU / entry state */
-    logf("KL7 SHIM v0.6.1  1/5");
+    logf("KL7 SHIM v0.6.2  1/5");
     logf("EL=%d MPIDR=%x", el, RD(mpidr_el1));
     logf("MIDR=%w", RD(midr_el1));
     logf("PFR0=%x", RD(id_aa64pfr0_el1));

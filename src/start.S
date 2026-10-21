@@ -51,7 +51,8 @@ _start:
  *
  * Besides the shared-memory report, every core paints a 32x32 square on the
  * framebuffer (column = Aff1, so cpu1..7 -> 8 slots): orange as the very first
- * thing it does, green once its MMU is on, then keeps repainting. That proof does
+ * thing it does, red + park if its context reads as zeros, blue just before the
+ * MMU enable, green once the MMU is on, then keeps repainting. That proof does
  * not depend on cache coherence with the boot CPU. FB row 900 of the visible area,
  * stride 4352. */
     .equ FB_SQ, 0xFDFFF000 + (1230 + 900) * 4352
@@ -88,6 +89,9 @@ secondary_entry:
     mov     x0, x4
     msr     spsel, #1
     ldr     x1, [x0, #0]
+    cbz     x1, .Lstale             /* context looks like zeros: boot CPU's writes not visible */
+    ldr     x2, [x0, #16]
+    cbz     x2, .Lstale
     mov     sp, x1
     adr     x9, exception_vectors
     msr     vbar_el1, x9
@@ -100,6 +104,7 @@ secondary_entry:
     str     x2, [x0, #32]
     dsb     sy
     sev
+    PAINT   0xFF0000FF              /* blue: context valid, enabling MMU now */
     ldr     x2, [x0, #8]
     msr     mair_el1, x2
     ldr     x2, [x0, #16]
@@ -126,6 +131,9 @@ secondary_entry:
     str     x2, [x0, #32]
     dsb     sy
     sev
+.Lstale:
+    PAINT   0xFFFF0000              /* red: stale/zero context, parked */
+    b       .Lstale
 .Lrepaint:
     PAINT   0xFF00FF00              /* green: MMU on, keep repainting */
     b       .Lrepaint
