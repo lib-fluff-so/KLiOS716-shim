@@ -46,7 +46,7 @@ _start:
     b       2b
 
 /* PSCI CPU_ON entry for secondary cores: MMU off, x0 = &struct sec_ctx (context_id).
- * ctx: +0 stack_top +8 mair +16 tcr +24 ttbr0 +32 state +40 mpidr +48 sctlr +56 el
+ * ctx (128 bytes): +0 stack_top +8 mair +16 tcr +24 ttbr0 +32 state +40 mpidr +48 sctlr +56 el +64 x0_seen
  * state 1 = entered, 2 = MMU on with the same tables as the boot CPU.
  *
  * Besides the shared-memory report, every core paints a 32x32 square on the
@@ -82,36 +82,63 @@ _start:
     .balign 4
     .globl secondary_entry
     .type secondary_entry, %function
+/* Does NOT trust x0/context_id (MTK's TF-A may not pass it): the core finds its own
+ * context from __seccpu_start + Aff1*128 and computes stack, MAIR, TCR and TTBR0 itself.
+ * It stores the x0 it was given at ctx+64 so the boot CPU can log it. */
 secondary_entry:
     msr     daifset, #0xf
-    mov     x4, x0                  /* PAINT clobbers x5-x12 only */
+    mov     x4, x0                  /* PAINT clobbers x5-x12, not x4 */
     PAINT   0xFFFFA500              /* orange: entered */
-    mov     x0, x4
+
+    mrs     x2, mpidr_el1
+    ubfx    x5, x2, #8, #8          /* idx = Aff1 */
+    adrp    x1, __seccpu_start
+    add     x1, x1, :lo12:__seccpu_start
+    lsl     x6, x5, #7
+    add     x0, x1, x6              /* x0 = ctx = __seccpu_start + idx*128 */
+    str     x4, [x0, #64]           /* x0 as received */
+    str     x2, [x0, #40]           /* mpidr */
+    mrs     x3, currentel
+    str     x3, [x0, #56]
+
+    add     x6, x5, #1              /* stack top = seccpu + 0x1000 + (idx+1)*0x2000 */
+    lsl     x6, x6, #13
+    add     x6, x6, x1
+    add     x6, x6, #0x1000
     msr     spsel, #1
-    ldr     x1, [x0, #0]
-    cbz     x1, .Lstale             /* context looks like zeros: boot CPU's writes not visible */
-    ldr     x2, [x0, #16]
-    cbz     x2, .Lstale
-    mov     sp, x1
+    mov     sp, x6
     adr     x9, exception_vectors
     msr     vbar_el1, x9
     isb
-    mrs     x2, mpidr_el1
-    str     x2, [x0, #40]
-    mrs     x2, currentel
-    str     x2, [x0, #56]
-    mov     x2, #1
-    str     x2, [x0, #32]
+
+    mov     x3, #1
+    str     x3, [x0, #32]           /* state = 1 */
     dsb     sy
     sev
-    PAINT   0xFF0000FF              /* blue: context valid, enabling MMU now */
-    ldr     x2, [x0, #8]
+
+    /* MAIR: Attr0 Device-nGnRnE, Attr1 Normal NC, Attr2 Normal WB */
+    mov     x2, #0x4400
+    movk    x2, #0xff, lsl #16
     msr     mair_el1, x2
-    ldr     x2, [x0, #16]
+    /* TCR: T0SZ=24, walks NC/OSH, TG0=16K, EPD1, TG1=16K, IPS=min(PARange,5) */
+    mov     x2, #0xa018
+    movk    x2, #0x4080, lsl #16
+    mrs     x3, id_aa64mmfr0_el1
+    and     x3, x3, #0xf
+    mov     x7, #5
+    cmp     x3, x7
+    csel    x3, x3, x7, ls
+    orr     x2, x2, x3, lsl #32
     msr     tcr_el1, x2
-    ldr     x2, [x0, #24]
+    /* TTBR0 = first 16 KiB-aligned table of the pool (the level-1 table) */
+    adrp    x2, __pgtbl_start
+    add     x2, x2, :lo12:__pgtbl_start
+    mov     x3, #0x3fff
+    add     x2, x2, x3
+    bic     x2, x2, x3
     msr     ttbr0_el1, x2
     isb
+    PAINT   0xFF0000FF              /* blue: about to enable the MMU */
     tlbi    vmalle1
     dsb     nsh
     isb
@@ -127,13 +154,10 @@ secondary_entry:
     isb
     mrs     x3, sctlr_el1
     str     x3, [x0, #48]
-    mov     x2, #2
-    str     x2, [x0, #32]
+    mov     x3, #2
+    str     x3, [x0, #32]           /* state = 2 */
     dsb     sy
     sev
-.Lstale:
-    PAINT   0xFFFF0000              /* red: stale/zero context, parked */
-    b       .Lstale
 .Lrepaint:
     PAINT   0xFF00FF00              /* green: MMU on, keep repainting */
     b       .Lrepaint
