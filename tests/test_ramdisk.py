@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent packaging assertions for the v0.7.0 raw newc CPIO ramdisk."""
+"""Independent packaging assertions for the v0.7.1 raw newc CPIO ramdisk."""
 import struct
 import sys
 import zlib

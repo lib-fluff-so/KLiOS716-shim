@@ -17,7 +17,7 @@ test_payload_entry:
     str     x1, [x19, #96]         /* payload_currentel */
     movz    x1, #0x4c4b
     movk    x1, #0x5437, lsl #16
-    movk    x1, #0x4553, lsl #32
+    movk    x1, #0x5345, lsl #32
     movk    x1, #0x3054, lsl #48 /* "KL7TEST0" in little-endian memory */
     str     x1, [x19, #72]         /* payload_magic */
     ldr     x16, [x19, #64]        /* return_address */
