@@ -45,6 +45,59 @@ _start:
     wfe
     b       2b
 
+/* PSCI CPU_ON entry for secondary cores: MMU off, x0 = &struct sec_ctx.
+ * ctx: +0 stack_top +8 mair +16 tcr +24 ttbr0 +32 state +40 mpidr +48 sctlr +56 el
+ * state 1 = entered, 2 = MMU on with the same tables as the boot CPU. */
+    .text
+    .balign 4
+    .globl secondary_entry
+    .type secondary_entry, %function
+secondary_entry:
+    msr     daifset, #0xf
+    msr     spsel, #1
+    ldr     x1, [x0, #0]
+    mov     sp, x1
+    adr     x9, exception_vectors
+    msr     vbar_el1, x9
+    isb
+    mrs     x2, mpidr_el1
+    str     x2, [x0, #40]
+    mrs     x2, currentel
+    str     x2, [x0, #56]
+    mov     x2, #1
+    str     x2, [x0, #32]
+    dsb     sy
+    sev
+    ldr     x2, [x0, #8]
+    msr     mair_el1, x2
+    ldr     x2, [x0, #16]
+    msr     tcr_el1, x2
+    ldr     x2, [x0, #24]
+    msr     ttbr0_el1, x2
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+    ic      iallu
+    dsb     nsh
+    isb
+    mrs     x2, sctlr_el1
+    orr     x2, x2, #1
+    bic     x2, x2, #2
+    bic     x2, x2, #4
+    bic     x2, x2, #0x1000
+    msr     sctlr_el1, x2
+    isb
+    mrs     x3, sctlr_el1
+    str     x3, [x0, #48]
+    mov     x2, #2
+    str     x2, [x0, #32]
+    dsb     sy
+    sev
+1:  wfe
+    b       1b
+    .size secondary_entry, . - secondary_entry
+
     .section .stack, "aw", %progbits
     .balign 16
     .space  0x10000
