@@ -1,6 +1,6 @@
 /* ios-kl7 diagnostic shim: framebuffer + register/DTB diagnostics + reset.
  * v0.5.2 adds a persistent_ram-compatible ramoops console log.
- * v0.6.0 adds the DTB memory map, a 16 KiB-granule identity map, MMU enable
+ * v0.6.1 adds the DTB memory map, a 16 KiB-granule identity map, MMU enable
  * and PSCI CPU_ON bring-up of all secondary cores (see mm.c, start.S).
  * Runs with MMU off: no libc and no SIMD; use aligned accesses only. */
 typedef unsigned char u8;
@@ -157,7 +157,7 @@ static void ramoops_init(void)
     b->sig = PERSISTENT_RAM_SIG;
     ramoops_barrier();
     ramoops_ready = 1;
-    ramoops_append_cstr("ios-kl7 v0.6.0: shim entered\n");
+    ramoops_append_cstr("ios-kl7 v0.6.1: shim entered\n");
 }
 
 static void ramoops_record_lines(void)
@@ -340,7 +340,7 @@ __attribute__((noreturn)) void exception_c_entry(struct exception_frame *f)
     }
 
     nlines = 0;
-    logf("KL7 EXCEPTION v0.6.0");
+    logf("KL7 EXCEPTION v0.6.1");
     logf("ESR=%w", f->esr);
     logf("EC=%x", (f->esr >> 26) & 0x3f);
     logf("ISS=%x", f->esr & 0x1ffffffUL);
@@ -434,6 +434,25 @@ __attribute__((unused)) static u64 psci_cpu_on(u64 mpidr, u64 entry, u64 ctx)
         :
         : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory", "cc");
     return x0;
+}
+
+/* PSCI AFFINITY_INFO(mpidr, level 0): 0 ON, 1 OFF, 2 ON_PENDING */
+static u64 psci_affinity(u64 mpidr)
+{
+    register u64 x0 __asm__("x0") = 0xC4000004UL;
+    register u64 x1 __asm__("x1") = mpidr;
+    register u64 x2 __asm__("x2") = 0;
+    __asm__ volatile("smc #0"
+        : "+r"(x0), "+r"(x1), "+r"(x2)
+        :
+        : "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory", "cc");
+    return x0;
+}
+
+/* clean+invalidate the cache line holding p so a read sees what another core wrote to DRAM */
+static void line_inval(const volatile void *p)
+{
+    __asm__ volatile("dc civac, %0\n dsb sy" :: "r"(p) : "memory");
 }
 
 static int overlaps(u64 a, u64 as, u64 b, u64 bs) { return a < b + bs && b < a + as; }
@@ -543,15 +562,21 @@ __attribute__((unused)) static void mmu_stage(const u8 *d, u32 dsz, u64 base, u6
         __asm__ volatile("dsb sy" ::: "memory");
         u64 r = psci_cpu_on(m, (u64)secondary_entry, (u64)&ctx[k]);
         tried++;
-        u64 t0 = cnt();
-        if (r == 0) while (*(volatile u64 *)&ctx[k].state != 2 && cnt() - t0 < freq / 10) {}
-        u64 st = *(volatile u64 *)&ctx[k].state;
-        klog("cpu: CPU_ON %x ret=%x state=%d mpidr=%x el=%x sctlr=%x", m, r, st,
+        u64 t0 = cnt(), st = 0;
+        while (cnt() - t0 < freq * 3 / 10) {
+            line_inval(&ctx[k]);
+            st = *(volatile u64 *)&ctx[k].state;
+            if (st == 2) break;
+        }
+        u64 aff = psci_affinity(m);
+        line_inval(&ctx[k]);
+        klog("cpu: CPU_ON %x entry=%x ret=%x aff=%x state=%d mpidr=%x el=%x sctlr=%x", m, (u64)secondary_entry, r, aff, st,
              *(volatile u64 *)&ctx[k].mpidr, *(volatile u64 *)&ctx[k].el, *(volatile u64 *)&ctx[k].sctlr);
-        logf("CPU%d %x R=%x ST=%d", (u64)k, m, r, st);
+        logf("CPU%d %x R=%x ST=%d A=%x", (u64)k, m, r, st, aff);
         if (st == 2) up++;
     }
     klog("cpu: %d of %d secondary cores reached MMU-on", (u64)up, (u64)tried);
+    klog("cpu: framebuffer squares: orange = core entered, green = core has MMU on");
     logf("SECONDARY UP %d/%d", (u64)up, (u64)tried);
 #endif
     show(freq, 8);
@@ -605,7 +630,7 @@ void shim_main(u64 dtb, u64 x1, u64 x2, u64 x3, u64 base)
     int dtb_ok = (magic == 0xd00dfeed && size < 0x800000);
 
     /* page 1: CPU / entry state */
-    logf("KL7 SHIM v0.6.0  1/5");
+    logf("KL7 SHIM v0.6.1  1/5");
     logf("EL=%d MPIDR=%x", el, RD(mpidr_el1));
     logf("MIDR=%w", RD(midr_el1));
     logf("PFR0=%x", RD(id_aa64pfr0_el1));

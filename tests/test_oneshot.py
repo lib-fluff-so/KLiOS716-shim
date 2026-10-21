@@ -46,16 +46,31 @@ for endian in "<>":
     print("arm ok, crc endian", endian, "->", p["slots"][1])
 
 d = Fake(False)
-before = bytes(d.misc)
+before, boot_before = bytes(d.misc), bytes(d.boot_b)
 buf = io.StringIO()
 try:
     with contextlib.redirect_stdout(buf): o.cmd_arm(d, "shim.img", 1, False)
     raise SystemExit("must refuse on a foreign layout")
 except SystemExit as e:
     assert e.code == 1, e.code
-changed = [i for i in range(len(before)) if before[i] != d.misc[i]]
-assert changed == [5008], f"only the HAL's own byte may differ, got {changed}"
-print("foreign layout refused, only the HAL's own byte changed; diff shown:", [l for l in buf.getvalue().splitlines() if "misc+" in l])
+assert bytes(d.misc) == before and bytes(d.boot_b) == boot_before and d.active == 0, "foreign layout: NOTHING may change"
+assert "ABORT before any change" in buf.getvalue()
+print("foreign layout: aborted with zero changes (misc, boot_b, active slot untouched)")
+
+# failure after set-active (read-back mismatch) must put slot A and the old misc back
+class Flaky(Fake):
+    def write(self, dev, off, data):
+        if dev == "misc" and off == o.CTL_OFF and len(data) == 32 and not getattr(self, "restoring", False):
+            return                       # patch silently lost -> read-back check must fail
+        super().write(dev, off, data)
+d = Flaky(True); orig = bytes(d.misc); buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(buf): o.cmd_arm(d, "shim.img", 1, False)
+    raise SystemExit("must fail")
+except SystemExit as e:
+    assert e.code == 1
+assert d.active == 0 and bytes(d.misc) == orig, "rolled back to slot A and original misc"
+print("read-back failure: rolled back to slot A with original misc")
 
 d = Fake(True); buf = io.StringIO()
 with contextlib.redirect_stdout(buf): o.cmd_probe(d)

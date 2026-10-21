@@ -45,15 +45,47 @@ _start:
     wfe
     b       2b
 
-/* PSCI CPU_ON entry for secondary cores: MMU off, x0 = &struct sec_ctx.
+/* PSCI CPU_ON entry for secondary cores: MMU off, x0 = &struct sec_ctx (context_id).
  * ctx: +0 stack_top +8 mair +16 tcr +24 ttbr0 +32 state +40 mpidr +48 sctlr +56 el
- * state 1 = entered, 2 = MMU on with the same tables as the boot CPU. */
+ * state 1 = entered, 2 = MMU on with the same tables as the boot CPU.
+ *
+ * Besides the shared-memory report, every core paints a 32x32 square on the
+ * framebuffer (column = Aff1, so cpu1..7 -> 8 slots): orange as the very first
+ * thing it does, green once its MMU is on, then keeps repainting. That proof does
+ * not depend on cache coherence with the boot CPU. FB row 900 of the visible area,
+ * stride 4352. */
+    .equ FB_SQ, 0xFDFFF000 + (1230 + 900) * 4352
+    .equ FB_STRIDE, 4352
+
+    .macro PAINT color
+        mrs     x5, mpidr_el1
+        ubfx    x5, x5, #8, #8
+        ldr     x7, =FB_SQ
+        mov     x8, #288
+        madd    x7, x5, x8, x7
+        add     x7, x7, #160
+        ldr     w6, =\color
+        mov     w9, #32
+        mov     x12, #FB_STRIDE
+    1:  mov     x10, x7
+        mov     w11, #32
+    2:  str     w6, [x10], #4
+        subs    w11, w11, #1
+        b.ne    2b
+        add     x7, x7, x12
+        subs    w9, w9, #1
+        b.ne    1b
+    .endm
+
     .text
     .balign 4
     .globl secondary_entry
     .type secondary_entry, %function
 secondary_entry:
     msr     daifset, #0xf
+    mov     x4, x0                  /* PAINT clobbers x5-x12 only */
+    PAINT   0xFFFFA500              /* orange: entered */
+    mov     x0, x4
     msr     spsel, #1
     ldr     x1, [x0, #0]
     mov     sp, x1
@@ -94,8 +126,10 @@ secondary_entry:
     str     x2, [x0, #32]
     dsb     sy
     sev
-1:  wfe
-    b       1b
+.Lrepaint:
+    PAINT   0xFF00FF00              /* green: MMU on, keep repainting */
+    b       .Lrepaint
+    .ltorg
     .size secondary_entry, . - secondary_entry
 
     .section .stack, "aw", %progbits

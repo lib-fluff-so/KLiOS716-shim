@@ -152,6 +152,14 @@ def cmd_arm(be, image, tries, reboot):
     print("misc backup:", bname)
     pre = parse(backup)
     show(pre)
+    if not pre or not pre["crc_ok"]:
+        # Nothing has been changed yet: leave it that way. Arming with an unknown
+        # layout would leave B active with the HAL's default (7) tries.
+        print("ABORT before any change: misc is not in the AOSP bootloader_control layout,")
+        print("so the retry count cannot be limited to one. Run `probe` and send its output.")
+        sys.exit(1)
+    if pre["slots"][1]["successful"]:
+        print("note: slot B is currently marked successful; set-active will clear that")
 
     print(f"flashing {image} ({len(data)} bytes) -> {boot_b}")
     be.write(boot_b, 0, data)
@@ -160,26 +168,27 @@ def cmd_arm(be, image, tries, reboot):
         sys.exit("boot_b read-back mismatch - NOT switching slots")
     print("boot_b verified")
 
+    def back_to_a(why):
+        print(why, "- restoring misc backup and making slot A active again")
+        be.write(misc, 0, backup)
+        be.run("bootctl set-active-boot-slot 0")
+        be.write(misc, 0, backup)
+        sys.exit(1)
+
     be.run("bootctl set-active-boot-slot 1")
     after = parse(be.read(misc, 0, SPAN))
     show(after)
     if not after or not after["crc_ok"]:
-        print("Layout is not the AOSP one: leaving the HAL default try count alone.")
-        print("Run `probe` and send its output; or use  pc/back_to_a.sh  if B keeps looping.")
-        diff(backup, be.read(misc, 0, SPAN))
-        sys.exit(1)
+        back_to_a("layout changed unexpectedly after set-active")
     if not after["slots"][1]["priority"]:
-        sys.exit("slot B has priority 0 after set-active - unexpected, not patching")
+        back_to_a("slot B has priority 0 after set-active")
     blob = be.read(misc, 0, SPAN)
     new = set_tries(blob, after["endian"], 1, tries)
     be.write(misc, CTL_OFF, new)
     chk = parse(be.read(misc, 0, SPAN))
     show(chk)
     if not (chk and chk["crc_ok"] and chk["slots"][1]["tries"] == tries and chk["slots"][1]["successful"] == 0):
-        print("read-back check failed, restoring misc backup")
-        be.write(misc, 0, backup)
-        be.run("bootctl set-active-boot-slot 0")
-        sys.exit(1)
+        back_to_a("read-back check failed")
     print(f"armed: slot B active with {tries} attempt(s); slot A takes over afterwards.")
     if reboot:
         be.run("reboot")
