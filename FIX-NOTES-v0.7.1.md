@@ -20,4 +20,4 @@ handoff: PASS; payload executed above 4 GiB, MMU off, x0=boot_args
 progress 100%: payload execution and handoff ABI verified
 ```
 
-Addresses and SCTLR value may vary; the decisive condition is `handoff: PASS`. The fixed build has not been confirmed on the phone yet.
+Addresses and SCTLR value may vary; the decisive condition is `handoff: PASS`. The user has since confirmed that the fixed v0.7.1 handoff PASS was observed on the physical phone.

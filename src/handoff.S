@@ -19,5 +19,8 @@ transfer_to_payload:
     bic     x2, x2, #0x1000     /* SCTLR_EL1.I = 0 */
     msr     sctlr_el1, x2
     isb
+    ic      iallu
+    dsb     sy
+    isb
     br      x16
     .size transfer_to_payload, . - transfer_to_payload
