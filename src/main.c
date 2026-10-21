@@ -1,8 +1,9 @@
-/* ios-kl7 v0.7.1: ramoops-first diagnostics, bottom-only progress UI, and a
+/* ios-kl7 v0.8.0: ramoops-first diagnostics, bottom-only progress UI, and a
  * controlled high-RAM test-payload handoff. v0.6.3 proved secondary CPU_ON;
  * this stage leaves secondaries off so a future XNU entry can own their startup.
  * No libc or SIMD. The MMU stage intentionally keeps caches disabled. */
 typedef unsigned char u8;
+typedef unsigned short u16;
 typedef unsigned int u32;
 typedef unsigned long u64;
 typedef __builtin_va_list va_list;
@@ -13,6 +14,7 @@ typedef __builtin_va_list va_list;
 #include "font.h"
 #include "mm.h"
 #include "loader.h"
+#include "xnu_payload.h"
 
 #ifndef TEST_EXCEPTION_VECTORS
 #define TEST_EXCEPTION_VECTORS 0
@@ -27,10 +29,13 @@ typedef __builtin_va_list va_list;
 #define MMU_FAULT_TEST 0 /* 1: after the MMU is on, read a no-map address on purpose */
 #endif
 #ifndef CPU_BRINGUP
-#define CPU_BRINGUP 0    /* v0.7.1: leave secondaries OFF for XNU to start */
+#define CPU_BRINGUP 0    /* Leave secondaries OFF for XNU to start. */
 #endif
 #ifndef LOADER_HANDOFF
 #define LOADER_HANDOFF 1 /* 0: stop after diagnostics, without payload handoff */
+#endif
+#ifndef XNU_PAYLOAD
+#define XNU_PAYLOAD 0 /* 0: verified test ABI; 1: SWEETXNU Mach-O container */
 #endif
 #if LOADER_HANDOFF && CPU_BRINGUP
 #error "LOADER_HANDOFF requires CPU_BRINGUP=0; XNU must start its own secondary CPUs"
@@ -57,6 +62,7 @@ typedef __builtin_va_list va_list;
 #define PROGRESS_BAR_H 14
 #define TEST_PAYLOAD_BASE 0x140000000UL
 #define TEST_PAYLOAD_NAME "ios-kl7-test.bin"
+#define XNU_PAYLOAD_NAME "ios-kl7-xnu.bin"
 #define TEST_PAYLOAD_RESULT 0x3054534554374c4bUL /* bytes: KL7TEST0 */
 #define BOOT_ARGS_MAGIC 0x30544f4f42374c4bUL /* bytes: KL7BOOT0 */
 
@@ -174,7 +180,7 @@ static void ramoops_init(void)
     b->sig = PERSISTENT_RAM_SIG;
     ramoops_barrier();
     ramoops_ready = 1;
-    ramoops_append_cstr("ios-kl7 v0.7.1: shim entered\n");
+    ramoops_append_cstr("ios-kl7 v0.8.0: shim entered\n");
 }
 
 #else
@@ -404,7 +410,7 @@ __attribute__((noreturn)) void exception_c_entry(struct exception_frame *f)
         for (;;) __asm__ volatile("wfe");
     }
 
-    logf("KL7 EXCEPTION v0.7.1");
+    logf("KL7 EXCEPTION v0.8.0");
     logf("ESR=%w", f->esr);
     logf("EC=%x", (f->esr >> 26) & 0x3f);
     logf("ISS=%x", f->esr & 0x1ffffffUL);
@@ -662,6 +668,218 @@ static int mmu_stage(const u8 *d, u32 dsz, u64 base, u64 freq)
 #endif
 
 #ifndef EMULATOR_COMPAT
+extern void transfer_to_payload(u64 target, u64 boot_args) __attribute__((noreturn));
+static int range_in_ram(u64 a, u64 sz);
+
+#if XNU_PAYLOAD
+#define XNU_FB_BASE   0xFDFFF000UL
+#define XNU_FB_STRIDE 4352u
+#define XNU_FB_WIDTH  1080u
+#define XNU_FB_HEIGHT 2436u
+#define XNU_EXPECTED_PHYS_BASE 0x140000000UL
+#define XNU_EXPECTED_MEM_SIZE  0xFFEFF000UL
+
+static u64 align_up_u64(u64 n, u64 align)
+{
+    if (n > (u64)-1 - (align - 1)) return 0;
+    return (n + align - 1) & ~(align - 1);
+}
+
+/* MMU remains enabled, but the loader intentionally has C/I caches disabled.
+ * Word copies avoid the byte-at-a-time loop on a multi-megabyte kernel image. */
+static void copy_words(u64 dst, const u8 *src, u64 n)
+{
+    volatile u64 *d = (volatile u64 *)dst;
+    const volatile u64 *s = (const volatile u64 *)src;
+    for (u64 i = 0; i < (n + 7u) / 8u; i++) d[i] = s[i];
+}
+
+static void zero_words(u64 dst, u64 n)
+{
+    volatile u64 *d = (volatile u64 *)dst;
+    for (u64 i = 0; i < n / 8u; i++) d[i] = 0;
+}
+
+static int xnu_target_region_ok(u64 dst, u64 sz, u64 dtb, u32 dsz,
+                                u64 initrd_start, u64 initrd_end, u64 base)
+{
+    u64 image_sz = (u64)(_end - _start);
+    u64 pool = (u64)__pgtbl_start;
+    u64 pool_sz = (u64)(__pgtbl_end - __pgtbl_start);
+    u64 sec = (u64)__seccpu_start;
+    u64 sec_sz = (u64)(__seccpu_end - __seccpu_start);
+    if (!sz || dst + sz < dst || !range_in_ram(dst, sz)) return 0;
+    if (!region_free(dst, sz, dtb, dsz, initrd_start, initrd_end)) return 0;
+    if (overlaps(dst, sz, base, image_sz) || overlaps(dst, sz, pool, pool_sz) ||
+        overlaps(dst, sz, sec, sec_sz) || overlaps(dst, sz, RAMOOPS_BASE, RAMOOPS_SIZE))
+        return 0;
+    return 1;
+}
+
+static int loader_handoff_xnu(const u8 *d, u32 dsz, u64 base,
+                              u64 initrd_start, u64 initrd_end,
+                              const loader_u8 *file, u32 file_size)
+{
+    struct xnu_payload_view p;
+    int rc = xnu_payload_parse(file, file_size, &p);
+    if (rc) {
+        logf("xnu: SWEETXNU container rejected rc=%d", (u64)(-rc));
+        progress_fail("XNU payload container is malformed");
+        return -30;
+    }
+    logf("xnu: payload size=%d segments=%d virt=%x entry=%x", (u64)file_size,
+         (u64)p.nsegs, p.virt_base, p.entry_va);
+    logf("xnu: phys=%x mem=%x end=%x adt=%x+%x", p.phys_base, p.mem_size,
+         p.kernel_end, p.adt_off, p.adt_size);
+    if (p.phys_base != XNU_EXPECTED_PHYS_BASE ||
+        p.mem_size != XNU_EXPECTED_MEM_SIZE) {
+        logf("xnu: refusing non-KL7 ADT RAM phys=%x size=%x", p.phys_base, p.mem_size);
+        progress_fail("payload ADT does not describe the expected KL7 upper DRAM bank");
+        return -31;
+    }
+    if (!range_in_ram(p.phys_base, p.mem_size)) {
+        progress_fail("ADT kernel RAM range is outside the live FDT RAM banks");
+        return -32;
+    }
+    progress_set(87, "XNU container and target RAM validated");
+
+    /* Preflight every physical write before the first segment is copied. */
+    u64 max_end_va = p.virt_base;
+    int entry_found = 0;
+    for (u32 i = 0; i < p.nsegs; i++) {
+        struct xnu_payload_segment seg;
+        if (xnu_payload_get_segment(&p, i, &seg)) return -33;
+        u64 delta = seg.vmaddr - p.virt_base;
+        if (delta > p.mem_size || seg.vmsize > p.mem_size - delta ||
+            p.phys_base > (u64)-1 - delta) {
+            logf("xnu: segment %d VA=%x size=%x exceeds ADT RAM", (u64)i, seg.vmaddr, seg.vmsize);
+            progress_fail("an XNU segment exceeds the ADT RAM window");
+            return -34;
+        }
+        u64 dst = p.phys_base + delta;
+        if (!xnu_target_region_ok(dst, seg.vmsize, (u64)d, dsz,
+                                  initrd_start, initrd_end, base)) {
+            logf("xnu: segment %d destination rejected PA=%x size=%x", (u64)i, dst, seg.vmsize);
+            progress_fail("an XNU segment overlaps live or reserved memory");
+            return -35;
+        }
+        u64 pa0 = 0, pa1 = 0;
+        if (!mm_translate(&mtab, dst, &pa0, 0) || pa0 != dst ||
+            !mm_translate(&mtab, dst + seg.vmsize - 1, &pa1, 0) ||
+            pa1 != dst + seg.vmsize - 1) {
+            logf("xnu: segment %d lacks an identity mapping", (u64)i);
+            progress_fail("an XNU segment is not identity-mapped");
+            return -36;
+        }
+        u64 seg_end = seg.vmaddr + seg.vmsize;
+        if (seg_end > max_end_va) max_end_va = seg_end;
+        if (p.entry_va >= seg.vmaddr && p.entry_va < seg_end) entry_found = 1;
+    }
+    if (!entry_found || p.kernel_end < max_end_va) {
+        progress_fail("XNU entry or kernel-end metadata is inconsistent");
+        return -37;
+    }
+
+    u64 adt_pa = p.phys_base + (p.kernel_end - p.virt_base);
+    u64 adt_copy_span = align_up_u64(p.adt_size, 8);
+    if (!adt_copy_span || adt_pa < p.phys_base ||
+        adt_pa > (u64)-1 - adt_copy_span) {
+        progress_fail("ADT destination address overflow");
+        return -38;
+    }
+    if (!xnu_target_region_ok(adt_pa, adt_copy_span, (u64)d, dsz,
+                              initrd_start, initrd_end, base)) {
+        logf("xnu: ADT destination rejected PA=%x size=%x", adt_pa, adt_copy_span);
+        progress_fail("ADT destination overlaps live or reserved memory");
+        return -39;
+    }
+    u64 adt_va = p.virt_base + (adt_pa - p.phys_base);
+    u64 ba_pa = align_up_u64(adt_pa + adt_copy_span, XNU_PAGE_SIZE);
+    if (!ba_pa || ba_pa > (u64)-1 - XNU_PAGE_SIZE) {
+        progress_fail("boot_args destination address overflow");
+        return -40;
+    }
+    u64 ba_end = ba_pa + XNU_PAGE_SIZE;
+    if (ba_pa < p.phys_base || ba_end > p.phys_base + p.mem_size ||
+        !xnu_target_region_ok(ba_pa, XNU_PAGE_SIZE, (u64)d, dsz,
+                              initrd_start, initrd_end, base)) {
+        logf("xnu: boot_args destination rejected PA=%x size=%x", ba_pa, (u64)XNU_PAGE_SIZE);
+        progress_fail("boot_args exceed available kernel RAM or overlap live memory");
+        return -41;
+    }
+
+    progress_set(90, "all XNU segment destinations preflighted");
+    for (u32 i = 0; i < p.nsegs; i++) {
+        struct xnu_payload_segment seg;
+        (void)xnu_payload_get_segment(&p, i, &seg);
+        u64 dst = p.phys_base + (seg.vmaddr - p.virt_base);
+        copy_words(dst, file + seg.file_off, seg.file_size);
+        u64 copied = align_up_u64(seg.file_size, 8);
+        if (seg.vmsize > copied) zero_words(dst + copied, seg.vmsize - copied);
+        logf("xnu: copied seg %d VA=%x PA=%x file=%x vm=%x", (u64)i,
+             seg.vmaddr, dst, seg.file_size, seg.vmsize);
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    progress_set(94, "Mach-O segments copied to high DRAM");
+
+    copy_words(adt_pa, file + p.adt_off, p.adt_size);
+    zero_words(ba_pa, XNU_PAGE_SIZE);
+
+    /* XNU arm64 boot_args rev 2, matching the sweet ABI exactly (736 bytes). */
+    struct boot_video {
+        u64 v_baseAddr, v_display, v_rowBytes, v_width, v_height, v_depth;
+    };
+    struct xnu_boot_args {
+        u16 Revision, Version;
+        u64 virtBase, physBase, memSize, topOfKernelData;
+        struct boot_video Video;
+        u32 machineType;
+        u64 deviceTreeP;
+        u32 deviceTreeLength;
+        char CommandLine[XNU_BOOT_LINE_LENGTH];
+        u64 bootFlags, memSizeActual;
+    };
+    _Static_assert(__builtin_offsetof(struct xnu_boot_args, Video) == 40, "boot_args Video offset");
+    _Static_assert(__builtin_offsetof(struct xnu_boot_args, CommandLine) == 108, "boot_args command line offset");
+    _Static_assert(sizeof(struct xnu_boot_args) == 736, "boot_args rev 2 size");
+    volatile struct xnu_boot_args *ba = (volatile struct xnu_boot_args *)ba_pa;
+    ba->Revision = 2;
+    ba->Version = 2;
+    ba->virtBase = p.virt_base;
+    ba->physBase = p.phys_base;
+    ba->memSize = p.mem_size;
+    ba->topOfKernelData = ba_end;
+    ba->Video.v_baseAddr = XNU_FB_BASE;
+    ba->Video.v_display = 1;
+    ba->Video.v_rowBytes = XNU_FB_STRIDE;
+    ba->Video.v_width = XNU_FB_WIDTH;
+    ba->Video.v_height = XNU_FB_HEIGHT;
+    ba->Video.v_depth = 32;
+    ba->machineType = 0;
+    ba->deviceTreeP = adt_va; /* XNU's virtual address after it builds its own map. */
+    ba->deviceTreeLength = (u32)p.adt_size;
+    for (u32 i = 0; i < XNU_BOOT_LINE_LENGTH; i++) ba->CommandLine[i] = (char)p.cmdline[i];
+    ba->bootFlags = 0;
+    ba->memSizeActual = p.mem_size;
+    __asm__ volatile("dsb sy" ::: "memory");
+    logf("xnu: boot_args PA=%x top=%x ADT PA=%x VA=%x len=%x", ba_pa,
+         ba_end, adt_pa, adt_va, p.adt_size);
+    logf("xnu: rev=%d ver=%d phys=%x virt=%x mem=%x", (u64)ba->Revision,
+         (u64)ba->Version, ba->physBase, ba->virtBase, ba->memSize);
+
+    u64 entry_pa = p.phys_base + (p.entry_va - p.virt_base);
+    if (entry_pa < p.phys_base || entry_pa >= p.phys_base + p.mem_size) {
+        progress_fail("translated XNU entry is outside kernel RAM");
+        return -42;
+    }
+    logf("handoff: XNU entry PA=%x x0=boot_args PA=%x; secondary CPUs OFF", entry_pa, ba_pa);
+    progress_set(98, "XNU boot_args rev 2 and ADT ready");
+    progress_set(99, "branching to XNU with MMU/caches off");
+    transfer_to_payload(entry_pa, ba_pa);
+}
+#endif
+
+#if !XNU_PAYLOAD
 struct test_boot_args {
     u64 signature;             /* 0 */
     u64 version;               /* 8 */
@@ -688,7 +906,7 @@ _Static_assert(__builtin_offsetof(struct test_boot_args, payload_x0) == 104,
 
 static struct test_boot_args handoff_args __attribute__((aligned(16)));
 static u64 boot_timer_freq;
-extern void transfer_to_payload(u64 target, u64 boot_args) __attribute__((noreturn));
+#endif
 
 static int range_in_ram(u64 a, u64 sz)
 {
@@ -702,6 +920,7 @@ static int range_in_ram(u64 a, u64 sz)
     return 0;
 }
 
+#if !XNU_PAYLOAD
 static int payload_destination_ok(u64 dst, u64 sz, u64 dtb, u32 dsz,
                                   u64 initrd_start, u64 initrd_end, u64 base)
 {
@@ -718,6 +937,7 @@ static int payload_destination_ok(u64 dst, u64 sz, u64 dtb, u32 dsz,
     if (overlaps(dst, sz, RAMOOPS_BASE, RAMOOPS_SIZE)) return 0;
     return 1;
 }
+#endif
 
 static __attribute__((noreturn)) void reset_after(u64 freq, u32 seconds)
 {
@@ -730,6 +950,7 @@ static __attribute__((noreturn)) void reset_after(u64 freq, u32 seconds)
     for (;;) __asm__ volatile("wfe");
 }
 
+#if !XNU_PAYLOAD
 static __attribute__((noreturn)) void payload_return(struct test_boot_args *a)
 {
     logf("handoff: test payload returned to shim at EL=%x", RD(CurrentEL));
@@ -757,6 +978,7 @@ static __attribute__((noreturn)) void payload_return(struct test_boot_args *a)
     progress_set(100, "payload execution and handoff ABI verified");
     reset_after(boot_timer_freq, 3);
 }
+#endif
 
 static int loader_handoff(const u8 *d, u32 dsz, u64 base)
 {
@@ -778,6 +1000,18 @@ static int loader_handoff(const u8 *d, u32 dsz, u64 base)
 
     const loader_u8 *file = 0;
     u32 file_size = 0;
+#if XNU_PAYLOAD
+    int rc = loader_cpio_find_file((const loader_u8 *)is, ie - is,
+                                   XNU_PAYLOAD_NAME, &file, &file_size);
+    if (rc || !file) {
+        logf("xnu: CPIO payload search failed rc=%d", (u64)(-rc));
+        progress_fail("XNU payload is absent from the live initrd");
+        return -22;
+    }
+    logf("xnu: CPIO file %s at %x size=%d", XNU_PAYLOAD_NAME, (u64)file, (u64)file_size);
+    progress_set(84, "SWEETXNU payload found in raw CPIO");
+    return loader_handoff_xnu(d, dsz, base, is, ie, file, file_size);
+#else
     int rc = loader_cpio_find_file((const loader_u8 *)is, ie - is,
                                    TEST_PAYLOAD_NAME, &file, &file_size);
     if (rc || !file) {
@@ -844,6 +1078,7 @@ static int loader_handoff(const u8 *d, u32 dsz, u64 base)
     logf("handoff: secondary CPUs left OFF; disabling MMU/caches before branch");
     progress_set(99, "entering copied test payload with x0=boot_args");
     transfer_to_payload(dst, (u64)&handoff_args);
+#endif
 }
 #endif
 
@@ -862,7 +1097,9 @@ void shim_main(u64 dtb, u64 x1, u64 x2, u64 x3, u64 base)
     u64 freq = RD(cntfrq_el0);
     if (!freq) freq = 13000000;
 #ifndef EMULATOR_COMPAT
+#if !XNU_PAYLOAD
     boot_timer_freq = freq;
+#endif
 #endif
 
 #ifdef EMULATOR_COMPAT
@@ -884,7 +1121,7 @@ void shim_main(u64 dtb, u64 x1, u64 x2, u64 x3, u64 base)
     if (dtb) { magic = be32(d); size = be32(d + 4); }
     int dtb_ok = (magic == 0xd00dfeed && size >= 40 && size < 0x800000);
 
-    logf("ios-kl7 SHIM v0.7.1");
+    logf("ios-kl7 SHIM v0.8.0");
     logf("entry: EL=%d MPIDR=%x MIDR=%w", el, RD(mpidr_el1), RD(midr_el1));
     logf("cpu: PFR0=%x MMFR0=%x ISAR0=%x ISAR1=%x", RD(id_aa64pfr0_el1),
          RD(id_aa64mmfr0_el1), RD(id_aa64isar0_el1), RD(id_aa64isar1_el1));
