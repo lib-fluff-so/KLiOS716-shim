@@ -1,15 +1,15 @@
 # ios-kl7
 
-Bare-metal ARM64 bring-up shim for the TECNO KL7 / MediaTek MT6789, aimed at eventually understanding the requirements for a Darwin/XNU experiment. **v0.7.0 is a loader-handoff test build, not an XNU boot.**
+Bare-metal ARM64 bring-up shim for the TECNO KL7 / MediaTek MT6789, aimed at eventually understanding the requirements for a Darwin/XNU experiment. **v0.7.1 is a loader-handoff test build, not an XNU boot.**
 
 ## Current state
 
 - The device has booted the shim through `boot_b`; ramoops logging has been confirmed on-device.
 - v0.6.3 was confirmed on the phone: MMU with a 16 KiB translation granule works; all seven secondary cores entered the test code and enabled the shared identity map; GICD PIDR2 reports GICv3.
-- In v0.7.0, `CPU_BRINGUP=0` by default. Secondary CPUs are left OFF so the future XNU entry can start them through its own platform code.
+- In v0.7.1, `CPU_BRINGUP=0` by default. Secondary CPUs are left OFF so the future XNU entry can start them through its own platform code.
 - The shim builds an identity map with caches off, verifies the GICv3 distributor and RAM access, locates a small test payload in the supplied initrd's raw newc CPIO, checks its size and CRC32, checks a high-RAM target at `0x140000000` against DTB RAM ranges and known live/reserved regions, copies and rechecks it, then jumps to it with `SCTLR_EL1.M/C/I=0` and `x0=&test_boot_args`.
 - The payload returns to a shim trampoline and reports what it observed. Only after validating its execution address, return ABI, `x0`, EL and MMU-off state does the progress bar reach 100%. It then requests a reset after three seconds.
-- **The v0.7.0 target handoff has not yet been verified on the phone.** A successful compile and host tests do not prove that the device bootloader exposes the injected CPIO at the DTB's initrd range or that the high-RAM branch succeeds on hardware.
+- **The v0.7.1 target handoff has not yet been verified on the phone.** A successful compile and host tests do not prove that the device bootloader exposes the injected CPIO at the DTB's initrd range or that the high-RAM branch succeeds on hardware.
 
 ## Display and logging
 
@@ -52,7 +52,7 @@ Do not leave `TEST_EXCEPTION_VECTORS=1` in the build used for normal boot testin
 
 ## Ramoops log
 
-The current image uses the observed Linux 5.10 layout: region `0x48090000..0x4816ffff`, console zone `0x480EF000..0x4812EFFF`. The shim writes only the console zone. Extraction after reset was confirmed for the earlier version on this device; v0.7.0's longer loader log and reset path still need a fresh on-device check. If the device kernel/ramoops layout changes, re-check the addresses before relying on the log. `RAMOOPS_LOG=0` disables physical ramoops writes.
+The current image uses the observed Linux 5.10 layout: region `0x48090000..0x4816ffff`, console zone `0x480EF000..0x4812EFFF`. The shim writes only the console zone. Extraction after reset was confirmed for the earlier version on this device; v0.7.1's longer loader log and reset path still need a fresh on-device check. If the device kernel/ramoops layout changes, re-check the addresses before relying on the log. `RAMOOPS_LOG=0` disables physical ramoops writes.
 
 ## Build switches
 

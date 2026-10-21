@@ -1,4 +1,4 @@
-/* ios-kl7 v0.7.0: ramoops-first diagnostics, bottom-only progress UI, and a
+/* ios-kl7 v0.7.1: ramoops-first diagnostics, bottom-only progress UI, and a
  * controlled high-RAM test-payload handoff. v0.6.3 proved secondary CPU_ON;
  * this stage leaves secondaries off so a future XNU entry can own their startup.
  * No libc or SIMD. The MMU stage intentionally keeps caches disabled. */
@@ -27,7 +27,7 @@ typedef __builtin_va_list va_list;
 #define MMU_FAULT_TEST 0 /* 1: after the MMU is on, read a no-map address on purpose */
 #endif
 #ifndef CPU_BRINGUP
-#define CPU_BRINGUP 0    /* v0.7.0: leave secondaries OFF for XNU to start */
+#define CPU_BRINGUP 0    /* v0.7.1: leave secondaries OFF for XNU to start */
 #endif
 #ifndef LOADER_HANDOFF
 #define LOADER_HANDOFF 1 /* 0: stop after diagnostics, without payload handoff */
@@ -174,7 +174,7 @@ static void ramoops_init(void)
     b->sig = PERSISTENT_RAM_SIG;
     ramoops_barrier();
     ramoops_ready = 1;
-    ramoops_append_cstr("ios-kl7 v0.7.0: shim entered\n");
+    ramoops_append_cstr("ios-kl7 v0.7.1: shim entered\n");
 }
 
 #else
@@ -404,7 +404,7 @@ __attribute__((noreturn)) void exception_c_entry(struct exception_frame *f)
         for (;;) __asm__ volatile("wfe");
     }
 
-    logf("KL7 EXCEPTION v0.7.0");
+    logf("KL7 EXCEPTION v0.7.1");
     logf("ESR=%w", f->esr);
     logf("EC=%x", (f->esr >> 26) & 0x3f);
     logf("ISS=%x", f->esr & 0x1ffffffUL);
@@ -884,7 +884,7 @@ void shim_main(u64 dtb, u64 x1, u64 x2, u64 x3, u64 base)
     if (dtb) { magic = be32(d); size = be32(d + 4); }
     int dtb_ok = (magic == 0xd00dfeed && size >= 40 && size < 0x800000);
 
-    logf("ios-kl7 SHIM v0.7.0");
+    logf("ios-kl7 SHIM v0.7.1");
     logf("entry: EL=%d MPIDR=%x MIDR=%w", el, RD(mpidr_el1), RD(midr_el1));
     logf("cpu: PFR0=%x MMFR0=%x ISAR0=%x ISAR1=%x", RD(id_aa64pfr0_el1),
          RD(id_aa64mmfr0_el1), RD(id_aa64isar0_el1), RD(id_aa64isar1_el1));
