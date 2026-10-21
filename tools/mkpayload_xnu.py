@@ -65,7 +65,10 @@ def parse_macho(buf):
                 raise ValueError('LC_SEGMENT_64 is shorter than 72 bytes')
             name = buf[off + 8:off + 24].split(b'\0')[0].decode(errors='replace')
             vmaddr, vmsize, fileoff, filesize = struct.unpack_from('<4Q', buf, off + 24)
-            if filesize > vmsize:
+            # __CTF is non-mapped debug metadata in some Apple kernel Mach-Os.
+            # It can have file bytes with vmsize == 0; keep its load-command slot
+            # (the chained-fixups table indexes Mach-O segments), but do not load it.
+            if filesize > vmsize and not (name == '__CTF' and vmsize == 0):
                 raise ValueError(f'{name}: filesize exceeds vmsize')
             if fileoff > len(buf) or filesize > len(buf) - fileoff:
                 raise ValueError(f'{name}: file range extends beyond Mach-O')

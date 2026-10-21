@@ -58,8 +58,15 @@ def make_macho(path):
     struct.pack_into('<II', thread, 8, 6, 68)  # ARM_THREAD_STATE64 flavor/count
     struct.pack_into('<Q', thread, 16 + 32 * 8, vmaddr + 0x100)  # PC
 
-    commands = bytes(text + data + thread)
-    header = struct.pack('<8I', 0xfeedfacf, 0x0100000c, 2, 2, 3, len(commands), 0, 0)
+    # Apple kernelcaches may contain a non-mapped __CTF metadata segment:
+    # it has file bytes but vmsize == 0, and must be ignored by the loader.
+    ctf = bytearray(72)
+    struct.pack_into('<II', ctf, 0, 0x19, 72)  # LC_SEGMENT_64
+    ctf[8:24] = b'__CTF\0' + b'\0' * 10
+    struct.pack_into('<QQQQiiII', ctf, 24, 0, 0, 0x300, 0x80, 0, 0, 0, 0)
+
+    commands = bytes(text + data + thread + ctf)
+    header = struct.pack('<8I', 0xfeedfacf, 0x0100000c, 2, 2, 4, len(commands), 0, 0)
     blob = bytearray(0x400)
     blob[:32] = header
     blob[32:32 + len(commands)] = commands
@@ -84,6 +91,11 @@ def run(output_dir):
     cpio_path = output_dir / 'xnu.cpio'
     make_macho(kernel)
     adt_path.write_bytes(adt_blob)
+
+    # Parser retains the __CTF slot for segment-index compatibility, while the
+    # produced payload contains only the two mapped kernel segments.
+    parsed = mkpayload_xnu.parse_macho(bytearray(kernel.read_bytes()))
+    assert any(s['name'] == '__CTF' and s['vmsize'] == 0 for s in parsed['segs'])
 
     payload, info = mkpayload_xnu.build(str(kernel), str(adt_path), 'debug=0xc cpus=1 keepsyms=1')
     payload_path.write_bytes(payload)
