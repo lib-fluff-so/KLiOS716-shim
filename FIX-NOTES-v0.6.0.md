@@ -29,3 +29,10 @@ Build, `pc/flash_shim.sh`, let the shim run (pages 1-4 take 16 s, then page 5 ~8
 | `cpu: N of M secondary cores reached MMU-on` | final result |
 
 Use `make MMU_FAULT_TEST=1` once afterwards: it must end on an exception screen with a translation fault (EC `0x25`) at FAR `0x70000000`, which proves no-map regions are really unmapped. Use `CPU_BRINGUP=0` or `MMU_STAGE=0` to bisect if something hangs.
+
+## v0.6.1 - secondary-core diagnostics (after the first device run: `CPUn <mpidr> R=0 ST=0` for all cores)
+`R=0` = PSCI accepted CPU_ON, `ST=0` = no report from the core in shared memory within 100 ms. Three explanations: the core never reached `secondary_entry` (entry/EL), it reached it but the boot CPU read a stale cache line, or it was just slow. v0.6.1 separates them without relying on shared memory:
+- every core paints a 32x32 square on the framebuffer in its very first instructions (column = Aff1): **orange = entered `secondary_entry`**, **green = its MMU is on**, then it keeps repainting (so the page render does not erase it). Squares sit at visible row 900, x = 40 + 72*Aff1.
+- the boot CPU invalidates the context cache line before every poll, waits up to 300 ms, and asks PSCI `AFFINITY_INFO` (`A=` on screen/log: 0 ON, 1 OFF, 2 ON_PENDING).
+
+Reading it: no square + `A=0` -> core runs but never at our entry (wrong entry address/EL, or firmware jumped elsewhere); no square + `A=1` -> core went off again; orange square only -> reached the entry but died before/at the MMU enable (look for an exception screen); green square but `ST=0` -> cores are fine, only the shared-memory report was stale; `ST=2` -> everything works.
