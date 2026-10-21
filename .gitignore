@@ -1,5 +1,6 @@
 # Build and emulator outputs
 /out/
+/out-*/
 /out-exception/
 /out-emu/
 /build/
