@@ -49,4 +49,4 @@ Defer until kernel logs and root storage work:
 
 ## Immediate next experiment
 
-Build a single-core KL7 XNU with the Phase 1 build patches and only the early-console/platform pieces needed for Phase 2. Use the v0.8.0 loader with a real arm64 kernelcache and real D22AP `/product` data. The first success criterion is a stable XNU-originated marker on the framebuffer or ramoops-compatible console; do **not** enable SMP or depend on UFS until that marker is repeatable.
+Build a single-core KL7 XNU with the Phase 1 build patches and only the early-console/platform pieces needed for Phase 2. Use the v0.9.1 minimal loader with a real arm64 kernelcache and real D22AP `/product` data. The first success criterion is a stable XNU-originated marker on the framebuffer or ramoops-compatible console; do **not** enable SMP or depend on UFS until that marker is repeatable.

@@ -1,0 +1,6 @@
+# v0.9.2 notes
+
+- **Watchdog visibility.** The MT6789 TOPRGU watchdog (`watchdog@10007000`, `mediatek,mt6589-wdt` layout) is now read at shim entry and logged to the framebuffer/ramoops: `wdt(entry): MODE=... LENGTH=... enabled=N`. On-device observation: the phone resets by itself after ~30 s even where the shim "halts", so a halt is not a halt while the watchdog is armed.
+- **Watchdog policy.** `WDT_DISABLE_AT_HANDOFF` (default `1` only for `XNU_PAYLOAD=1`, `0` for the test build) clears `WDT_MODE.EN` (with the `0x22` key) immediately before jumping to XNU, so failures during preflight still fall back through the watchdog, while a multi-minute XNU boot is not reset. A `wdt(disabled)` line shows the readback; if `enabled=1` persists, the register layout/lock needs checking on the device. Override with `make WDT_DISABLE_AT_HANDOFF=0|1` .
+- **Alignment check.** XNU mode copies with aligned 8-byte accesses while the MMU is off (Device memory). The loader now refuses a container whose address inside the CPIO, ADT offset, or any segment file offset is not 8-byte aligned (rc 42/43) instead of faulting mid-copy. It worked before only because of the CPIO name length and an aligned initrd.
+- Not run on hardware. Host tests unchanged.
