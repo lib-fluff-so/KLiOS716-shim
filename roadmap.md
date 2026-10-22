@@ -1,24 +1,30 @@
-# Roadmap
+# Roadmap — ios-kl7 v0.9.1
 
-[x] Boot the shim through the existing Android boot path and preserve the existing screen except for the bottom progress strip
-[x] Read CPU state, DTB, bootargs and bootconfig; stream diagnostics to ramoops
-[x] v0.5.1: EL1 stack setup and exception vectors; deliberate UDF test
-[x] v0.5.2: identify ramoops/persistent_ram layout and confirm extraction after reset
-[x] v0.6.0: derive RAM and reservation ranges from the live DTB; host-tested
-[x] v0.6.3: 16 KiB translation tables + MMU on, caches off; confirmed on-device
-[x] v0.6.3: PSCI_CPU_ON diagnostic for all seven secondary cores; confirmed on-device
-[x] v0.7.0: ramoops-first logging, bottom progress strip, and raw newc test ramdisk
-[x] v0.7.0: high-RAM test copy, read-back validation, and MMU-off handoff trampoline
-[x] v0.7.1: corrected test-payload magic and confirmed physical test-payload handoff PASS (user-confirmed)
-[x] v0.8.0: parse SWEETXNU v1 container in freestanding C; host adversarial tests
-[x] v0.8.0: opt-in Mach-O packaging with chained-fixup handling and raw CPIO entry
-[x] v0.8.0: generate KL7-oriented ADT from the checked-in DTB facts; host assertions
-[x] v0.8.0: construct boot_args rev 2 / 736-byte ABI and I-cache invalidation at transfer
-[ ] Obtain and validate a real D22AP Apple Device Tree including /product from the IPSW
-[ ] Adapt/verify early framebuffer console, panic path, and keep-console-after-TTBR0 XNU patches for KL7
-[ ] Boot an actual XNU kernelcache and capture the first XNU-side log on physical KL7
-[ ] Audit and port target-specific GIC, timer, CPU_ON/SMP, framebuffer, and SoC configuration patches
-[ ] Determine whether UFS can be initialized from the state left by LK/TF-A and implement a KL7 storage path
-[ ] Identify the KL7 touch controller and port the input driver
-[ ] Enable/validate SMP and cache/MMU setup under XNU once early single-core entry is stable
-[ ] Bring up matching iOS userland only after the kernel and storage platform are usable
+## Shim / loader
+
+[x] Enter shim through the existing Android/LK boot path at EL1 with MMU off
+[x] Parse live FDT RAM, `/reserved-memory`, `no-map`, and FDT reservation-map entries
+[x] Locate raw `newc` CPIO in the initrd declared by `linux,initrd-start/end`
+[x] Validate the `KL7PAY0` test payload and preserve the physical handoff regression path
+[x] Parse the `SWEETXNU` container and preflight Mach-O segment placement
+[x] Copy Mach-O segments and BSS; copy ADT; form `boot_args` rev. 2; pass its physical address in `x0`
+[x] Transfer with MMU/caches disabled and invalidate I-cache before branching
+[x] Replace the progress strip with a text framebuffer console
+[x] Route one log stream to both framebuffer and ramoops
+[x] Remove page-table construction, PSCI `CPU_ON`, GIC/timer probes, and emulator-only shim mode
+[x] Reduce exception output to ESR/FAR/ELR/SPSR
+[x] Host tests for DTB memory map, legacy payload, SWEETXNU parser, packaging and ADT generation
+
+[ ] Verify the v0.9.1 framebuffer console on the physical KL7
+[ ] Verify the v0.9.1 ramoops log after rebooting back into Android
+[ ] Add an explicit hardware test payload that validates all fields of a v0.9 boot ABI and returns
+[ ] Test a real (not synthetic) Mach-O through the complete CPIO → container → segment-copy path
+[ ] Confirm the current boot_args / ADT placement contract against the exact XNU build being targeted
+
+## Not shim work (kept out of this release)
+
+- Port XNU's early console and PlatformExpert to MT6789
+- Adapt XNU GIC/timer/SMP and interrupt initialization
+- Determine whether UFS can be started from the state left by LK/TF-A; implement a KL7 storage path if needed
+- Identify and support KL7's touch controller
+- Bring up matching iOS userland after the kernel and storage work
