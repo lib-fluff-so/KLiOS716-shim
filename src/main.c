@@ -1,4 +1,4 @@
-/* ios-kl7 v0.9.2: minimal payload loader with a framebuffer console and ramoops.
+/* ios-kl7 v0.9.3: minimal payload loader with a framebuffer console and ramoops.
  * Entry: EL1, MMU/caches off, x0 = live Linux DTB. No shim page tables,
  * no CPU_ON, no GIC/timer probes. Prepare payload, boot_args and ADT, then jump. */
 typedef unsigned char u8;
@@ -33,7 +33,7 @@ typedef __builtin_va_list va_list;
 #define FB_STRIDE             4352u
 #define FB_HEIGHT             2436u
 #define FB_VISIBLE_OFFSET     (1230UL * FB_STRIDE)
-#define XNU_FB_BASE           FB_BASE
+#define XNU_FB_BASE           (FB_BASE + FB_VISIBLE_OFFSET)
 #define XNU_FB_STRIDE         FB_STRIDE
 #define XNU_FB_WIDTH          1080u
 #define XNU_FB_HEIGHT         FB_HEIGHT
@@ -679,7 +679,7 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
     (void)x3;
     ramoops_init();
     console_init();
-    logf("ios-kl7 shim v0.9.2");
+    logf("ios-kl7 shim v0.9.3");
     logf("console: framebuffer + ramoops");
     wdt_report("entry");
     logf("entry: DTB=%x shim=%x size=%x", dtb_address, shim_base, (u64)(_end - _start));

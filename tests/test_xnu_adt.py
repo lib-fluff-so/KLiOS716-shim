@@ -57,6 +57,11 @@ def main():
     assert one_u32(chosen, 'embedded-panic-log-size') == 0x100000
     assert chosen.prop('random-seed') == seed
 
+    ramoops = find(parsed, 'kl7-ramoops')
+    assert ramoops.prop('reg') == struct.pack('<QQ', 0x480ef000, 0x40000)
+    fbcon = find(parsed, 'kl7-fbcon')
+    assert fbcon.prop('reg') == struct.pack('<QQ', 0xfdfff000 + 1230 * 4352, 4352 * 2436)
+
     cpus = find(parsed, 'cpus')
     cpu_nodes = [n for n in cpus.children if n.name.startswith('cpu')]
     assert len(cpu_nodes) == 8
