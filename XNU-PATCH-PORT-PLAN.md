@@ -1,52 +1,51 @@
-# XNU patch port plan: ios-sweet → KL7 / MT6789
+# XNU port plan: ios-sweet -> KL7 / MT6789 (v0.9.3)
 
-This is a triage map of the patch series in the supplied `ios-sweet` clone. It is a static review aid, **not** proof that the patches apply to a specific XNU checkout or that a kernel built from them boots. The source tree/version and build workflow must be fixed before applying anything.
+Source of truth: github.com/dipa-studio/ios-sweet, patch series `xnu/patches/` applied to
+`apple-oss-distributions/xnu` tag **xnu-8796.141.3** (macOS 13.5 release.json, what the sweet CI builds).
+Checked: sweet 0001-0081 apply cleanly in order to that tag, except 0031/0041, which need the HFS tree staged by
+`0026-stage-hfs.sh` (CI does this). Our delta `xnu/patches-kl7/0101,0102` applies on top of the full series.
+**Nothing here has been compiled** (the build needs macOS runners) or booted.
 
-## Phase 1 — make one core image build
+## How to build
+Fork ios-sweet, copy `xnu/patches-kl7/*.patch` into its `xnu/patches/`, run the `xnu` workflow with
+`machine_config=SWEET`. Output `kernel.development.sweet` goes to `XNU_KERNEL=` of this shim's Makefile.
+Local review of the patched tree: `tools/kl7-xnu-tree.sh <ios-sweet clone> <outdir>`.
+First boot args: keep `cpus=1` (the shim's default `XNU_CMDLINE`), no `rd=ufsroot0` yet.
 
-Start with build-system / open-source XNU compatibility work, then create a new `KL7` board config instead of renaming Qualcomm assumptions mechanically:
+## Done in the delta
+- **0101 early framebuffer.** sweet hard-codes 0x9c000000 / 1080x2400 / stride 4320 in `start.s`,
+  `sweet_early.c` and `arm_vm_init.c` (0010, 0012). KL7: visible page 0xFE519E00, 1080x2436, stride 4352,
+  geometry in `SWEET.h` (`SWEET_EARLY_FB_*`) with a static assert that the page sits in one 32 MiB L2 block
+  (16K granule): block 0xFE000000. The bootstrap and final-alias mappings are **Device-nGnRnE instead of
+  Normal-NC**: that 32 MiB block also contains `tkv-reserved` (0xffff7000, TEE), and Normal memory may be
+  speculatively read; sweet's Qualcomm shim avoided this the same way ("nothing cacheable except our image").
+  Fallback if Device writes prove too slow: exact-page L3 mapping.
+- **0102 names.** Platform expert also matches `tecno,kl7`, CPU driver also matches `arm,cortex-a55/a76`
+  (ADT cpu nodes do not say `qcom,kryo470`), fbcon accepts `kl7-fbcon`. Identity strings already come
+  from the ADT (sweet 0059).
 
-- `0001`, `0002`: compiler/kernel-source compatibility.
-- `0004`, `0005`, `0006`, `0007`, `0008`, `0009`: machine config, non-PAC/build setup, open-source pmap/master config, private-header stubs, missing open-source symbols, and export cleanup. These are **not all SoC-neutral**. In particular, review the CPU feature flags, cache-line size, interrupt-entry path and GIC security-group handling in `0004` against MT6789.
-- Use the correct XNU source revision and build host/CI from the sweet workflow. A successful compile of the shim says nothing about whether this kernel source revision is buildable.
+## Already generic (checked, no change needed)
+- GIC: sweet 0004/0017 use Group 1 NS IRQ + `ICC_IAR1`, timer INTID read from the ADT gic node
+  (`virtual-timer-intid`, KL7 = 27 = PPI 11). `GICR_PE_SIZE` 0x20000 is right for GICv3 (observed
+  GICD_PIDR2 arch=3); the redistributor walk stops at `GICR_TYPER.Last` (region is 2 MiB, 8 PEs).
+- CPU: Cortex-A55/A76, same family as sweet's Kryo 470: cache line 64, ARMv8.2, no PAC. MIDR 0x412fd050,
+  MMFR0 PARange 40-bit, TGran16 supported. MPIDR = Aff1 core number as on sweet.
+- Handoff: sweet's shim also enters XNU with MMU off at EL1, `x0 = boot_args` (rev 2), so `transfer_to_payload` matches.
+- Timer 13 MHz comes from the ADT cpu `timebase-frequency` (`pe_identify_machine.c`; 24 MHz there is only a default).
+- Memory: physBase 0x140000000 is 16K aligned and L2-indexes into the same first V=P L2 page as sweet's map.
 
-Deliverable for this phase: a reproducible XNU build with a KL7-specific kernel configuration and no device drivers assumed to work yet.
+## Risks to watch on the first boot (in order of the stage markers drawn by `sweet_early_mark`)
+1. White 64x32 band at the bottom of the visible page: proves `start_first_cpu` ran and the FB base is right.
+2. Marks 1-8: PE_init_platform, topology (needs a `running` cpu0 with `reg`=0 in the ADT), cpu_bootstrap, arm_vm_init.
+3. Marks 9-14: kernel VA alias of the FB, TTBR0 teardown, pmap_bootstrap. `ARM64_PHYSMAP_ALIGNMENT_PADDING` (0011) matters here.
+4. Marks 15-20: serial_init -> `kl7-fbcon` WC mapping (`reg` = visible page only, base not 16K aligned: `ml_io_map_wcomb` must handle the offset).
+5. The MT6789 watchdog is disabled by the shim at handoff (`WDT_DISABLE_AT_HANDOFF`, verified in v0.9.2); sweet's `wdt=-1` boot-arg only affects XNU's own driver.
 
-## Phase 2 — first visible XNU instruction
-
-Prioritize these before storage, touch, USB, or multi-core bring-up:
-
-- `0010`: early framebuffer/debug output. Rework the framebuffer base, stride, height and pixel format for KL7 (`0xfdfff000`, stride `4352`, `1080×2436`), and verify the actual buffer format before relying on visible output.
-- `0011`: physmap alignment and padding. Re-check against the KL7 16 KiB page size and the new `physBase`/`topOfKernelData` layout.
-- `0012`: keep the debug console reachable after TTBR0 changes. Trace the exact TTBR and mapping assumptions rather than applying it as a blind hunk.
-- `0016`: device-tree PlatformExpert. Replace the `xiaomi,sweet` match and product strings; validate the ADT properties and registry enumeration against the generated KL7 tree.
-- `0017`: architected virtual timer / interrupt path. KL7's DT-derived virtual timer is PPI 11 / INTID 27, but the `GICD_CTLR`, security state, IRQ-vs-FIQ and acknowledge/EOI logic must be checked on MT6789 before using the SWEET implementation.
-- `0018`: boot-CPU `IOCPU` driver, as a single-core milestone. Update logical/physical CPU identity and the platform-expert matching.
-
-The generated ADT currently carries `/chosen`, eight CPU nodes, GIC, timer information, framebuffer, UFS register range and `/pram`; without a real D22AP ADT, `/product` is deliberately absent. Therefore this milestone should target **early kernel logging**, not full iOS boot.
-
-## Phase 3 — memory and SMP, after single-core boot
-
-- `0065` and `0078`: PSCI/SMP startup and 8-core topology. These require a KL7-specific mapping from real `MPIDR_EL1` values to ADT CPU nodes. Do not assume Qualcomm's `context_id` path or CPU-number encoding matches the MediaTek firmware handoff. Keep secondaries disabled until the boot CPU, panic path and memory map are stable.
-- Revisit XNU pmap, cache attributes, physical-memory discovery, reserved/no-map ranges and the 1 MiB panic-log carve-out as one consistent memory contract. The shim's MMU-off handoff is not a substitute for XNU's own pmap setup.
-
-## Phase 4 — storage and userspace
-
-The sweet UFS code is a **driver port, not a generic UFS feature flag**:
-
-- `0028`, `0030`, `0034`, `0069` cover the sweet UFS device/root path, writes, DMA-above-4-GiB handling and performance. Replace the controller-specific register programming, queue/descriptor assumptions, DMA constraints and any Qualcomm-only calls with an MT6789 implementation. The presence of `mediatek,mt8183-ufshci` in Linux DTB only identifies a compatible register interface; it does not prove that XNU can initialize the controller in the post-LK state.
-- `0021`–`0024` are an alternate mock/ramdisk-root route, useful for a controlled early userspace test but not evidence that the KL7 UFS path works.
-- `0029`, `0031` and the filesystem/AMFI patches are downstream of a working root device. Do not start there.
-
-## Phase 5 — peripheral drivers and polish
-
-Defer until kernel logs and root storage work:
-
-- `0058`, `0060`, `0062`, `0063`, `0071`: HID, keys, touch, battery/power and Goodix GENI details. The sweet touch/power stack contains Qualcomm-specific dependencies; identify KL7's actual touch controller and MediaTek power-management interfaces first.
-- `0040`, `0045`, `0046`, `0056`, `0061`, `0079`: watchdog/display/performance and iPhone-X display assumptions. Re-check each against the KL7 hardware rather than treating dimensions or driver names as proof of compatibility.
-- `0072`–`0081`: USB, networking diagnostics, and later SMP/display improvements; these are not required to prove the initial kernel handoff.
-- Patches for RNG, crypto, AMFI, HFS, tracing, crash logs and bundled libraries may be needed to build or run userland, but most are not the first-boot blocker. Triage build dependencies individually once the target XNU tree is pinned.
-
-## Immediate next experiment
-
-Build a single-core KL7 XNU with the Phase 1 build patches and only the early-console/platform pieces needed for Phase 2. Use the v0.9.1 minimal loader with a real arm64 kernelcache and real D22AP `/product` data. The first success criterion is a stable XNU-originated marker on the framebuffer or ramoops-compatible console; do **not** enable SMP or depend on UFS until that marker is repeatable.
+## Later phases (unchanged from sweet unless noted)
+- SMP (0065/0078): PSCI CPU_ON with the MT6789 MPIDR map (Aff1 = core, cores 6-7 are A76); keep `cpus=1` until the boot CPU is stable.
+- Storage (0028/0030/0034/0069): sweet's UFS driver is Qualcomm UFS (`qcom,ufshc`); KL7 is `mediatek,mt8183-ufshci`
+  (UFSHCI regs at 0x11270000 + MTK glue: M-PHY/unipro power, vendor ops). Whether LK leaves it initialised is unknown; driver port needed.
+  0021-0024 (mock/ramdisk root) are the way to test userland earlier.
+- Display (0046/0061/0079) is 1080x2400 sweet panel logic; KL7 is 1080x2436 with a double-buffered page offset (see 0101): rework with the framebuffer driver.
+- Touch/buttons/battery (0058-0063, 0071): Qualcomm GENI/SPMI/RPMh specific, KL7 needs its own drivers.
+- USB (0072-0081): Qualcomm DWC3/QUSB; MTK uses MUSB/XHCI-MTK.

@@ -1,4 +1,4 @@
-# Roadmap — ios-kl7 v0.9.1
+# Roadmap — ios-kl7 v0.9.3
 
 ## Shim / loader
 
@@ -28,3 +28,11 @@
 - Determine whether UFS can be started from the state left by LK/TF-A; implement a KL7 storage path if needed
 - Identify and support KL7's touch controller
 - Bring up matching iOS userland after the kernel and storage work
+
+## XNU kernel (v0.9.3)
+
+[x] ios-sweet series 0001-0081 verified to apply to xnu-8796.141.3; KL7 delta 0101/0102 verified on top
+[x] XNU framebuffer base fixed in shim and ADT (visible page 0xFE519E00)
+[ ] Build `kernel.development.sweet` with the KL7 delta (CI, macOS runner)
+[ ] Run it through the shim with `cpus=1`; target: white band + `SWEET EARLY n` marks on screen / in ramoops-compatible log
+[ ] Real D22AP `/product` ADT (research/ipsw-x/d22ap.adt)

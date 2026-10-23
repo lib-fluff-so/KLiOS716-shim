@@ -1,4 +1,4 @@
-# ios-kl7 v0.9.1
+# ios-kl7 v0.9.3
 
 Minimal ARM64 shim for the TECNO KL7 / MediaTek MT6789. This release focuses on the loader contract: read the live DTB and initrd, validate memory destinations, prepare either the test payload or a `SWEETXNU` container, then hand off with MMU/caches disabled. The shim no longer builds page tables, probes GIC/timers, or starts secondary CPUs.
 
@@ -80,3 +80,8 @@ make OUT=out-xnu XNU_PAYLOAD=1 XNU_KERNEL=/path/to/kernelcache all
 ## Scope removed in v0.9.0 and kept in v0.9.1
 
 The firmware no longer includes the shim page-table/MMU builder, MMU-fault experiment, PSCI `CPU_ON` experiment, GIC/timer probes, emulator-only build path, progress strip, or verbose bootconfig/register dumps. The DTB memory/reservation parser stays because payload placement must avoid memory owned by the OS, reserved devices, ramoops, the DTB, the initrd, and the shim itself.
+
+## v0.9.3 and the XNU kernel
+v0.9.3 fixes the framebuffer base handed to XNU (visible page 0xFE519E00, not the region start). The kernel side lives in
+`xnu/patches-kl7/` on top of ios-sweet's series; see `XNU-PATCH-PORT-PLAN.md` and `FIX-NOTES-v0.9.3.md`.
+The README text above about v0.9.1 (no MMU/SMP in the shim) still holds for v0.9.3.

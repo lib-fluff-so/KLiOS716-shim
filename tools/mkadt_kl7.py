@@ -24,6 +24,11 @@ PAGE_16K = 0x4000
 PANIC_LOG_SIZE = 0x100000
 SOC_BASE = 0x01000000
 FB_W, FB_H, FB_STRIDE = 1080, 2436, 4352
+# The panel scans out a page that starts 1230 rows into the reserved region
+# (observed on device, see shim src/console.c VISIBLE_OFFSET). XNU must draw there.
+FB_VISIBLE_OFFSET = 1230 * FB_STRIDE
+# Linux ramoops console zone (same constants as the shim, src/main.c RAMOOPS_CONSOLE_*)
+RAMOOPS_CONSOLE_BASE, RAMOOPS_CONSOLE_SIZE = 0x480EF000, 0x40000
 SWEET_ECID = 0x4B4C375F00000001  # synthetic KL7 identity; never a real device ID
 D22AP_ADT_DEFAULT = Path(__file__).resolve().parent.parent / 'research/ipsw-x/d22ap.adt'
 
@@ -367,10 +372,16 @@ def build(facts, product_adt=None, seed=None):
     fbcon = node('kl7-fbcon', [
         ph(),
         ('compatible', cstr('tecno,kl7-framebuffer')),
-        ('reg', u64(facts['fb'], facts['fb_size'])),
+        ('reg', u64(facts['fb'] + FB_VISIBLE_OFFSET, FB_STRIDE * FB_H)),
         ('width', u32(FB_W)),
         ('height', u32(FB_H)),
         ('stride', u32(FB_STRIDE)),
+    ])
+
+    ramoops = node('kl7-ramoops', [
+        ph(),
+        ('compatible', cstr('tecno,kl7-ramoops')),
+        ('reg', u64(RAMOOPS_CONSOLE_BASE, RAMOOPS_CONSOLE_SIZE)),
     ])
 
     ufs = node('kl7-ufs', [
@@ -399,7 +410,7 @@ def build(facts, product_adt=None, seed=None):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + products + [ufs])
+    ], [chosen, defaults, cpus, arm_io, fbcon, ramoops, buttons, pram] + products + [ufs])
 
 
 def main():
