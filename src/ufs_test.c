@@ -55,6 +55,25 @@ typedef unsigned long long u64;
 #define REFCLK_REQUEST		0x1
 #define REFCLK_ACK		0x2
 
+/*
+ * KL7 UFS resets live in infracfg_ao (syscon@10001000), child node
+ * infracfg_rst (ti,syscon-reset).  Live DT:
+ *   resets = <&infracfg_rst 1>, <&infracfg_rst 2>, <&infracfg_rst 3>;
+ *   reset-names = "hci_rst", "unipro_rst", "crypto_rst";
+ * ti,reset-bits entries: <assert_off assert_bit deassert_off deassert_bit
+ *                         status_off status_bit flags>
+ *   hci_rst:    0x130 bit 15 / 0x134 bit 15
+ *   unipro_rst: 0x140 bit  7 / 0x144 bit  7
+ * flags 0x1c = STATUS_NONE | ASSERT_SET | DEASSERT_SET.
+ */
+#define INFRACFG_AO_BASE	0x10001000UL
+#define INFRACFG_HCI_RST_SET	0x130
+#define INFRACFG_HCI_RST_CLR	0x134
+#define INFRACFG_UNIPRO_RST_SET	0x140
+#define INFRACFG_UNIPRO_RST_CLR	0x144
+#define INFRACFG_HCI_RST_BIT	15
+#define INFRACFG_UNIPRO_RST_BIT	7
+
 #define HCS_DP		(1u << 0)
 #define HCS_UTRLRDY	(1u << 1)
 #define HCS_UCRDY	(1u << 3)
@@ -67,6 +86,8 @@ typedef unsigned long long u64;
 /* UIC command opcodes and UniPro attributes used by the MTK resume path. */
 #define UIC_CMD_DME_GET		0x01
 #define UIC_CMD_DME_SET		0x02
+#define UIC_CMD_DME_ENABLE	0x12
+#define UIC_CMD_DME_RESET	0x14
 #define UIC_CMD_DME_LINK_STARTUP 0x16
 #define UIC_CMD_DME_HIBER_EXIT	0x18
 
@@ -188,6 +209,74 @@ static void ref_clk_on(void)
 	logf("UFS: refclk ctrl after=%x", (u64)v);
 }
 
+static u32 infracfg_rd(u32 off)
+{
+	return *(volatile u32 *)(INFRACFG_AO_BASE + off);
+}
+
+static void infracfg_set(u32 off, u32 bit)
+{
+	u32 v = infracfg_rd(off);
+
+	*(volatile u32 *)(INFRACFG_AO_BASE + off) = v | (1u << bit);
+}
+
+/*
+ * Mirror ufs_mtk_host_reset(): assert HCI and UniPro resets, then release
+ * UniPro first and HCI last.  Without this the UniPro link startup state
+ * machine stays in the LK's state and DME_LINK_STARTUP returns failure.
+ */
+static void mtk_host_reset(void)
+{
+	logf("UFS: icfg before hci=%x/%x uni=%x/%x",
+	     (u64)infracfg_rd(INFRACFG_HCI_RST_SET),
+	     (u64)infracfg_rd(INFRACFG_HCI_RST_CLR),
+	     (u64)infracfg_rd(INFRACFG_UNIPRO_RST_SET),
+	     (u64)infracfg_rd(INFRACFG_UNIPRO_RST_CLR));
+	infracfg_set(INFRACFG_HCI_RST_SET, INFRACFG_HCI_RST_BIT);
+	infracfg_set(INFRACFG_UNIPRO_RST_SET, INFRACFG_UNIPRO_RST_BIT);
+	delay_us(100);
+	infracfg_set(INFRACFG_UNIPRO_RST_CLR, INFRACFG_UNIPRO_RST_BIT);
+	infracfg_set(INFRACFG_HCI_RST_CLR, INFRACFG_HCI_RST_BIT);
+	delay_us(100);
+	logf("UFS: icfg after hci=%x/%x uni=%x/%x",
+	     (u64)infracfg_rd(INFRACFG_HCI_RST_SET),
+	     (u64)infracfg_rd(INFRACFG_HCI_RST_CLR),
+	     (u64)infracfg_rd(INFRACFG_UNIPRO_RST_SET),
+	     (u64)infracfg_rd(INFRACFG_UNIPRO_RST_CLR));
+}
+
+/*
+ * Mirror ufshcd_hba_execute_hce(): stop, MTK reset, ref clock, start HCE,
+ * then wait for the controller to finish its 1->0->1 initialization.
+ */
+static void hce_cycle(void)
+{
+	if (ufs_rd(REG_HCE) & 1u) {
+		ufs_wr(REG_HCE, 0);
+		u64 start = ticks();
+		u64 timeout = timer_freq() / 100;	/* 10 ms */
+		while ((ufs_rd(REG_HCE) & 1u) && ticks() - start < timeout)
+			;
+	}
+	logf("UFS: hce stop=%x hcs=%x", (u64)ufs_rd(REG_HCE),
+	     (u64)ufs_rd(REG_HCS));
+
+	mtk_host_reset();
+	ref_clk_on();
+
+	ufs_wr(REG_HCE, 1);
+	delay_us(600);
+	u64 start = ticks();
+	u64 timeout = timer_freq();		/* 1 second */
+	while (!(ufs_rd(REG_HCE) & 1u)) {
+		if (ticks() - start > timeout)
+			break;
+	}
+	logf("UFS: hce start=%x hcs=%x is=%x", (u64)ufs_rd(REG_HCE),
+	     (u64)ufs_rd(REG_HCS), (u64)ufs_rd(REG_IS));
+}
+
 /*
  * Send one UIC command and wait for completion.  UFSHCI signals UIC command
  * completion in IS bit 10 (0x400); the result code is in UICARG2 and the DME
@@ -212,6 +301,25 @@ static u32 uic(u32 opcode, u32 arg1, u32 arg2, u32 arg3, u32 *val)
 		*val = ufs_rd(REG_UIC_ARG3);
 	ufs_wr(REG_IS, IS_UIC_COMMAND_COMPL);
 	return result;
+}
+
+/* Mirror ufs_mtk_pre_link(): HPM, host TX LCC off, disable deep stall. */
+static void mtk_pre_link(void)
+{
+	u32 v = 0, r;
+
+	r = uic(UIC_CMD_DME_SET, (u32)VS_UNIPROPOWERDOWNCONTROL << 16, 0, 0,
+		&v);
+	logf("UFS: HPM rc=%x", (u64)r);
+	r = uic(UIC_CMD_DME_SET, (u32)PA_LOCAL_TX_LCC_ENABLE << 16, 0, 0, &v);
+	logf("UFS: TXLCC rc=%x", (u64)r);
+	r = uic(UIC_CMD_DME_GET, (u32)VS_SAVEPOWERCONTROL << 16, 0, 0, &v);
+	logf("UFS: SAVEPWR get rc=%x val=%x", (u64)r, (u64)v);
+	if (!r) {
+		r = uic(UIC_CMD_DME_SET, (u32)VS_SAVEPOWERCONTROL << 16, 0,
+			v & ~(1u << 6), &v);
+		logf("UFS: SAVEPWR set rc=%x", (u64)r);
+	}
 }
 
 static void zero(void *p, unsigned n)
@@ -492,52 +600,27 @@ void ufs_test(void)
 	     (u64)ufs_rd(REG_UECPA), (u64)ufs_rd(REG_UECBA),
 	     (u64)ufs_rd(REG_UECC));
 
-	if (!(hce & 1u)) {
-		logf("UFS: HCE=0 -> host disabled by LK; stop (read-only)");
-		return;
-	}
-	if (!(hcs & HCS_DP)) {
-		logf("UFS: DP=0 -> link down/hibernated; stop (read-only)");
-		return;
-	}
-	if (!(hcs & HCS_UTRLRDY)) {
-		logf("UFS: UTRLRDY=0 -> host not ready; stop (read-only)");
-		return;
-	}
-	if (ufs_rd(REG_UTRLDBR)) {
-		logf("UFS: UTRLDBR=%x outstanding; stop (read-only)",
+	/* Informational only: the reset/HCE cycle below is authoritative. */
+	if (!(hce & 1u))
+		logf("UFS: LK left HCE=0; will initialise the controller");
+	if (!(hcs & HCS_DP))
+		logf("UFS: LK left DP=0; link startup will retry");
+	if (ufs_rd(REG_UTRLDBR))
+		logf("UFS: warning: LK UTRLDBR=%x outstanding",
 		     (u64)ufs_rd(REG_UTRLDBR));
-		return;
-	}
-
-	/* Take over the transfer request list: stop, point at ours, run. */
-	ufs_wr(REG_UTRLRSR, 0);
-	u64 list = (u64)(unsigned long)utrl;
-	ufs_wr(REG_UTRLBA, (u32)list);
-	ufs_wr(REG_UTRLBAU, (u32)(list >> 32));
-	ufs_wr(REG_UTRLRSR, 1);
-	logf("UFS: own utrl=%x rsr=%x", list, (u64)ufs_rd(REG_UTRLRSR));
-	/*
-	 * Never ring a doorbell unless the host really uses our list: otherwise
-	 * it would execute whatever LK left in its own slot 0 (maybe a write).
-	 */
-	if (ufs_rd(REG_UTRLBA) != (u32)list ||
-	    ufs_rd(REG_UTRLBAU) != (u32)(list >> 32) ||
-	    !(ufs_rd(REG_UTRLRSR) & 1u)) {
-		logf("UFS: list take-over failed; stop (no doorbell rung)");
-		return;
-	}
 
 	/*
-	 * The LK leaves the UFS device in a low-power/protocol-down state and
-	 * UniPro in PWM-G1.  Linux ufs-mediatek re-initialises the link with:
-	 * ref clock on, MTK SiP device reset (RST_n low/high), HPM, host TX
-	 * LCC off, deep-stall off, then DME_LINK_STARTUP.  Local DME commands
-	 * alone do not wake the device; only link startup renegotiates the
-	 * UniPro link.
+	 * This is the piece the LK cannot hand over: a full MTK host reset and
+	 * HCE 1->0->1 initialization.  The kernel always does this on probe;
+	 * starting from the LK's live HCE=1 state leaves the UniPro link
+	 * startup state machine unusable (DME_LINK_STARTUP returns failure).
 	 */
-	ref_clk_on();
+	hce_cycle();
+	logf("UFS: post-hce hcs=%x is=%x uecpa=%x",
+	     (u64)ufs_rd(REG_HCS), (u64)ufs_rd(REG_IS),
+	     (u64)ufs_rd(REG_UECPA));
 
+	/* Device RST_n through the MTK secure monitor (works: rc=0). */
 	u64 s = ufs_smc(UFS_MTK_SIP_DEVICE_RESET, 0);
 	logf("UFS: RST low rc=%x", s);
 	delay_us(20);
@@ -545,21 +628,20 @@ void ufs_test(void)
 	logf("UFS: RST high rc=%x", s);
 	delay_us(15000);
 
+	mtk_pre_link();
 	u32 v = 0, r;
-	r = uic(UIC_CMD_DME_SET, (u32)VS_UNIPROPOWERDOWNCONTROL << 16, 0, 0,
-		&v);
-	logf("UFS: HPM rc=%x", (u64)r);
-	r = uic(UIC_CMD_DME_SET, (u32)PA_LOCAL_TX_LCC_ENABLE << 16, 0, 0, &v);
-	logf("UFS: TXLCC rc=%x", (u64)r);
-	r = uic(UIC_CMD_DME_GET, (u32)VS_SAVEPOWERCONTROL << 16, 0, 0, &v);
-	logf("UFS: SAVEPWR get rc=%x val=%x", (u64)r, (u64)v);
-	if (!r) {
-		r = uic(UIC_CMD_DME_SET, (u32)VS_SAVEPOWERCONTROL << 16, 0,
-			v & ~(1u << 6), &v);
-		logf("UFS: SAVEPWR set rc=%x", (u64)r);
-	}
 	r = uic(UIC_CMD_DME_LINK_STARTUP, 0, 0, 0, &v);
 	logf("UFS: LINKSTART rc=%x", (u64)r);
+	if (r) {
+		/* Kernel fallback for a failed link startup: local UniPro reset. */
+		r = uic(UIC_CMD_DME_RESET, 0, 0, 0, &v);
+		logf("UFS: DMERESET rc=%x", (u64)r);
+		r = uic(UIC_CMD_DME_ENABLE, 0, 0, 0, &v);
+		logf("UFS: DMEENABLE rc=%x", (u64)r);
+		mtk_pre_link();
+		r = uic(UIC_CMD_DME_LINK_STARTUP, 0, 0, 0, &v);
+		logf("UFS: LINKSTART2 rc=%x", (u64)r);
+	}
 	r = uic(UIC_CMD_DME_GET, (u32)PA_PWRMODE << 16, 0, 0, &v);
 	logf("UFS: PA_PWRMODE rc=%x val=%x", (u64)r, (u64)v);
 	logf("UFS: link hcs=%x is=%x uecpa=%x", (u64)ufs_rd(REG_HCS),
@@ -567,6 +649,24 @@ void ufs_test(void)
 	logf("UFS: refclk=%x ext=%x mphy=%x",
 	     (u64)ufs_rd(REG_UFS_REFCLK_CTRL), (u64)ufs_rd(REG_UFS_EXTREG),
 	     (u64)ufs_rd(REG_UFS_MPHYCTRL));
+
+	/*
+	 * HCI reset cleared UTRLBA/RSR; take over the list only now, after the
+	 * controller is operational.  Never ring a doorbell unless the host
+	 * really uses our list (otherwise LK slot 0, possibly a write, runs).
+	 */
+	ufs_wr(REG_UTRLRSR, 0);
+	u64 list = (u64)(unsigned long)utrl;
+	ufs_wr(REG_UTRLBA, (u32)list);
+	ufs_wr(REG_UTRLBAU, (u32)(list >> 32));
+	ufs_wr(REG_UTRLRSR, 1);
+	logf("UFS: own utrl=%x rsr=%x", list, (u64)ufs_rd(REG_UTRLRSR));
+	if (ufs_rd(REG_UTRLBA) != (u32)list ||
+	    ufs_rd(REG_UTRLBAU) != (u32)(list >> 32) ||
+	    !(ufs_rd(REG_UTRLRSR) & 1u)) {
+		logf("UFS: list take-over failed; stop (no doorbell rung)");
+		return;
+	}
 
 	probe_lun(0);
 	probe_lun(1);
