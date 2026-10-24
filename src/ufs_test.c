@@ -133,6 +133,8 @@ static u8 data[2 * BLOCK] __attribute__((aligned(4096)));
 static u8 ents[128 * 128] __attribute__((aligned(4096)));
 
 static u32 last_ocs, last_st, last_sense;
+static u32 last_upiu, last_rsp;
+static u32 last_sense_len, last_sk, last_asc, last_ascq;
 
 static u64 ticks(void)
 {
@@ -411,12 +413,28 @@ static u32 scsi(u32 lun, const u8 *cdb, u32 cdb_len, void *buf, u32 len)
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 	last_ocs = utrl[0].dw2 & 0xff;
-	last_st = ucd.resp[7];			/* SCSI status in the response UPIU */
-	last_sense = (u32)ucd.resp[16] << 24 | (u32)ucd.resp[17] << 16 |
-		     (u32)ucd.resp[18] << 8 | ucd.resp[19];
+	last_upiu = ucd.resp[0];		/* 0x21 = RESPONSE UPIU */
+	last_rsp = ucd.resp[6];			/* UPIU response code */
+	last_st = ucd.resp[7];			/* SCSI status */
+	/*
+	 * struct utp_cmd_rsp: residual_transfer_count @12, reserved[4] @16..31,
+	 * sense_data_len (BE16) @32, sense_data[18] @34.  The sense key is
+	 * sense[2], ASC sense[12], ASCQ sense[13].
+	 */
+	last_sense_len = ((u32)ucd.resp[32] << 8) | ucd.resp[33];
+	if (last_sense_len > 18)
+		last_sense_len = 18;
+	last_sk = last_asc = last_ascq = 0;
+	if (last_sense_len >= 3)
+		last_sk = ucd.resp[34 + 2] & 0xf;
+	if (last_sense_len >= 14) {
+		last_asc = ucd.resp[34 + 12];
+		last_ascq = ucd.resp[34 + 13];
+	}
+	last_sense = last_sk << 16 | last_asc << 8 | last_ascq;
 	if (last_ocs)
 		return 2;
-	if (ucd.resp[0] != 0x21)		/* RESPONSE UPIU */
+	if (last_upiu != 0x21)			/* RESPONSE UPIU */
 		return 3;
 	return last_st ? 4 : 0;
 }
@@ -428,16 +446,49 @@ static u32 read_blocks(u32 lun, u32 lba, u32 count, void *buf)
 	return scsi(lun, cdb, sizeof(cdb), buf, count * BLOCK);
 }
 
+/* Fallback only: UFS normally returns sense data inside the response UPIU. */
+static u32 request_sense(u32 lun)
+{
+	static const u8 cdb[6] = { 0x03, 0, 0, 0, 18, 0 };
+	u32 rc = scsi(lun, cdb, sizeof(cdb), data, 18);
+	logf("LUN%d REQSENSE: rc=%x ocs=%x st=%x rsp=%x slen=%x key=%x asc=%x ascq=%x",
+	     (u64)lun, (u64)rc, (u64)last_ocs, (u64)last_st, (u64)last_rsp,
+	     (u64)last_sense_len, (u64)last_sk, (u64)last_asc,
+	     (u64)last_ascq);
+	if (!rc)
+		logf("LUN%d SENSE: %x %x %x %x %x %x %x %x %x %x %x %x %x %x",
+		     (u64)lun, (u64)data[0], (u64)data[1], (u64)data[2],
+		     (u64)data[3], (u64)data[4], (u64)data[5], (u64)data[6],
+		     (u64)data[7], (u64)data[8], (u64)data[9], (u64)data[10],
+		     (u64)data[11], (u64)data[12], (u64)data[13]);
+	return rc;
+}
+
 static u32 tur(u32 lun)
 {
 	static const u8 cdb[6] = { 0x00 };
 	u32 rc = 0;
-	/* The first command may report a unit attention; retry a few times. */
-	for (int i = 0; i < 3; i++) {
+	/*
+	 * A freshly reset device reports unit attention (sense key 6) or not
+	 * ready/initializing (key 2); both are transient.  Retry those, but
+	 * stop immediately on any persistent sense so we do not hide it.
+	 */
+	for (int i = 0; i < 5; i++) {
 		rc = scsi(lun, cdb, sizeof(cdb), 0, 0);
+		logf("LUN%d TUR%d: rc=%x ocs=%x st=%x rsp=%x slen=%x key=%x asc=%x ascq=%x",
+		     (u64)lun, (u64)i, (u64)rc, (u64)last_ocs,
+		     (u64)last_st, (u64)last_rsp, (u64)last_sense_len,
+		     (u64)last_sk, (u64)last_asc, (u64)last_ascq);
 		if (!rc)
 			break;
+		if (rc != 4 || !last_sense_len)
+			break;
+		if (last_sk != 0x6 && last_sk != 0x2)
+			break;
+		delay_us(5000);
 	}
+	if (rc == 4 && !last_sense_len)
+		request_sense(lun);
 	return rc;
 }
 
@@ -540,23 +591,27 @@ static void probe_lun(u32 lun)
 {
 	logf("=== LUN %d ===", (u64)lun);
 	u32 rc = tur(lun);
-	logf("LUN%d TUR: rc=%x ocs=%x st=%x sense=%x", (u64)lun,
-	     (u64)rc, (u64)last_ocs, (u64)last_st, (u64)last_sense);
-	if (rc)
+	logf("LUN%d TUR: rc=%x ocs=%x st=%x rsp=%x sense=%x slen=%x key=%x asc=%x ascq=%x",
+	     (u64)lun, (u64)rc, (u64)last_ocs, (u64)last_st, (u64)last_rsp,
+	     (u64)last_sense, (u64)last_sense_len, (u64)last_sk,
+	     (u64)last_asc, (u64)last_ascq);
+	/* CHECK CONDITION still carries useful info; do not stop the probe. */
+	if (rc && rc != 4)
 		return;
 
 	u32 last_lba = 0, blk = 0;
 	rc = read_capacity(lun, &last_lba, &blk);
-	logf("LUN%d CAP: rc=%x ocs=%x st=%x last=%x blk=%x", (u64)lun,
-	     (u64)rc, (u64)last_ocs, (u64)last_st, (u64)last_lba,
-	     (u64)blk);
-	if (rc)
+	logf("LUN%d CAP: rc=%x ocs=%x st=%x key=%x asc=%x ascq=%x last=%x blk=%x",
+	     (u64)lun, (u64)rc, (u64)last_ocs, (u64)last_st, (u64)last_sk,
+	     (u64)last_asc, (u64)last_ascq, (u64)last_lba, (u64)blk);
+	if (rc && rc != 4)
 		return;
 
 	rc = read_blocks(lun, 0, 1, data);
-	logf("LUN%d READ0: rc=%x ocs=%x st=%x", (u64)lun, (u64)rc,
-	     (u64)last_ocs, (u64)last_st);
-	if (rc)
+	logf("LUN%d READ0: rc=%x ocs=%x st=%x key=%x asc=%x ascq=%x", (u64)lun,
+	     (u64)rc, (u64)last_ocs, (u64)last_st, (u64)last_sk,
+	     (u64)last_asc, (u64)last_ascq);
+	if (rc && rc != 4)
 		return;
 
 	char a[9], b[9];
