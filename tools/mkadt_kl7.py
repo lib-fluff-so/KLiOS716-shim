@@ -387,7 +387,7 @@ def build(facts, product_adt=None, seed=None):
     ufs = node('kl7-ufs', [
         ph(),
         ('compatible', cstr('mediatek,mt8183-ufshci')),
-        ('reg', u64(facts['ufs'] - SOC_BASE, facts['ufs_size'])),
+        ('reg', u64(facts['ufs'], facts['ufs_size'], 0x10001000, 0x1000)),
     ])
 
     defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
