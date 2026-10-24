@@ -71,7 +71,8 @@ def main():
     assert values == (0x0b000000, 0x40000, 0x0b040000, 0x200000)
 
     ufs = find(parsed, 'kl7-ufs')
-    assert struct.unpack('<2Q', ufs.prop('reg')) == (0x10270000, 0x2300)
+    assert struct.unpack('<4Q', ufs.prop('reg')) == (
+        0x11270000, 0x2300, 0x10001000, 0x1000)
     pram = find(parsed, 'pram')
     assert struct.unpack('<2Q', pram.prop('reg')) == (0x23feff000, 0x100000)
     print(f'RESULT: KL7 ADT generation checks passed ({len(blob)} bytes)')
