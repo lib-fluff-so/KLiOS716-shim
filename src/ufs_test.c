@@ -43,16 +43,28 @@ typedef unsigned long long u64;
 #define REG_UCDLBAU	0x74
 #define REG_UCDDBR	0x78
 #define REG_UICCMD	0x90
-#define REG_UICARG	0x94
-#define REG_UICARG1	0x98
-#define REG_UICARG2	0x9c
-#define REG_UICARG3	0xa0
+#define REG_UIC_ARG1	0x94
+#define REG_UIC_ARG2	0x98
+#define REG_UIC_ARG3	0x9c
 
 #define HCS_DP		(1u << 0)
 #define HCS_UTRLRDY	(1u << 1)
 #define HCS_UCRDY	(1u << 3)
 
 #define BLOCK		4096u
+
+#define IS_UIC_ERROR		(1u << 2)
+#define IS_UIC_COMMAND_COMPL	(1u << 10)
+
+/* UIC command opcodes and UniPro attributes used by the MTK resume path. */
+#define UIC_CMD_DME_GET		0x01
+#define UIC_CMD_DME_SET		0x02
+#define UIC_CMD_DME_LINK_STARTUP 0x16
+#define UIC_CMD_DME_HIBER_EXIT	0x18
+
+#define PA_LOCAL_TX_LCC_ENABLE	0x155E
+#define PA_PWRMODE		0x1571
+#define VS_UNIPROPOWERDOWNCONTROL 0xD0A8
 
 static inline u32 ufs_rd(u32 off) { return *(volatile u32 *)(UFS_BASE + off); }
 static inline void ufs_wr(u32 off, u32 v) { *(volatile u32 *)(UFS_BASE + off) = v; }
@@ -70,11 +82,11 @@ struct utrd {
 };
 
 /* UTP command descriptor: command UPIU, response UPIU, PRDT.
- * This is the standard 32+32 layout used by the Linux ufshcd driver.  The
- * MTK UFSHCI 2.0 rejects a 512-byte response length as an invalid UTRD. */
+ * Linux ufshcd uses ALIGNED_UPIU_SIZE = 512 for each UPIU and puts the PRDT
+ * at offset 1024; the UTRD response/PRDT offsets and lengths are in DWORDs. */
 struct ucd {
-	u8 cmd[32];
-	u8 resp[32];
+	u8 cmd[512];
+	u8 resp[512];
 	struct {
 		u32 addr_lo, addr_hi, rsvd, dbc;	/* dbc = byte count - 1 */
 	} prdt[1];
@@ -99,6 +111,32 @@ static u64 timer_freq(void)
 	u64 f;
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
 	return f ? f : 19200000u;
+}
+
+/*
+ * Send one UIC command and wait for completion.  UFSHCI signals UIC command
+ * completion in IS bit 10 (0x400); the result code is in UICARG2 and the DME
+ * attribute value in UICARG3 (Linux ufshcd_get_uic_cmd_result/get_dme_attr_val).
+ */
+static u32 uic(u32 opcode, u32 arg1, u32 arg2, u32 arg3, u32 *val)
+{
+	ufs_wr(REG_IS, IS_UIC_COMMAND_COMPL | IS_UIC_ERROR);
+	ufs_wr(REG_UIC_ARG1, arg1);
+	ufs_wr(REG_UIC_ARG2, arg2);
+	ufs_wr(REG_UIC_ARG3, arg3);
+	ufs_wr(REG_UICCMD, opcode & 0xff);
+
+	u64 start = ticks();
+	u64 timeout = timer_freq() / 2;		/* 500 ms */
+	while (!(ufs_rd(REG_IS) & IS_UIC_COMMAND_COMPL)) {
+		if (ticks() - start > timeout)
+			return 0x100;		/* timeout */
+	}
+	u32 result = ufs_rd(REG_UIC_ARG2) & 0xff;
+	if (val)
+		*val = ufs_rd(REG_UIC_ARG3);
+	ufs_wr(REG_IS, IS_UIC_COMMAND_COMPL);
+	return result;
 }
 
 static void zero(void *p, unsigned n)
@@ -169,13 +207,13 @@ static u32 scsi(u32 lun, const u8 *cdb, u32 cdb_len, void *buf, u32 len)
 	utrl[0].dw2 = 0x0f;			/* OCS: invalid until the host updates it */
 	utrl[0].ucdba = (u32)ucd_pa;
 	utrl[0].ucdbau = (u32)(ucd_pa >> 32);
-	utrl[0].resp = (32u / 4) << 16 | (32u / 4);
+	utrl[0].resp = (512u / 4) << 16 | (512u / 4);
 	if (len) {
 		u64 buf_pa = (u64)(unsigned long)buf;
 		ucd.prdt[0].addr_lo = (u32)buf_pa;
 		ucd.prdt[0].addr_hi = (u32)(buf_pa >> 32);
 		ucd.prdt[0].dbc = len - 1;
-		utrl[0].prdt = (64u / 4) << 16 | 1;
+		utrl[0].prdt = (1024u / 4) << 16 | 1;
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 
@@ -372,9 +410,9 @@ void ufs_test(void)
 	     (u64)ufs_rd(REG_UTRLRSR));
 	logf("UFS: ucdlba=%x/%x ucddbr=%x", (u64)ufs_rd(REG_UCDLBA),
 	     (u64)ufs_rd(REG_UCDLBAU), (u64)ufs_rd(REG_UCDDBR));
-	logf("UFS: uiccmd=%x arg=%x a1=%x a2=%x a3=%x", (u64)ufs_rd(REG_UICCMD),
-	     (u64)ufs_rd(REG_UICARG), (u64)ufs_rd(REG_UICARG1),
-	     (u64)ufs_rd(REG_UICARG2), (u64)ufs_rd(REG_UICARG3));
+	logf("UFS: uiccmd=%x arg1=%x arg2=%x arg3=%x", (u64)ufs_rd(REG_UICCMD),
+	     (u64)ufs_rd(REG_UIC_ARG1), (u64)ufs_rd(REG_UIC_ARG2),
+	     (u64)ufs_rd(REG_UIC_ARG3));
 	logf("UFS: ahit=%x uecpa=%x uecba=%x uecc=%x", (u64)ufs_rd(REG_AHIT),
 	     (u64)ufs_rd(REG_UECPA), (u64)ufs_rd(REG_UECBA),
 	     (u64)ufs_rd(REG_UECC));
@@ -414,6 +452,31 @@ void ufs_test(void)
 		logf("UFS: list take-over failed; stop (no doorbell rung)");
 		return;
 	}
+
+	/*
+	 * LK leaves UniPro in low-power mode after loading the image.  Linux
+	 * ufs-mediatek resumes with VS_UNIPROPOWERDOWNCONTROL=0 (HPM), disables
+	 * host TX LCC and exits hibernation (H8).  Without this the first UPIU
+	 * is lost and the UTRD completes with OCS=5 (PEER_COMM_FAILURE).
+	 */
+	u32 v = 0, r;
+	r = uic(UIC_CMD_DME_SET, (u32)VS_UNIPROPOWERDOWNCONTROL << 16, 0, 0,
+		&v);
+	logf("UFS: HPM rc=%x", (u64)r);
+	r = uic(UIC_CMD_DME_SET, (u32)PA_LOCAL_TX_LCC_ENABLE << 16, 0, 0, &v);
+	logf("UFS: TXLCC rc=%x", (u64)r);
+	r = uic(UIC_CMD_DME_HIBER_EXIT, 0, 0, 0, &v);
+	logf("UFS: H8EXIT rc=%x", (u64)r);
+	r = uic(UIC_CMD_DME_GET, (u32)PA_PWRMODE << 16, 0, 0, &v);
+	logf("UFS: PA_PWRMODE rc=%x val=%x", (u64)r, (u64)v);
+	if (r) {
+		r = uic(UIC_CMD_DME_LINK_STARTUP, 0, 0, 0, &v);
+		logf("UFS: LINKSTART rc=%x", (u64)r);
+		r = uic(UIC_CMD_DME_GET, (u32)PA_PWRMODE << 16, 0, 0, &v);
+		logf("UFS: PA_PWRMODE2 rc=%x val=%x", (u64)r, (u64)v);
+	}
+	logf("UFS: link hcs=%x is=%x", (u64)ufs_rd(REG_HCS),
+	     (u64)ufs_rd(REG_IS));
 
 	probe_lun(0);
 	probe_lun(1);
