@@ -14,12 +14,16 @@ typedef __builtin_va_list va_list;
 #include "memmap.h"
 #include "loader.h"
 #include "xnu_payload.h"
+#include "ufs_test.h"
 
 #ifndef RAMOOPS_LOG
 #define RAMOOPS_LOG 1
 #endif
 #ifndef XNU_PAYLOAD
 #define XNU_PAYLOAD 0
+#endif
+#ifndef UFS_TEST
+#define UFS_TEST 0
 #endif
 #ifndef AUTO_REBOOT_TEST
 #if XNU_PAYLOAD
@@ -216,7 +220,7 @@ static int format_line(char *out, int cap, const char *fmt, va_list ap)
     return (int)(out - begin);
 }
 
-static void logf(const char *fmt, ...)
+void logf(const char *fmt, ...)
 {
     char line[160];
     va_list ap;
@@ -288,7 +292,7 @@ static __attribute__((naked, noreturn)) void psci_reset_timer(void)
         "b 1b\n");
 }
 
-static void psci_start_reset_timer(void)
+static __attribute__((unused)) void psci_start_reset_timer(void)
 {
     u64 entry = (u64)(unsigned long)&psci_reset_timer;
     u64 rc = psci_smc(PSCI_CPU_ON, PSCI_RESET_CPU_MPIDR, entry, 0);
@@ -758,6 +762,18 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
     logf("console: framebuffer + ramoops");
     wdt_report("entry");
     logf("entry: DTB=%x shim=%x size=%x", dtb_address, shim_base, (u64)(_end - _start));
+
+#if UFS_TEST
+    logf("UFS TEST: read-only probe (XNU will not be loaded)");
+    ufs_test();
+    logf("UFS TEST: probe returned");
+#if AUTO_REBOOT_TEST
+    finish_test_attempt("UFS probe done");
+#else
+    logf("UFS TEST: halting (no reboot path)");
+    for (;;) __asm__ volatile("wfe");
+#endif
+#endif
 
     const u8 *dtb = (const u8 *)dtb_address;
     u32 dtb_size = 0;
