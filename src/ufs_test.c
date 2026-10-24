@@ -91,6 +91,15 @@ typedef unsigned long long u64;
 #define UIC_CMD_DME_LINK_STARTUP 0x16
 #define UIC_CMD_DME_HIBER_EXIT	0x18
 
+/* UFS query UPIU (ufs.h / scsi_bsg_ufs.h). */
+#define UPIU_TRANSACTION_QUERY_REQ	0x16
+#define UPIU_TRANSACTION_QUERY_RSP	0x36
+#define UPIU_QUERY_OPCODE_READ_FLAG	0x05
+#define UPIU_QUERY_OPCODE_SET_FLAG	0x06
+#define UPIU_QUERY_FUNC_STANDARD_READ	0x01
+#define UPIU_QUERY_FUNC_STANDARD_WRITE	0x81
+#define QUERY_FLAG_IDN_FDEVICEINIT	0x01
+
 #define PA_LOCAL_TX_LCC_ENABLE	0x155E
 #define PA_PWRMODE		0x1571
 #define VS_UNIPROPOWERDOWNCONTROL 0xD0A8
@@ -439,6 +448,100 @@ static u32 scsi(u32 lun, const u8 *cdb, u32 cdb_len, void *buf, u32 len)
 	return last_st ? 4 : 0;
 }
 
+/*
+ * Send one UFS QUERY REQUEST (no data) in UTRL slot 0.  Used for the
+ * fDeviceInit handshake: after a device reset the UFS device keeps all LUs
+ * NOT READY (sense key 2, ASC 0x04, ASCQ 0x01) until the host sets this flag;
+ * the device then initializes and clears it (ufshcd_complete_dev_init()).
+ */
+static u32 ufs_query_flag(u32 opcode, u32 idn, u32 index, u32 *val)
+{
+	static u8 qtag;
+	zero(&utrl[0], sizeof(utrl[0]));
+	zero(&ucd, sizeof(ucd));
+
+	ucd.cmd[0] = UPIU_TRANSACTION_QUERY_REQ;
+	ucd.cmd[1] = 0;
+	ucd.cmd[2] = 0;				/* LUN 0: device management */
+	ucd.cmd[3] = ++qtag;
+	ucd.cmd[5] = (opcode == UPIU_QUERY_OPCODE_SET_FLAG) ?
+		     UPIU_QUERY_FUNC_STANDARD_WRITE :
+		     UPIU_QUERY_FUNC_STANDARD_READ;
+	ucd.cmd[12] = (u8)opcode;
+	ucd.cmd[13] = (u8)idn;
+	ucd.cmd[14] = (u8)index;
+	ucd.cmd[15] = 0;			/* selector */
+	/* length and value stay zero for flag queries */
+
+	u64 ucd_pa = (u64)(unsigned long)&ucd;
+	utrl[0].dw0 = (1u << 28) | (1u << 24);	/* UFS storage, interrupt */
+	utrl[0].dw1 = 0;
+	utrl[0].dw2 = 0x0f;			/* OCS invalid until completion */
+	utrl[0].dw3 = 0;
+	utrl[0].ucdba = (u32)ucd_pa;
+	utrl[0].ucdbau = (u32)(ucd_pa >> 32);
+	utrl[0].resp = (512u / 4) << 16 | (512u / 4);
+	utrl[0].prdt = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	ufs_wr(REG_UTRLDBR, 1);
+	u64 start = ticks();
+	u64 timeout = timer_freq();		/* 1 second */
+	while (ufs_rd(REG_UTRLDBR) & 1) {
+		if (ticks() - start > timeout) {
+			ufs_wr(REG_UTRLCLR, 1);
+			logf("UFS: query op=%x idn=%x timeout", (u64)opcode,
+			     (u64)idn);
+			return 2;
+		}
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	u32 ocs = utrl[0].dw2 & 0xff;
+	u32 upiu = ucd.resp[0];
+	u32 rsp = ucd.resp[6];
+	u32 v = be32(ucd.resp + 20);		/* query response value */
+	if (val)
+		*val = v;
+	/* SET_FLAG and errors are interesting; quiet successful READ_FLAGs. */
+	if (opcode == UPIU_QUERY_OPCODE_SET_FLAG || ocs ||
+	    upiu != UPIU_TRANSACTION_QUERY_RSP || rsp)
+		logf("UFS: query op=%x idn=%x ocs=%x upiu=%x rsp=%x val=%x",
+		     (u64)opcode, (u64)idn, (u64)ocs, (u64)upiu, (u64)rsp,
+		     (u64)v);
+	if (ocs)
+		return 3;
+	if (upiu != UPIU_TRANSACTION_QUERY_RSP)
+		return 4;
+	if (rsp)
+		return 5;
+	return 0;
+}
+
+static u32 ufs_complete_dev_init(void)
+{
+	u32 val = 0, rc;
+	rc = ufs_query_flag(UPIU_QUERY_OPCODE_SET_FLAG,
+			    QUERY_FLAG_IDN_FDEVICEINIT, 0, &val);
+	logf("UFS: fDeviceInit SET rc=%x", (u64)rc);
+	if (rc)
+		return rc;
+
+	u64 start = ticks();
+	u64 timeout = timer_freq() * 1500 / 1000;	/* 1.5 s */
+	u32 tries = 0;
+	do {
+		rc = ufs_query_flag(UPIU_QUERY_OPCODE_READ_FLAG,
+				    QUERY_FLAG_IDN_FDEVICEINIT, 0, &val);
+		tries++;
+		if (rc || !(val & 1u))
+			break;
+		delay_us(5000);
+	} while (ticks() - start < timeout);
+	logf("UFS: fDeviceInit poll rc=%x val=%x tries=%x", (u64)rc,
+	     (u64)val, (u64)tries);
+	return rc;
+}
+
 static u32 read_blocks(u32 lun, u32 lba, u32 count, void *buf)
 {
 	u8 cdb[10] = { 0x28, 0, (u8)(lba >> 24), (u8)(lba >> 16),
@@ -722,6 +825,13 @@ void ufs_test(void)
 		logf("UFS: list take-over failed; stop (no doorbell rung)");
 		return;
 	}
+
+	/*
+	 * Device reset leaves every LU NOT READY until the host sets
+	 * fDeviceInit and the device clears it (Linux complete_dev_init()).
+	 */
+	u32 init_rc = ufs_complete_dev_init();
+	logf("UFS: device init rc=%x", (u64)init_rc);
 
 	probe_lun(0);
 	probe_lun(1);
