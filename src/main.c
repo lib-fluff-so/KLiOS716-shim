@@ -1,4 +1,4 @@
-/* ios-kl7 v0.9.3: minimal payload loader with a framebuffer console and ramoops.
+/* ios-kl7 v0.10.0: minimal payload loader with a framebuffer console and ramoops.
  * Entry: EL1, MMU/caches off, x0 = live Linux DTB. No shim page tables,
  * no CPU_ON, no GIC/timer probes. Prepare payload, boot_args and ADT, then jump. */
 typedef unsigned char u8;
@@ -32,8 +32,8 @@ typedef __builtin_va_list va_list;
 #define FB_BASE               0xFDFFF000UL
 #define FB_STRIDE             4352u
 #define FB_HEIGHT             2436u
-#define FB_VISIBLE_OFFSET     (1230UL * FB_STRIDE)
-#define XNU_FB_BASE           (FB_BASE + FB_VISIBLE_OFFSET)
+#define FB_VISIBLE_OFFSET     0UL
+#define XNU_FB_BASE           FB_BASE
 #define XNU_FB_STRIDE         FB_STRIDE
 #define XNU_FB_WIDTH          1080u
 #define XNU_FB_HEIGHT         FB_HEIGHT
@@ -61,6 +61,17 @@ typedef __builtin_va_list va_list;
 #define WDT_LENGTH_REG        0x04u
 #define WDT_MODE_KEY          0x22000000u
 #define WDT_MODE_EN           0x1u
+#define WDT_RESTART_REG       0x08u
+#define WDT_RESTART_KEY       0x1971u
+/* WDT_TIMEOUT_AT_HANDOFF: arm (rather than disable) the watchdog right before
+ * jumping to XNU, as a last-resort backstop. LENGTH ticks are 1/2048 s:
+ * 0x5000 = 10 s, 0xf000 = 30 s (the MT6789 reads back 0xf000, i.e. the write
+ * is ignored, so the real reset always comes from the PSCI timer below). */
+#ifndef WDT_TIMEOUT_AT_HANDOFF
+/* WDT is disabled at handoff: the PSCI timer on cpu1 is the only reset source.
+ * A watchdog reset loses DRAM/ramoops, so it must never fire first. */
+#define WDT_TIMEOUT_AT_HANDOFF 0u
+#endif
 /* WDT_DISABLE_AT_HANDOFF=1: stop the watchdog right before jumping to XNU so a
  * multi-minute kernel boot is not reset. Default on only for XNU_PAYLOAD=1;
  * the test build keeps the watchdog as a safety net. */
@@ -225,6 +236,64 @@ static void wdt_report(const char *when)
     u32 length = w[WDT_LENGTH_REG / 4];
     logf("wdt(%s): MODE=%x LENGTH=%x enabled=%d", when, (u64)mode, (u64)length,
          (u64)(mode & WDT_MODE_EN));
+}
+
+static __attribute__((unused)) void wdt_arm(u32 ticks)
+{
+    volatile u32 *w = (volatile u32 *)WDT_BASE;
+    u32 mode = w[WDT_MODE_REG / 4] & 0x00ffffffu;
+    w[WDT_MODE_REG / 4] = WDT_MODE_KEY | (mode | WDT_MODE_EN);
+    w[WDT_LENGTH_REG / 4] = ticks;
+    w[WDT_RESTART_REG / 4] = WDT_RESTART_KEY;
+    wdt_report("armed");
+}
+
+/* PSCI 1.0 (DT /psci method = "smc"). Start a secondary core in a tiny timer
+ * loop that issues SYSTEM_RESET after a delay. A PSCI reset is clean: it keeps
+ * DRAM (and therefore the ramoops/pstore ring) across the reboot, unlike a
+ * watchdog reset, which resets the SoC without a cache/DRAM handshake. */
+#define PSCI_CPU_ON          0xC4000003UL
+#define PSCI_RESET_CPU_MPIDR 0x100UL   /* cpu1: Aff1 = 1 */
+#define PSCI_RESET_DELAY_S   50u
+
+static u64 psci_smc(u64 fn, u64 a1, u64 a2, u64 a3)
+{
+    register u64 x0 __asm__("x0") = fn;
+    register u64 x1 __asm__("x1") = a1;
+    register u64 x2 __asm__("x2") = a2;
+    register u64 x3 __asm__("x3") = a3;
+    __asm__ volatile("smc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3)
+                     : "memory");
+    return x0;
+}
+
+/* Runs on the secondary core: MMU/caches off, no stack, no memory accesses. */
+static __attribute__((naked, noreturn)) void psci_reset_timer(void)
+{
+    __asm__ volatile(
+        "mrs x0, cntfrq_el0\n"
+        "mov x2, #50\n"                     /* PSCI_RESET_DELAY_S */
+        "mul x2, x0, x2\n"
+        "mrs x1, cntpct_el0\n"
+        "add x2, x2, x1\n"
+        "1: mrs x3, cntpct_el0\n"
+        "cmp x3, x2\n"
+        "b.lo 1b\n"
+        "movz x0, #0x0009\n"
+        "movk x0, #0x8400, lsl #16\n"
+        "mov x1, xzr\n"
+        "mov x2, xzr\n"
+        "mov x3, xzr\n"
+        "smc #0\n"
+        "b 1b\n");
+}
+
+static void psci_start_reset_timer(void)
+{
+    u64 entry = (u64)(unsigned long)&psci_reset_timer;
+    u64 rc = psci_smc(PSCI_CPU_ON, PSCI_RESET_CPU_MPIDR, entry, 0);
+    logf("psci cpu_on(mpidr=%x entry=%x) -> %x", PSCI_RESET_CPU_MPIDR,
+         entry, rc);
 }
 
 #if WDT_DISABLE_AT_HANDOFF
@@ -596,10 +665,16 @@ static int load_xnu(const u8 *dtb, u32 dtb_size, u64 initrd_start,
     u64 entry_pa = p.phys_base + entry_delta;
     logf("boot_args rev2: PA=%x ADT=%x+%x", boot_args_pa, adt_pa, p.adt_size);
     logf("XNU entry: PA=%x x0=%x", entry_pa, boot_args_pa);
-#if WDT_DISABLE_AT_HANDOFF
+#if XNU_PAYLOAD
+    psci_start_reset_timer();
+#endif
+#if WDT_TIMEOUT_AT_HANDOFF
+    wdt_arm(WDT_TIMEOUT_AT_HANDOFF);
+#elif WDT_DISABLE_AT_HANDOFF
     wdt_disable();
 #endif
-    logf("HANDOFF: MMU off, caches off, secondaries untouched");
+    logf("HANDOFF: MMU off, caches off, secondaries untouched (cpu1 has the "
+         "reset timer)");
     transfer_to_payload(entry_pa, boot_args_pa);
 }
 #endif
@@ -679,7 +754,7 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
     (void)x3;
     ramoops_init();
     console_init();
-    logf("ios-kl7 shim v0.9.3");
+    logf("ios-kl7 shim v0.10.0");
     logf("console: framebuffer + ramoops");
     wdt_report("entry");
     logf("entry: DTB=%x shim=%x size=%x", dtb_address, shim_base, (u64)(_end - _start));
