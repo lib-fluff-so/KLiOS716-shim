@@ -47,6 +47,14 @@ typedef unsigned long long u64;
 #define REG_UIC_ARG2	0x98
 #define REG_UIC_ARG3	0x9c
 
+/* MediaTek vendor registers (ufs-mediatek.h). */
+#define REG_UFS_REFCLK_CTRL	0x144
+#define REG_UFS_EXTREG		0x2100
+#define REG_UFS_MPHYCTRL	0x2200
+
+#define REFCLK_REQUEST		0x1
+#define REFCLK_ACK		0x2
+
 #define HCS_DP		(1u << 0)
 #define HCS_UTRLRDY	(1u << 1)
 #define HCS_UCRDY	(1u << 3)
@@ -65,6 +73,12 @@ typedef unsigned long long u64;
 #define PA_LOCAL_TX_LCC_ENABLE	0x155E
 #define PA_PWRMODE		0x1571
 #define VS_UNIPROPOWERDOWNCONTROL 0xD0A8
+#define VS_SAVEPOWERCONTROL	0xD0A6
+
+/* MediaTek SiP UFS control (ufs-mediatek.c/ufs-mediatek.h). */
+#define MTK_SIP_UFS_CONTROL		0x82000276UL
+#define UFS_MTK_SIP_DEVICE_RESET	2
+#define UFS_MTK_SIP_REF_CLK_NOTIFICATION 8
 
 static inline u32 ufs_rd(u32 off) { return *(volatile u32 *)(UFS_BASE + off); }
 static inline void ufs_wr(u32 off, u32 v) { *(volatile u32 *)(UFS_BASE + off) = v; }
@@ -111,6 +125,67 @@ static u64 timer_freq(void)
 	u64 f;
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
 	return f ? f : 19200000u;
+}
+
+static void delay_us(u64 us)
+{
+	u64 start = ticks();
+	u64 delta = us * timer_freq() / 1000000u;
+
+	while (ticks() - start < delta)
+		;
+}
+
+/*
+ * MediaTek SiP UFS control, used by Linux ufs-mediatek.c.  The secure
+ * monitor owns the UFS device reset line (RST_n) and the reference clock
+ * gate; both are needed to revive a device left powered down by the LK.
+ * x0 = MTK_SIP_SMC_CMD(0x276), x1 = command, x2 = value.
+ */
+static u64 ufs_smc(u64 cmd, u64 val)
+{
+	register u64 x0 __asm__("x0") = MTK_SIP_UFS_CONTROL;
+	register u64 x1 __asm__("x1") = cmd;
+	register u64 x2 __asm__("x2") = val;
+	register u64 x3 __asm__("x3") = 0;
+	register u64 x4 __asm__("x4") = 0;
+	register u64 x5 __asm__("x5") = 0;
+	register u64 x6 __asm__("x6") = 0;
+	register u64 x7 __asm__("x7") = 0;
+
+	__asm__ volatile("smc #0" : "+r"(x0)
+			 : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5),
+			   "r"(x6), "r"(x7)
+			 : "memory");
+	return x0;
+}
+
+/*
+ * Mirror ufs_mtk_setup_ref_clk(true): notify the secure monitor that the
+ * reference clock is needed, then request it from the host controller and
+ * wait for the ack.  If the LK already left it running, change nothing.
+ */
+static void ref_clk_on(void)
+{
+	u32 v = ufs_rd(REG_UFS_REFCLK_CTRL);
+	logf("UFS: refclk ctrl=%x", (u64)v);
+	if ((v & (REFCLK_REQUEST | REFCLK_ACK)) ==
+	    (REFCLK_REQUEST | REFCLK_ACK))
+		return;
+
+	u64 s = ufs_smc(UFS_MTK_SIP_REF_CLK_NOTIFICATION, 1);
+	logf("UFS: refclk smc=%x", s);
+	delay_us(10);
+	ufs_wr(REG_UFS_REFCLK_CTRL, REFCLK_REQUEST);
+
+	u64 start = ticks();
+	u64 timeout = timer_freq() * 3 / 1000;	/* 3 ms */
+	do {
+		v = ufs_rd(REG_UFS_REFCLK_CTRL);
+		if (((v & REFCLK_ACK) >> 1) == (v & REFCLK_REQUEST))
+			break;
+	} while (ticks() - start < timeout);
+	logf("UFS: refclk ctrl after=%x", (u64)v);
 }
 
 /*
@@ -454,29 +529,44 @@ void ufs_test(void)
 	}
 
 	/*
-	 * LK leaves UniPro in low-power mode after loading the image.  Linux
-	 * ufs-mediatek resumes with VS_UNIPROPOWERDOWNCONTROL=0 (HPM), disables
-	 * host TX LCC and exits hibernation (H8).  Without this the first UPIU
-	 * is lost and the UTRD completes with OCS=5 (PEER_COMM_FAILURE).
+	 * The LK leaves the UFS device in a low-power/protocol-down state and
+	 * UniPro in PWM-G1.  Linux ufs-mediatek re-initialises the link with:
+	 * ref clock on, MTK SiP device reset (RST_n low/high), HPM, host TX
+	 * LCC off, deep-stall off, then DME_LINK_STARTUP.  Local DME commands
+	 * alone do not wake the device; only link startup renegotiates the
+	 * UniPro link.
 	 */
+	ref_clk_on();
+
+	u64 s = ufs_smc(UFS_MTK_SIP_DEVICE_RESET, 0);
+	logf("UFS: RST low rc=%x", s);
+	delay_us(20);
+	s = ufs_smc(UFS_MTK_SIP_DEVICE_RESET, 1);
+	logf("UFS: RST high rc=%x", s);
+	delay_us(15000);
+
 	u32 v = 0, r;
 	r = uic(UIC_CMD_DME_SET, (u32)VS_UNIPROPOWERDOWNCONTROL << 16, 0, 0,
 		&v);
 	logf("UFS: HPM rc=%x", (u64)r);
 	r = uic(UIC_CMD_DME_SET, (u32)PA_LOCAL_TX_LCC_ENABLE << 16, 0, 0, &v);
 	logf("UFS: TXLCC rc=%x", (u64)r);
-	r = uic(UIC_CMD_DME_HIBER_EXIT, 0, 0, 0, &v);
-	logf("UFS: H8EXIT rc=%x", (u64)r);
+	r = uic(UIC_CMD_DME_GET, (u32)VS_SAVEPOWERCONTROL << 16, 0, 0, &v);
+	logf("UFS: SAVEPWR get rc=%x val=%x", (u64)r, (u64)v);
+	if (!r) {
+		r = uic(UIC_CMD_DME_SET, (u32)VS_SAVEPOWERCONTROL << 16, 0,
+			v & ~(1u << 6), &v);
+		logf("UFS: SAVEPWR set rc=%x", (u64)r);
+	}
+	r = uic(UIC_CMD_DME_LINK_STARTUP, 0, 0, 0, &v);
+	logf("UFS: LINKSTART rc=%x", (u64)r);
 	r = uic(UIC_CMD_DME_GET, (u32)PA_PWRMODE << 16, 0, 0, &v);
 	logf("UFS: PA_PWRMODE rc=%x val=%x", (u64)r, (u64)v);
-	if (r) {
-		r = uic(UIC_CMD_DME_LINK_STARTUP, 0, 0, 0, &v);
-		logf("UFS: LINKSTART rc=%x", (u64)r);
-		r = uic(UIC_CMD_DME_GET, (u32)PA_PWRMODE << 16, 0, 0, &v);
-		logf("UFS: PA_PWRMODE2 rc=%x val=%x", (u64)r, (u64)v);
-	}
-	logf("UFS: link hcs=%x is=%x", (u64)ufs_rd(REG_HCS),
-	     (u64)ufs_rd(REG_IS));
+	logf("UFS: link hcs=%x is=%x uecpa=%x", (u64)ufs_rd(REG_HCS),
+	     (u64)ufs_rd(REG_IS), (u64)ufs_rd(REG_UECPA));
+	logf("UFS: refclk=%x ext=%x mphy=%x",
+	     (u64)ufs_rd(REG_UFS_REFCLK_CTRL), (u64)ufs_rd(REG_UFS_EXTREG),
+	     (u64)ufs_rd(REG_UFS_MPHYCTRL));
 
 	probe_lun(0);
 	probe_lun(1);
