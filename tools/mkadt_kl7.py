@@ -372,7 +372,7 @@ def build(facts, product_adt=None, seed=None):
     fbcon = node('kl7-fbcon', [
         ph(),
         ('compatible', cstr('tecno,kl7-framebuffer')),
-        ('reg', u64(facts['fb'] + FB_VISIBLE_OFFSET, FB_STRIDE * FB_H)),
+        ('reg', u64(facts['fb'], facts['fb_size'])),
         ('width', u32(FB_W)),
         ('height', u32(FB_H)),
         ('stride', u32(FB_STRIDE)),

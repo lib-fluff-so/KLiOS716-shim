@@ -9,7 +9,7 @@ typedef unsigned long u64;
 #define FB_WIDTH      1080u
 #define FB_HEIGHT     2436u
 #define FB_STRIDE     4352u
-#define VISIBLE_OFFSET (1230UL * FB_STRIDE)
+#define VISIBLE_OFFSET 0UL
 #define SCALE         2u
 #define CELL_WIDTH    (8u * SCALE)
 #define CELL_HEIGHT   (16u * SCALE)
