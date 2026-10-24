@@ -69,10 +69,12 @@ struct utrd {
 	u32 prdt;		/* [31:16] PRDT offset, [15:0] entries */
 };
 
-/* UTP command descriptor: command UPIU, response UPIU, PRDT. */
+/* UTP command descriptor: command UPIU, response UPIU, PRDT.
+ * This is the standard 32+32 layout used by the Linux ufshcd driver.  The
+ * MTK UFSHCI 2.0 rejects a 512-byte response length as an invalid UTRD. */
 struct ucd {
-	u8 cmd[512];
-	u8 resp[512];
+	u8 cmd[32];
+	u8 resp[32];
 	struct {
 		u32 addr_lo, addr_hi, rsvd, dbc;	/* dbc = byte count - 1 */
 	} prdt[1];
@@ -167,13 +169,13 @@ static u32 scsi(u32 lun, const u8 *cdb, u32 cdb_len, void *buf, u32 len)
 	utrl[0].dw2 = 0x0f;			/* OCS: invalid until the host updates it */
 	utrl[0].ucdba = (u32)ucd_pa;
 	utrl[0].ucdbau = (u32)(ucd_pa >> 32);
-	utrl[0].resp = (512u / 4) << 16 | (512u / 4);
+	utrl[0].resp = (32u / 4) << 16 | (32u / 4);
 	if (len) {
 		u64 buf_pa = (u64)(unsigned long)buf;
 		ucd.prdt[0].addr_lo = (u32)buf_pa;
 		ucd.prdt[0].addr_hi = (u32)(buf_pa >> 32);
 		ucd.prdt[0].dbc = len - 1;
-		utrl[0].prdt = (1024u / 4) << 16 | 1;
+		utrl[0].prdt = (64u / 4) << 16 | 1;
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 
