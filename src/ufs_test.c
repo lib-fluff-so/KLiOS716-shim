@@ -168,6 +168,12 @@ static u32 last_ocs, last_st, last_sense;
 static u32 last_upiu, last_rsp;
 static u32 last_sense_len, last_sk, last_asc, last_ascq;
 
+/* v0117 HS result, repeated after the GPT dump so it stays on screen. */
+static u32 hs_local_gear, hs_peer_gear, hs_rxlanes, hs_txlanes;
+static u32 hs_final_pwr;
+static int hs_active;
+static const char *hs_fail = "not_run";
+
 static u64 ticks(void)
 {
 	u64 t;
@@ -401,19 +407,29 @@ ufs_hs_enable(void)
 	if (hs_get(UIC_CMD_DME_GET, PA_CONNECTEDRXDATALANES,
 		   "connected_rx", &rxlanes) ||
 	    hs_get(UIC_CMD_DME_GET, PA_CONNECTEDTXDATALANES,
-		   "connected_tx", &txlanes))
+		   "connected_tx", &txlanes)) {
+		hs_fail = "connected_lanes";
 		return;
+	}
+	hs_rxlanes = rxlanes;
+	hs_txlanes = txlanes;
 	if (hs_get(UIC_CMD_DME_GET, PA_MAXRXHSGEAR, "max_hs_local", &local) ||
 	    hs_get(UIC_CMD_DME_PEER_GET, PA_MAXRXHSGEAR, "max_hs_peer",
-		   &peer))
+		   &peer)) {
+		hs_fail = "max_hs_gear";
 		return;
+	}
+	hs_local_gear = local;
+	hs_peer_gear = peer;
 	if (!rxlanes || !txlanes || rxlanes > 2 || txlanes > 2) {
 		logf("UFS HS: bad lanes rx=%x tx=%x", (u64)rxlanes,
 		     (u64)txlanes);
+		hs_fail = "bad_lanes";
 		return;
 	}
 	if (!peer) {
 		logf("UFS HS: peer has no HS gear");
+		hs_fail = "peer_no_hs";
 		return;
 	}
 	logf("UFS HS: caps lanes %x/%x, max gear local=%x peer=%x",
@@ -426,8 +442,10 @@ ufs_hs_enable(void)
 	    hs_set(PA_TXGEAR, 1, "txgear") ||
 	    hs_set(PA_ACTIVETXDATALANES, txlanes, "txlanes") ||
 	    hs_set(PA_TXTERMINATION, 1, "txterm") ||
-	    hs_set(PA_HSSERIES, PA_HS_MODE_B, "hsseries_b"))
+	    hs_set(PA_HSSERIES, PA_HS_MODE_B, "hsseries_b")) {
+		hs_fail = "hs_set";
 		return;
+	}
 
 	/*
 	 * Linux supplies the UniPro timeout user-data with every power-mode
@@ -446,19 +464,24 @@ ufs_hs_enable(void)
 	delay_us(1000);
 	if (hs_get(UIC_CMD_DME_GET, PA_PWRMODE, "pwr_readback", &pwr)) {
 		logf("UFS HS: pwr readback failed");
+		hs_fail = "pwr_readback";
 		return;
 	}
+	hs_final_pwr = pwr;
 	(void)hs_get(UIC_CMD_DME_GET, PA_TXGEAR, "txgear_readback", &v);
 	(void)hs_get(UIC_CMD_DME_GET, PA_RXGEAR, "rxgear_readback", &v);
 	(void)hs_get(UIC_CMD_DME_GET, PA_TXPWRSTATUS, "txstatus", &v);
 	(void)hs_get(UIC_CMD_DME_GET, PA_RXPWRSTATUS, "rxstatus", &v);
 	if (hs_pwr_mode(pwr)) {
 		logf("UFS HS: ACTIVE pwr=%x (set rc=%x)", (u64)pwr, (u64)r);
+		hs_active = 1;
+		hs_fail = "none";
 		return;
 	}
 
 	logf("UFS HS: NOT active pwr=%x (set rc=%x), restoring PWM",
 	     (u64)pwr, (u64)r);
+	hs_fail = "not_hs";
 	(void)hs_set(PA_TXHSADAPTTYPE, PA_NO_ADAPT, "noadapt");
 	(void)hs_set(PA_PWRMODE, 0x55, "pwm_restore");
 }
@@ -995,5 +1018,8 @@ void ufs_test(void)
 	probe_lun(1);
 	probe_lun(2);
 	ufs_bench(2);
+	logf("UFS HS SUMMARY: active=%d fail=%s pwr=%x lanes=%x/%x gears=%x/%x",
+	     (u64)hs_active, hs_fail, (u64)hs_final_pwr, (u64)hs_rxlanes,
+	     (u64)hs_txlanes, (u64)hs_local_gear, (u64)hs_peer_gear);
 	logf("UFS TEST: end");
 }
