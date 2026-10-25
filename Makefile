@@ -16,6 +16,9 @@ XNU_CMDLINE ?= debug=0xc serial=3 cpus=1 keepsyms=1 rd=ufsroot0 ufsroot=iosroot 
 D22AP_ADT ?= research/ipsw-x/d22ap.adt
 
 CFLAGS += -DRAMOOPS_LOG=$(RAMOOPS_LOG) -DXNU_PAYLOAD=$(XNU_PAYLOAD) -DUFS_TEST=$(UFS_TEST)
+ifneq ($(strip $(AUTO_REBOOT_TEST)),)
+CFLAGS += -DAUTO_REBOOT_TEST=$(AUTO_REBOOT_TEST)
+endif
 ifdef WDT_DISABLE_AT_HANDOFF
 CFLAGS += -DWDT_DISABLE_AT_HANDOFF=$(WDT_DISABLE_AT_HANDOFF)
 endif

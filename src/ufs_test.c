@@ -86,6 +86,8 @@ typedef unsigned long long u64;
 /* UIC command opcodes and UniPro attributes used by the MTK resume path. */
 #define UIC_CMD_DME_GET		0x01
 #define UIC_CMD_DME_SET		0x02
+#define UIC_CMD_DME_PEER_GET	0x03
+#define UIC_CMD_DME_PEER_SET	0x04
 #define UIC_CMD_DME_ENABLE	0x12
 #define UIC_CMD_DME_RESET	0x14
 #define UIC_CMD_DME_LINK_STARTUP 0x16
@@ -101,7 +103,28 @@ typedef unsigned long long u64;
 #define QUERY_FLAG_IDN_FDEVICEINIT	0x01
 
 #define PA_LOCAL_TX_LCC_ENABLE	0x155E
+#define PA_ACTIVETXDATALANES	0x1560
+#define PA_CONNECTEDTXDATALANES	0x1561
+#define PA_TXPWRSTATUS		0x1567
+#define PA_TXGEAR		0x1568
+#define PA_TXTERMINATION	0x1569
+#define PA_HSSERIES		0x156A
 #define PA_PWRMODE		0x1571
+#define PA_ACTIVERXDATALANES	0x1580
+#define PA_CONNECTEDRXDATALANES	0x1581
+#define PA_RXPWRSTATUS		0x1582
+#define PA_RXGEAR		0x1583
+#define PA_RXTERMINATION	0x1584
+#define PA_MAXRXHSGEAR		0x1587
+#define PA_PWRMODEUSERDATA0	0x15B0
+#define PA_PWRMODEUSERDATA1	0x15B1
+#define PA_PWRMODEUSERDATA2	0x15B2
+#define PA_PWRMODEUSERDATA3	0x15B3
+#define PA_PWRMODEUSERDATA4	0x15B4
+#define PA_PWRMODEUSERDATA5	0x15B5
+#define PA_TXHSADAPTTYPE	0x15D4
+#define PA_NO_ADAPT		3
+#define PA_HS_MODE_B		2
 #define VS_UNIPROPOWERDOWNCONTROL 0xD0A8
 #define VS_SAVEPOWERCONTROL	0xD0A6
 
@@ -331,6 +354,113 @@ static void mtk_pre_link(void)
 			v & ~(1u << 6), &v);
 		logf("UFS: SAVEPWR set rc=%x", (u64)r);
 	}
+}
+
+/*
+ * v0117: the KL7 bootloader leaves UniPro in PWM (PA_PWRMODE=0x55, i.e.
+ * SLOWAUTO/SLOWAUTO).  The Android kernel then performs the standard HS
+ * power-mode change; our driver historically skipped it, which is why the
+ * link moved at PWM-G1 speed (~480 KiB/s).  This is the same sequence Linux
+ * uses in ufshcd_dme_change_power_mode(), but kept read-only with respect to
+ * the UFS device: only UniPro/PHY attributes change.
+ */
+static u32
+hs_get(u32 opcode, u32 attr, const char *name, u32 *val)
+{
+	u32 v = 0;
+	u32 r = uic(opcode, attr << 16, 0, 0, &v);
+	logf("UFS HS: %s rc=%x val=%x", name, (u64)r, (u64)v);
+	if (val)
+		*val = v;
+	return r;
+}
+
+static u32
+hs_set(u32 attr, u32 val, const char *name)
+{
+	u32 v = 0;
+	u32 r = uic(UIC_CMD_DME_SET, attr << 16, 0, val, &v);
+	logf("UFS HS: set %s=%x rc=%x", name, (u64)val, (u64)r);
+	return r;
+}
+
+static int
+hs_pwr_mode(u32 v)
+{
+	u32 rx = (v >> 4) & 0xf, tx = v & 0xf;
+	return (rx == 1 || rx == 4) && (tx == 1 || tx == 4);
+}
+
+static void
+ufs_hs_enable(void)
+{
+	u32 rxlanes = 0, txlanes = 0, local = 0, peer = 0;
+	u32 pwr = 0, v = 0, r;
+
+	logf("UFS HS: enter");
+	if (hs_get(UIC_CMD_DME_GET, PA_CONNECTEDRXDATALANES,
+		   "connected_rx", &rxlanes) ||
+	    hs_get(UIC_CMD_DME_GET, PA_CONNECTEDTXDATALANES,
+		   "connected_tx", &txlanes))
+		return;
+	if (hs_get(UIC_CMD_DME_GET, PA_MAXRXHSGEAR, "max_hs_local", &local) ||
+	    hs_get(UIC_CMD_DME_PEER_GET, PA_MAXRXHSGEAR, "max_hs_peer",
+		   &peer))
+		return;
+	if (!rxlanes || !txlanes || rxlanes > 2 || txlanes > 2) {
+		logf("UFS HS: bad lanes rx=%x tx=%x", (u64)rxlanes,
+		     (u64)txlanes);
+		return;
+	}
+	if (!peer) {
+		logf("UFS HS: peer has no HS gear");
+		return;
+	}
+	logf("UFS HS: caps lanes %x/%x, max gear local=%x peer=%x",
+	     (u64)rxlanes, (u64)txlanes, (u64)local, (u64)peer);
+
+	/* HS-G1 series B is the conservative first step; Android uses more. */
+	if (hs_set(PA_RXGEAR, 1, "rxgear") ||
+	    hs_set(PA_ACTIVERXDATALANES, rxlanes, "rxlanes") ||
+	    hs_set(PA_RXTERMINATION, 1, "rxterm") ||
+	    hs_set(PA_TXGEAR, 1, "txgear") ||
+	    hs_set(PA_ACTIVETXDATALANES, txlanes, "txlanes") ||
+	    hs_set(PA_TXTERMINATION, 1, "txterm") ||
+	    hs_set(PA_HSSERIES, PA_HS_MODE_B, "hsseries_b"))
+		return;
+
+	/*
+	 * Linux supplies the UniPro timeout user-data with every power-mode
+	 * change.  Failures here are logged but do not abort the change; the
+	 * bootloader may already have usable values.
+	 */
+	(void)hs_set(PA_PWRMODEUSERDATA0, 8191, "ud0");
+	(void)hs_set(PA_PWRMODEUSERDATA1, 65535, "ud1");
+	(void)hs_set(PA_PWRMODEUSERDATA2, 32767, "ud2");
+	(void)hs_set(PA_PWRMODEUSERDATA3, 8191, "ud3");
+	(void)hs_set(PA_PWRMODEUSERDATA4, 65535, "ud4");
+	(void)hs_set(PA_PWRMODEUSERDATA5, 32767, "ud5");
+
+	/* FAST (0x1) for both directions: 0x11.  FASTAUTO would be 0x44. */
+	r = hs_set(PA_PWRMODE, 0x11, "pwr_0x11");
+	delay_us(1000);
+	if (hs_get(UIC_CMD_DME_GET, PA_PWRMODE, "pwr_readback", &pwr)) {
+		logf("UFS HS: pwr readback failed");
+		return;
+	}
+	(void)hs_get(UIC_CMD_DME_GET, PA_TXGEAR, "txgear_readback", &v);
+	(void)hs_get(UIC_CMD_DME_GET, PA_RXGEAR, "rxgear_readback", &v);
+	(void)hs_get(UIC_CMD_DME_GET, PA_TXPWRSTATUS, "txstatus", &v);
+	(void)hs_get(UIC_CMD_DME_GET, PA_RXPWRSTATUS, "rxstatus", &v);
+	if (hs_pwr_mode(pwr)) {
+		logf("UFS HS: ACTIVE pwr=%x (set rc=%x)", (u64)pwr, (u64)r);
+		return;
+	}
+
+	logf("UFS HS: NOT active pwr=%x (set rc=%x), restoring PWM",
+	     (u64)pwr, (u64)r);
+	(void)hs_set(PA_TXHSADAPTTYPE, PA_NO_ADAPT, "noadapt");
+	(void)hs_set(PA_PWRMODE, 0x55, "pwm_restore");
 }
 
 static void zero(void *p, unsigned n)
@@ -729,6 +859,32 @@ static void probe_lun(u32 lun)
 		dump_gpt(lun);
 }
 
+/*
+ * Read-only throughput check.  `ents` is a 16 KiB static buffer; one SCSI
+ * READ(10) is issued per 16 KiB, so the result includes command overhead.
+ * PWM-G1 is ~0.5 MB/s; a working HS-G1 link should be tens of MB/s.
+ */
+static void ufs_bench(u32 lun)
+{
+	const u32 chunk = sizeof(ents);
+	const u32 total_kib = 2048;
+	const u32 blocks = chunk / BLOCK;
+	const u32 cmds = total_kib * 1024 / chunk;
+	u32 rc = 0;
+
+	u64 start = ticks();
+	for (u32 i = 0; i < cmds; i++) {
+		rc = read_blocks(lun, i * blocks, blocks, ents);
+		if (rc)
+			break;
+	}
+	u64 elapsed = ticks() - start;
+	u64 done_kib = (u64)cmds * (chunk / 1024);
+	u64 kbs = elapsed ? done_kib * timer_freq() / elapsed : 0;
+	logf("UFS BENCH: read %d KiB in %d ticks, %d KiB/s rc=%x",
+	     done_kib, elapsed, kbs, (u64)rc);
+}
+
 void ufs_test(void)
 {
 	logf("UFS TEST: base=%x (mediatek,mt8183-ufshci)", (u64)UFS_BASE);
@@ -804,9 +960,11 @@ void ufs_test(void)
 	logf("UFS: PA_PWRMODE rc=%x val=%x", (u64)r, (u64)v);
 	logf("UFS: link hcs=%x is=%x uecpa=%x", (u64)ufs_rd(REG_HCS),
 	     (u64)ufs_rd(REG_IS), (u64)ufs_rd(REG_UECPA));
-	logf("UFS: refclk=%x ext=%x mphy=%x",
+	logf("UFS: refclk=%x ext=%x mphy_before=%x",
 	     (u64)ufs_rd(REG_UFS_REFCLK_CTRL), (u64)ufs_rd(REG_UFS_EXTREG),
 	     (u64)ufs_rd(REG_UFS_MPHYCTRL));
+	ufs_hs_enable();
+	logf("UFS: mphy_after=%x", (u64)ufs_rd(REG_UFS_MPHYCTRL));
 
 	/*
 	 * HCI reset cleared UTRLBA/RSR; take over the list only now, after the
@@ -836,5 +994,6 @@ void ufs_test(void)
 	probe_lun(0);
 	probe_lun(1);
 	probe_lun(2);
+	ufs_bench(2);
 	logf("UFS TEST: end");
 }
