@@ -81,7 +81,14 @@ typedef unsigned long long u64;
 #define BLOCK		4096u
 
 #define IS_UIC_ERROR		(1u << 2)
+#define IS_UIC_POWER_MODE	(1u << 4)
 #define IS_UIC_COMMAND_COMPL	(1u << 10)
+#define HCS_UPMCRS_PWR_LOCAL	1u
+
+/* Conservative first bring-up used HS-G1; the device and MPHY advertise G3. */
+#ifndef UFS_HS_GEAR
+#define UFS_HS_GEAR 3u
+#endif
 
 /* UIC command opcodes and UniPro attributes used by the MTK resume path. */
 #define UIC_CMD_DME_GET		0x01
@@ -168,10 +175,10 @@ static u32 last_ocs, last_st, last_sense;
 static u32 last_upiu, last_rsp;
 static u32 last_sense_len, last_sk, last_asc, last_ascq;
 
-/* v0117 HS result, repeated after the GPT dump so it stays on screen. */
+/* v0117 HS result, repeated after the bench so it stays on screen. */
 static u32 hs_local_gear, hs_peer_gear, hs_rxlanes, hs_txlanes;
-static u32 hs_final_pwr;
-static int hs_active;
+static u32 hs_final_pwr, hs_final_gear, hs_upmcrs;
+static int hs_active, hs_link_broken;
 static const char *hs_fail = "not_run";
 
 static u64 ticks(void)
@@ -390,11 +397,39 @@ hs_set(u32 attr, u32 val, const char *name)
 	return r;
 }
 
-static int
-hs_pwr_mode(u32 v)
+/*
+ * A DME_SET(PA_PWRMODE) completes in two stages: first the UIC command
+ * completion, then the actual link power-mode change.  The latter is
+ * signalled by IS.UIC_POWER_MODE and its result is HCS.UPMCRS.  Linux's
+ * ufshcd_uic_pwr_ctrl() waits for both; polling only UIC_COMMAND_COMPL makes
+ * the change look like a failure and then races the PWM restore.
+ */
+static u32
+hs_pwr_change(u32 mode, const char *name)
 {
-	u32 rx = (v >> 4) & 0xf, tx = v & 0xf;
-	return (rx == 1 || rx == 4) && (tx == 1 || tx == 4);
+	u32 v = 0;
+	ufs_wr(REG_IS, IS_UIC_POWER_MODE);
+	u32 r = uic(UIC_CMD_DME_SET, (u32)PA_PWRMODE << 16, 0, mode, &v);
+	logf("UFS HS: set %s=%x rc=%x", name, (u64)mode, (u64)r);
+	if (r)
+		return r;
+
+	u64 start = ticks();
+	u64 timeout = timer_freq();		/* 1 second */
+	while (!(ufs_rd(REG_IS) & IS_UIC_POWER_MODE)) {
+		if (ticks() - start > timeout) {
+			logf("UFS HS: %s timeout is=%x hcs=%x", name,
+			     (u64)ufs_rd(REG_IS), (u64)ufs_rd(REG_HCS));
+			return 0x100;
+		}
+	}
+	u32 is = ufs_rd(REG_IS);
+	u32 hcs = ufs_rd(REG_HCS);
+	hs_upmcrs = (hcs >> 8) & 7u;
+	ufs_wr(REG_IS, IS_UIC_POWER_MODE);
+	logf("UFS HS: %s done is=%x hcs=%x upmcrs=%x", name, (u64)is,
+	     (u64)hcs, (u64)hs_upmcrs);
+	return hs_upmcrs == HCS_UPMCRS_PWR_LOCAL ? 0 : (0x200u | hs_upmcrs);
 }
 
 static void
@@ -432,14 +467,14 @@ ufs_hs_enable(void)
 		hs_fail = "peer_no_hs";
 		return;
 	}
-	logf("UFS HS: caps lanes %x/%x, max gear local=%x peer=%x",
-	     (u64)rxlanes, (u64)txlanes, (u64)local, (u64)peer);
+	logf("UFS HS: caps lanes %x/%x, max gear local=%x peer=%x, target=%x",
+	     (u64)rxlanes, (u64)txlanes, (u64)local, (u64)peer,
+	     (u64)UFS_HS_GEAR);
 
-	/* HS-G1 series B is the conservative first step; Android uses more. */
-	if (hs_set(PA_RXGEAR, 1, "rxgear") ||
+	if (hs_set(PA_RXGEAR, UFS_HS_GEAR, "rxgear") ||
 	    hs_set(PA_ACTIVERXDATALANES, rxlanes, "rxlanes") ||
 	    hs_set(PA_RXTERMINATION, 1, "rxterm") ||
-	    hs_set(PA_TXGEAR, 1, "txgear") ||
+	    hs_set(PA_TXGEAR, UFS_HS_GEAR, "txgear") ||
 	    hs_set(PA_ACTIVETXDATALANES, txlanes, "txlanes") ||
 	    hs_set(PA_TXTERMINATION, 1, "txterm") ||
 	    hs_set(PA_HSSERIES, PA_HS_MODE_B, "hsseries_b")) {
@@ -460,30 +495,33 @@ ufs_hs_enable(void)
 	(void)hs_set(PA_PWRMODEUSERDATA5, 32767, "ud5");
 
 	/* FAST (0x1) for both directions: 0x11.  FASTAUTO would be 0x44. */
-	r = hs_set(PA_PWRMODE, 0x11, "pwr_0x11");
-	delay_us(1000);
+	r = hs_pwr_change(0x11, "pwr_0x11");
+	if (r) {
+		logf("UFS HS: power change failed rc=%x, restoring PWM",
+		     (u64)r);
+		hs_fail = "not_hs";
+		if (hs_pwr_change(0x55, "pwm_restore")) {
+			hs_link_broken = 1;
+			logf("UFS HS: PWM restore failed; link unusable");
+		}
+		return;
+	}
 	if (hs_get(UIC_CMD_DME_GET, PA_PWRMODE, "pwr_readback", &pwr)) {
 		logf("UFS HS: pwr readback failed");
 		hs_fail = "pwr_readback";
 		return;
 	}
 	hs_final_pwr = pwr;
-	(void)hs_get(UIC_CMD_DME_GET, PA_TXGEAR, "txgear_readback", &v);
+	(void)hs_get(UIC_CMD_DME_GET, PA_TXGEAR, "txgear_readback",
+		     &hs_final_gear);
 	(void)hs_get(UIC_CMD_DME_GET, PA_RXGEAR, "rxgear_readback", &v);
 	(void)hs_get(UIC_CMD_DME_GET, PA_TXPWRSTATUS, "txstatus", &v);
 	(void)hs_get(UIC_CMD_DME_GET, PA_RXPWRSTATUS, "rxstatus", &v);
-	if (hs_pwr_mode(pwr)) {
-		logf("UFS HS: ACTIVE pwr=%x (set rc=%x)", (u64)pwr, (u64)r);
-		hs_active = 1;
-		hs_fail = "none";
-		return;
-	}
-
-	logf("UFS HS: NOT active pwr=%x (set rc=%x), restoring PWM",
-	     (u64)pwr, (u64)r);
-	hs_fail = "not_hs";
+	logf("UFS HS: ACTIVE pwr=%x gear=%x upmcrs=%x", (u64)pwr,
+	     (u64)hs_final_gear, (u64)hs_upmcrs);
+	hs_active = 1;
+	hs_fail = "none";
 	(void)hs_set(PA_TXHSADAPTTYPE, PA_NO_ADAPT, "noadapt");
-	(void)hs_set(PA_PWRMODE, 0x55, "pwm_restore");
 }
 
 static void zero(void *p, unsigned n)
@@ -815,7 +853,7 @@ static void list_partitions(u32 lun, u64 entry_lba, u32 nent)
 	logf("GPT: %d partitions listed", (u64)shown);
 }
 
-static void dump_gpt(u32 lun)
+static __attribute__((unused)) void dump_gpt(u32 lun)
 {
 	u32 rc = read_blocks(lun, 0, 2, data);
 	logf("LUN%d READ0/1: rc=%x ocs=%x st=%x sense=%x", (u64)lun,
@@ -863,23 +901,6 @@ static void probe_lun(u32 lun)
 	if (rc && rc != 4)
 		return;
 
-	rc = read_blocks(lun, 0, 1, data);
-	logf("LUN%d READ0: rc=%x ocs=%x st=%x key=%x asc=%x ascq=%x", (u64)lun,
-	     (u64)rc, (u64)last_ocs, (u64)last_st, (u64)last_sk,
-	     (u64)last_asc, (u64)last_ascq);
-	if (rc && rc != 4)
-		return;
-
-	char a[9], b[9];
-	ascii8(a, data);
-	ascii8(b, data + 8);
-	logf("LUN%d data0: '%s' '%s' %x %x %x %x", (u64)lun, a, b,
-	     (u64)data[0], (u64)data[1], (u64)data[2], (u64)data[3]);
-	if (name_eq(a, "UFS_BOOT"))
-		logf("LUN%d: UFS_BOOT signature", (u64)lun);
-
-	if (lun == 2)
-		dump_gpt(lun);
 }
 
 /*
@@ -1014,12 +1035,15 @@ void ufs_test(void)
 	u32 init_rc = ufs_complete_dev_init();
 	logf("UFS: device init rc=%x", (u64)init_rc);
 
-	probe_lun(0);
-	probe_lun(1);
-	probe_lun(2);
-	ufs_bench(2);
-	logf("UFS HS SUMMARY: active=%d fail=%s pwr=%x lanes=%x/%x gears=%x/%x",
-	     (u64)hs_active, hs_fail, (u64)hs_final_pwr, (u64)hs_rxlanes,
-	     (u64)hs_txlanes, (u64)hs_local_gear, (u64)hs_peer_gear);
+	if (!hs_link_broken) {
+		probe_lun(2);
+		ufs_bench(2);
+	} else {
+		logf("UFS: skipping LUN probe/bench (link recovery failed)");
+	}
+	logf("UFS HS SUMMARY: active=%d fail=%s pwr=%x upmcrs=%x lanes=%x/%x gear=%x max=%x/%x",
+	     (u64)hs_active, hs_fail, (u64)hs_final_pwr, (u64)hs_upmcrs,
+	     (u64)hs_rxlanes, (u64)hs_txlanes, (u64)hs_final_gear,
+	     (u64)hs_local_gear, (u64)hs_peer_gear);
 	logf("UFS TEST: end");
 }

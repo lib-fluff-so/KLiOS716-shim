@@ -50,29 +50,18 @@ static void draw_char(u32 x, u32 y, char ch)
     }
 }
 
-static void clear_last_line(void)
+static void clear_row(u32 row)
 {
-    clear_pixels(VISIBLE_OFFSET + (u64)(FB_HEIGHT - CELL_HEIGHT) * FB_STRIDE,
+    clear_pixels(VISIBLE_OFFSET + (u64)row * CELL_HEIGHT * FB_STRIDE,
                  (u64)CELL_HEIGHT * FB_STRIDE, COLOR_BG);
-}
-
-static void scroll_one_line(void)
-{
-    const u64 words_per_row = FB_STRIDE / 8u;
-    for (u32 y = 0; y < FB_HEIGHT - CELL_HEIGHT; y++) {
-        volatile u64 *dst = (volatile u64 *)(FB_BASE + VISIBLE_OFFSET + (u64)y * FB_STRIDE);
-        volatile u64 *src = (volatile u64 *)(FB_BASE + VISIBLE_OFFSET + (u64)(y + CELL_HEIGHT) * FB_STRIDE);
-        for (u64 x = 0; x < words_per_row; x++) dst[x] = src[x];
-    }
-    clear_last_line();
-    cursor_y = ROWS - 1u;
 }
 
 static void newline(void)
 {
     cursor_x = 0;
     cursor_y++;
-    if (cursor_y >= ROWS) scroll_one_line();
+    if (cursor_y >= ROWS) cursor_y = 0;
+    clear_row(cursor_y);
 }
 
 static void put_char(char ch)

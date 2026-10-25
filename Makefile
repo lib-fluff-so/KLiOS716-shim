@@ -10,13 +10,14 @@ OUT     ?= out
 RAMOOPS_LOG ?= 1
 XNU_PAYLOAD ?= 0
 UFS_TEST ?= 0
+UFS_HS_GEAR ?= 3
 PSCI_RESET_TIMER ?= 0
 XNU_KERNEL ?=
 XNU_RAMDISK ?=
 XNU_CMDLINE ?= debug=0xc serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsroot=iosroot ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin wdt=-1
 D22AP_ADT ?= research/ipsw-x/d22ap.adt
 
-CFLAGS += -DRAMOOPS_LOG=$(RAMOOPS_LOG) -DXNU_PAYLOAD=$(XNU_PAYLOAD) -DUFS_TEST=$(UFS_TEST) -DPSCI_RESET_TIMER=$(PSCI_RESET_TIMER)
+CFLAGS += -DRAMOOPS_LOG=$(RAMOOPS_LOG) -DXNU_PAYLOAD=$(XNU_PAYLOAD) -DUFS_TEST=$(UFS_TEST) -DUFS_HS_GEAR=$(UFS_HS_GEAR) -DPSCI_RESET_TIMER=$(PSCI_RESET_TIMER)
 ifneq ($(strip $(AUTO_REBOOT_TEST)),)
 CFLAGS += -DAUTO_REBOOT_TEST=$(AUTO_REBOOT_TEST)
 endif
