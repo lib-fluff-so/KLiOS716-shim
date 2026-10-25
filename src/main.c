@@ -340,6 +340,7 @@ static __attribute__((noreturn)) void psci_system_reset(void)
     logf("ERROR: PSCI SYSTEM_RESET returned x0=%x", status);
     for (;;) __asm__ volatile("wfe");
 }
+#endif /* AUTO_REBOOT_TEST */
 
 static __attribute__((noreturn)) void finish_test_attempt(const char *reason)
 {
@@ -351,8 +352,6 @@ static __attribute__((noreturn)) void finish_test_attempt(const char *reason)
     for (;;) __asm__ volatile("wfe");
 #endif
 }
-
-#endif /* AUTO_REBOOT_TEST */
 
 static int be32_checked(const u8 *p, u32 *out)
 {
