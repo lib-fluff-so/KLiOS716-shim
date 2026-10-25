@@ -336,6 +336,7 @@ static __attribute__((noreturn)) void psci_system_reset(void)
 }
 #endif /* AUTO_REBOOT_TEST */
 
+#if AUTO_REBOOT_TEST || UFS_TEST
 static __attribute__((noreturn)) void finish_test_attempt(const char *reason)
 {
 #if AUTO_REBOOT_TEST
@@ -346,6 +347,7 @@ static __attribute__((noreturn)) void finish_test_attempt(const char *reason)
     for (;;) __asm__ volatile("wfe");
 #endif
 }
+#endif
 
 static int be32_checked(const u8 *p, u32 *out)
 {
