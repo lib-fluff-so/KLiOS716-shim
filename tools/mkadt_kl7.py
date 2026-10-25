@@ -24,11 +24,6 @@ PAGE_16K = 0x4000
 PANIC_LOG_SIZE = 0x100000
 SOC_BASE = 0x01000000
 FB_W, FB_H, FB_STRIDE = 1080, 2436, 4352
-# Presented iPhone X surface, i.e. what IOMobileFramebuffer.framework reads
-# from /arm-io/disp0. SweetFramebuffer crops it onto the 1080x2436 panel.
-# With the panel size here backboardd looks for AppleM2ScalerCSCDriver on
-# every frame and never swaps.
-PRESENTED_W, PRESENTED_H = 1125, 2436
 # The panel scans out a page that starts 1230 rows into the reserved region
 # (observed on device, see shim src/console.c VISIBLE_OFFSET). XNU must draw there.
 FB_VISIBLE_OFFSET = 1230 * FB_STRIDE
@@ -369,8 +364,8 @@ def build(facts, product_adt=None, seed=None):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('tecno,kl7-display')),
-            ('canvas-width', u32(PRESENTED_W)),
-            ('canvas-height', u32(PRESENTED_H)),
+            ('canvas-width', u32(FB_W)),
+            ('canvas-height', u32(FB_H)),
         ]),
     ])
 
@@ -402,8 +397,12 @@ def build(facts, product_adt=None, seed=None):
         ('home-button-type', u32(2)),
         ('opposed-power-vol-buttons', u32(1)),
     ])
-    product_props = d22ap_product(product_adt)
-    products = [node('product', [ph()] + product_props)] if product_props else []
+    product_props = [
+        ('certificate-production-status', u32(0)),
+        ('effective-production-status-ap', u32(0)),
+        ('effective-security-mode-sep', u32(1)),
+    ]
+    products = [node('product', [ph()] + product_props)]
     pram = node('pram', [ph(), ('reg', u64(panic_base, PANIC_LOG_SIZE))])
 
     return node('device-tree', [
