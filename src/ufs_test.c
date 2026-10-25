@@ -175,7 +175,7 @@ static u8 data[2 * BLOCK] __attribute__((aligned(4096)));
 static u8 ents[1 * 1024 * 1024] __attribute__((aligned(4096)));
 
 static u32 last_ocs, last_st, last_sense;
-static u32 last_upiu, last_rsp;
+static u32 last_upiu, last_rsp, last_resid;
 static u32 last_sense_len, last_sk, last_asc, last_ascq;
 
 /* v0117 HS result, repeated after the bench so it stays on screen. */
@@ -627,6 +627,7 @@ static u32 scsi(u32 lun, const u8 *cdb, u32 cdb_len, void *buf, u32 len)
 	last_ocs = utrl[0].dw2 & 0xff;
 	last_upiu = ucd.resp[0];		/* 0x21 = RESPONSE UPIU */
 	last_rsp = ucd.resp[6];			/* UPIU response code */
+	last_resid = be32(ucd.resp + 12);	/* residual transfer count */
 	last_st = ucd.resp[7];			/* SCSI status */
 	/*
 	 * struct utp_cmd_rsp: residual_transfer_count @12, reserved[4] @16..31,
@@ -926,20 +927,23 @@ static void ufs_bench(u32 lun)
 	const u32 total_kib = 64 * 1024;
 	const u32 blocks = chunk / BLOCK;
 	const u32 cmds = total_kib * 1024 / chunk;
-	u32 rc = 0, done = 0;
+	u32 rc = 0, done = 0, resid = 0;
+	u64 done_bytes = 0;
 
 	u64 start = ticks();
 	for (u32 i = 0; i < cmds; i++) {
 		rc = read_blocks(lun, i * blocks, blocks, ents);
 		if (rc)
 			break;
+		resid = last_resid > chunk ? chunk : last_resid;
+		done_bytes += chunk - resid;
 		done++;
 	}
 	u64 elapsed = ticks() - start;
-	u64 done_kib = (u64)done * (chunk / 1024);
+	u64 done_kib = done_bytes / 1024;
 	u64 kbs = elapsed ? done_kib * timer_freq() / elapsed : 0;
-	logf("UFS BENCH: read %d KiB in %d ticks, %d KiB/s rc=%x",
-	     done_kib, elapsed, kbs, (u64)rc);
+	logf("UFS BENCH: read %d KiB in %d ticks, %d KiB/s rc=%x resid=%x cmds=%x",
+	     done_kib, elapsed, kbs, (u64)rc, (u64)resid, (u64)done);
 }
 
 void ufs_test(void)
