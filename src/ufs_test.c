@@ -158,18 +158,21 @@ struct utrd {
 /* UTP command descriptor: command UPIU, response UPIU, PRDT.
  * Linux ufshcd uses ALIGNED_UPIU_SIZE = 512 for each UPIU and puts the PRDT
  * at offset 1024; the UTRD response/PRDT offsets and lengths are in DWORDs. */
+#define PRDT_CHUNK	16384u
+#define PRDT_MAX	128u
+
 struct ucd {
 	u8 cmd[512];
 	u8 resp[512];
 	struct {
 		u32 addr_lo, addr_hi, rsvd, dbc;	/* dbc = byte count - 1 */
-	} prdt[1];
+	} prdt[PRDT_MAX];
 };
 
 static struct utrd utrl[32] __attribute__((aligned(1024)));
 static struct ucd ucd __attribute__((aligned(128)));
 static u8 data[2 * BLOCK] __attribute__((aligned(4096)));
-static u8 ents[128 * 128] __attribute__((aligned(4096)));
+static u8 ents[1 * 1024 * 1024] __attribute__((aligned(4096)));
 
 static u32 last_ocs, last_st, last_sense;
 static u32 last_upiu, last_rsp;
@@ -594,11 +597,20 @@ static u32 scsi(u32 lun, const u8 *cdb, u32 cdb_len, void *buf, u32 len)
 	utrl[0].ucdbau = (u32)(ucd_pa >> 32);
 	utrl[0].resp = (512u / 4) << 16 | (512u / 4);
 	if (len) {
+		u32 entries = (len + PRDT_CHUNK - 1) / PRDT_CHUNK;
+		if (entries > PRDT_MAX)
+			return 0x105;
 		u64 buf_pa = (u64)(unsigned long)buf;
-		ucd.prdt[0].addr_lo = (u32)buf_pa;
-		ucd.prdt[0].addr_hi = (u32)(buf_pa >> 32);
-		ucd.prdt[0].dbc = len - 1;
-		utrl[0].prdt = (1024u / 4) << 16 | 1;
+		for (u32 i = 0; i < entries; i++) {
+			u32 n = len - i * PRDT_CHUNK;
+			if (n > PRDT_CHUNK)
+				n = PRDT_CHUNK;
+			u64 pa = buf_pa + (u64)i * PRDT_CHUNK;
+			ucd.prdt[i].addr_lo = (u32)pa;
+			ucd.prdt[i].addr_hi = (u32)(pa >> 32);
+			ucd.prdt[i].dbc = n - 1;
+		}
+		utrl[0].prdt = (1024u / 4) << 16 | entries;
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 
@@ -904,26 +916,27 @@ static void probe_lun(u32 lun)
 }
 
 /*
- * Read-only throughput check.  `ents` is a 16 KiB static buffer; one SCSI
- * READ(10) is issued per 16 KiB, so the result includes command overhead.
- * PWM-G1 is ~0.5 MB/s; a working HS-G1 link should be tens of MB/s.
+ * Read-only throughput check.  `ents` is a 2 MiB static buffer described by
+ * up to 128 PRDT entries; one SCSI READ(10) moves the whole buffer, so this
+ * measures sustained link throughput rather than per-command overhead.
  */
 static void ufs_bench(u32 lun)
 {
 	const u32 chunk = sizeof(ents);
-	const u32 total_kib = 2048;
+	const u32 total_kib = 64 * 1024;
 	const u32 blocks = chunk / BLOCK;
 	const u32 cmds = total_kib * 1024 / chunk;
-	u32 rc = 0;
+	u32 rc = 0, done = 0;
 
 	u64 start = ticks();
 	for (u32 i = 0; i < cmds; i++) {
 		rc = read_blocks(lun, i * blocks, blocks, ents);
 		if (rc)
 			break;
+		done++;
 	}
 	u64 elapsed = ticks() - start;
-	u64 done_kib = (u64)cmds * (chunk / 1024);
+	u64 done_kib = (u64)done * (chunk / 1024);
 	u64 kbs = elapsed ? done_kib * timer_freq() / elapsed : 0;
 	logf("UFS BENCH: read %d KiB in %d ticks, %d KiB/s rc=%x",
 	     done_kib, elapsed, kbs, (u64)rc);

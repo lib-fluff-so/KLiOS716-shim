@@ -12,7 +12,8 @@ _start:
     .ascii  "ARM\x64"           /* magic */
     .word   0                   /* res5 */
 1:
-    adr     x9, stack_top
+    adrp    x9, stack_top
+    add     x9, x9, :lo12:stack_top
     /* Select SP_EL1; writing SP_EL1 directly is UNDEFINED at EL1. */
     msr     spsel, #1
     mov     sp, x9
