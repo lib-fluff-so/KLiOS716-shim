@@ -15,9 +15,10 @@ TOUCH_TEST ?= 0
 PSCI_RESET_TIMER ?= 0
 XNU_KERNEL ?=
 XNU_RAMDISK ?=
-# The KL7 panel shows the iOS UI now: keep kernel text off the screen by
-# default. It still goes to the persistent log, and panics are drawn.
-# Remove sweetfb_noconsole=1 from XNU_CMDLINE when debugging early boot.
+# The KL7 panel shows the iOS UI now. sweetfb_noconsole=1 still draws early
+# kernel text until the first iOS frame, then stops drawing it over the GUI;
+# text always goes to the persistent log, and panics are drawn.
+# Remove sweetfb_noconsole=1 from XNU_CMDLINE to keep text over the GUI.
 # sweetvib=300 pulses the KL7 actuator once at boot. iOS has no haptic driver
 # for this linear actuator yet, so keep this pulse as the only feedback.
 XNU_CMDLINE ?= debug=0xc serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsroot=iosroot ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin wdt=-1 sweetfb_noconsole=1 sweetvib=300
