@@ -220,7 +220,7 @@ static int format_line(char *out, int cap, const char *fmt, va_list ap)
     return (int)(out - begin);
 }
 
-static void logf(const char *fmt, ...)
+void logf(const char *fmt, ...)
 {
     char line[160];
     va_list ap;

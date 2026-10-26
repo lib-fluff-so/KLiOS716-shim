@@ -103,11 +103,12 @@ static u32 spi_cs_time = 36u;
 
 /* FocalTech SPI framing (focaltech_spi.c). */
 #define FTS_CMD_READ		0xA0u	/* 0x80 | DATA_CRC_EN(0x20) */
+#define FTS_CMD_READ_TOUCH_DATA	0x01u	/* FTS touch report register */
 #define FTS_DUMMY_BYTE		3u
 #define FTS_HDR_LEN		4u
 #define FTS_CRC_LEN		2u
 #define FTS_DATA_OFF		(FTS_HDR_LEN + FTS_DUMMY_BYTE)
-#define FTS_BUF_SIZE		16u
+#define FTS_BUF_SIZE		32u
 
 #define FTS_REG_CHIP_ID_H	0xA3u
 #define FTS_REG_CHIP_ID_L	0x9Fu
@@ -390,7 +391,7 @@ static int fts_read(u8 reg, u8 *val, u32 n)
 	u32 i, total;
 	int rc;
 
-	if (n == 0u || n > 4u)
+	if (n == 0u || n > 16u)
 		return -1;
 	total = FTS_HDR_LEN + FTS_DUMMY_BYTE + n + FTS_CRC_LEN;
 	if (total > FTS_BUF_SIZE)
@@ -415,6 +416,52 @@ static int fts_read(u8 reg, u8 *val, u32 n)
 
 	/* FTS requires CS high for at least 150 us between transfers. */
 	delay_us(200);
+	return 0;
+}
+
+/*
+ * Read one FTS touch report (register 0x01).  FT3519 uses the 16-bit
+ * point format; the first data byte is the point count, then six bytes
+ * per point:
+ *   [XH(event[7:6]) XL YH(id[7:4]) YL AREA PRE]
+ * The raw axes are 16x the panel: X max 17279, Y max 38975.
+ */
+static int fts_read_touch(u32 *x, u32 *y, int *down)
+{
+	u8 buf[FTS_BUF_SIZE];
+	u32 i, count, rx, ry;
+	u8 xh, xl, yh, yl, area, pre;
+	int rc;
+
+	for (i = 0; i < FTS_BUF_SIZE; i++)
+		buf[i] = 0u;
+
+	rc = fts_read(FTS_CMD_READ_TOUCH_DATA, buf, 16u);
+	if (rc)
+		return rc;
+
+	count = buf[0] & 0x0Fu;
+	if (count == 0u || count > 10u) {
+		*down = 0;
+		return 0;
+	}
+
+	xh = buf[1];
+	xl = buf[2];
+	yh = buf[3];
+	yl = buf[4];
+	area = buf[5];
+	pre = buf[6];
+
+	rx = ((u32)xl << 3) | ((u32)(xh & 0x0Fu) << 11) |
+	     ((u32)(xh >> 5) & 1u) | ((u32)(area >> 5) & 6u);
+	ry = ((u32)yl << 4) | ((u32)(yh & 0x0Fu) << 12) |
+	     ((u32)(area >> 2) & 0x0Cu) | ((u32)(xh >> 3) & 2u) |
+	     ((u32)(pre >> 7) & 1u);
+
+	*x = rx;
+	*y = ry;
+	*down = ((xh >> 6) != 1u);
 	return 0;
 }
 
@@ -500,6 +547,48 @@ void touch_test(void)
 		fts_read(FTS_REG_FW_VER, &fw, 1u);
 		fts_read(FTS_REG_POWER_MODE, &pm, 1u);
 		logf("TOUCH: RESULT OK fw=%x pm=%x", (u64)fw, (u64)pm);
+
+		/*
+		 * Live coordinate test: draw a full-width/full-height
+		 * crosshair at the first finger for 15 seconds, then let the
+		 * normal PSCI reset path run.  Watchdog (30 s) stays armed.
+		 */
+		{
+			u64 start = ticks();
+			u64 end = start + 15u * timer_freq();
+			int shown = 0;
+			int logged = 0;
+
+			logf("TOUCH: crosshair 15s, touch the panel");
+			while (ticks() < end) {
+				u32 rx = 0u, ry = 0u, sx, sy;
+				int down = 0;
+				int trc = fts_read_touch(&rx, &ry, &down);
+
+				if (trc == 0 && down) {
+					sx = rx / 16u;
+					sy = ry / 16u;
+					if (sx >= 1080u)
+						sx = 1079u;
+					if (sy >= 2436u)
+						sy = 2435u;
+					console_crosshair((int)sx, (int)sy);
+					if (!logged) {
+						logf("TOUCH: first x=%d y=%d raw=%d,%d",
+						     (u64)sx, (u64)sy, (u64)rx, (u64)ry);
+						logged = 1;
+					}
+					shown = 1;
+				} else if (shown) {
+					console_crosshair_hide();
+					shown = 0;
+				}
+				delay_ms(20);
+			}
+			if (shown)
+				console_crosshair_hide();
+			logf("TOUCH: crosshair done");
+		}
 	} else {
 		logf("TOUCH: RESULT FAIL rc=%d st=%x id=%x%x",
 		     (u64)rc, (u64)fts_last_status, (u64)idh, (u64)idl);

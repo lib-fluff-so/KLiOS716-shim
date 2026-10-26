@@ -108,3 +108,66 @@ void console_write(const char *text, unsigned long length)
     if (!console_ready || !text) return;
     for (unsigned long i = 0; i < length; i++) put_char(text[i]);
 }
+
+
+/* Touch crosshair: full-width horizontal + full-height vertical line.
+ * The pixels under the old lines are saved, so moving the crosshair
+ * restores the console text instead of painting a trail. */
+#define CROSS_THICK 2u
+#define CROSS_COLOR 0xFFFF3030u
+
+static u32 cross_saved_v[CROSS_THICK][FB_HEIGHT];
+static u32 cross_saved_h[CROSS_THICK][FB_WIDTH];
+static int cross_x = -1;
+static int cross_y = -1;
+
+void console_crosshair_hide(void)
+{
+    u32 t, i;
+
+    if (cross_x < 0 || cross_y < 0)
+        return;
+
+    for (t = 0; t < CROSS_THICK; t++)
+        for (i = 0; i < FB_HEIGHT; i++)
+            *pixel_ptr((u32)cross_x + t, i) = cross_saved_v[t][i];
+    for (t = 0; t < CROSS_THICK; t++)
+        for (i = 0; i < FB_WIDTH; i++)
+            *pixel_ptr(i, (u32)cross_y + t) = cross_saved_h[t][i];
+
+    cross_x = -1;
+    cross_y = -1;
+}
+
+void console_crosshair(int x, int y)
+{
+    u32 t, i, ux, uy;
+
+    console_crosshair_hide();
+    if (x < 0 || y < 0)
+        return;
+
+    ux = (u32)x;
+    uy = (u32)y;
+    if (ux > FB_WIDTH - CROSS_THICK)
+        ux = FB_WIDTH - CROSS_THICK;
+    if (uy > FB_HEIGHT - CROSS_THICK)
+        uy = FB_HEIGHT - CROSS_THICK;
+
+    for (t = 0; t < CROSS_THICK; t++)
+        for (i = 0; i < FB_HEIGHT; i++)
+            cross_saved_v[t][i] = *pixel_ptr(ux + t, i);
+    for (t = 0; t < CROSS_THICK; t++)
+        for (i = 0; i < FB_WIDTH; i++)
+            cross_saved_h[t][i] = *pixel_ptr(i, uy + t);
+
+    for (t = 0; t < CROSS_THICK; t++)
+        for (i = 0; i < FB_HEIGHT; i++)
+            *pixel_ptr(ux + t, i) = CROSS_COLOR;
+    for (t = 0; t < CROSS_THICK; t++)
+        for (i = 0; i < FB_WIDTH; i++)
+            *pixel_ptr(i, uy + t) = CROSS_COLOR;
+
+    cross_x = (int)ux;
+    cross_y = (int)uy;
+}
