@@ -110,64 +110,82 @@ void console_write(const char *text, unsigned long length)
 }
 
 
-/* Touch crosshair: full-width horizontal + full-height vertical line.
- * The pixels under the old lines are saved, so moving the crosshair
- * restores the console text instead of painting a trail. */
+/* Touch crosshairs: full-width horizontal + full-height vertical lines.
+ * The pixels under every old line are saved, so moving the fingers
+ * restores the console text instead of painting a trail.  Save all
+ * backgrounds before drawing any line: overlapping crosses then still
+ * restore cleanly. */
 #define CROSS_THICK 2u
 #define CROSS_COLOR 0xFFFF3030u
+#define CROSS_MAX 10
 
-static u32 cross_saved_v[CROSS_THICK][FB_HEIGHT];
-static u32 cross_saved_h[CROSS_THICK][FB_WIDTH];
-static int cross_x = -1;
-static int cross_y = -1;
+static u32 cross_saved_v[CROSS_MAX][CROSS_THICK][FB_HEIGHT];
+static u32 cross_saved_h[CROSS_MAX][CROSS_THICK][FB_WIDTH];
+static int cross_x[CROSS_MAX];
+static int cross_y[CROSS_MAX];
+static int cross_n;
 
 void console_crosshair_hide(void)
 {
-    u32 t, i;
+    u32 t, i, k, x, y;
 
-    if (cross_x < 0 || cross_y < 0)
+    for (k = 0; k < (u32)cross_n; k++) {
+        x = (u32)cross_x[k];
+        y = (u32)cross_y[k];
+        for (t = 0; t < CROSS_THICK; t++)
+            for (i = 0; i < FB_HEIGHT; i++)
+                *pixel_ptr(x + t, i) = cross_saved_v[k][t][i];
+        for (t = 0; t < CROSS_THICK; t++)
+            for (i = 0; i < FB_WIDTH; i++)
+                *pixel_ptr(i, y + t) = cross_saved_h[k][t][i];
+    }
+
+    cross_n = 0;
+}
+
+void console_crosshairs(const int *xs, const int *ys, int n)
+{
+    u32 t, i, k, x, y;
+
+    console_crosshair_hide();
+    if (!xs || !ys || n <= 0)
         return;
+    if (n > CROSS_MAX)
+        n = CROSS_MAX;
 
-    for (t = 0; t < CROSS_THICK; t++)
-        for (i = 0; i < FB_HEIGHT; i++)
-            *pixel_ptr((u32)cross_x + t, i) = cross_saved_v[t][i];
-    for (t = 0; t < CROSS_THICK; t++)
-        for (i = 0; i < FB_WIDTH; i++)
-            *pixel_ptr(i, (u32)cross_y + t) = cross_saved_h[t][i];
+    /* Save every background first, then draw all lines. */
+    for (k = 0; k < (u32)n; k++) {
+        x = (u32)xs[k];
+        y = (u32)ys[k];
+        if (x > FB_WIDTH - CROSS_THICK)
+            x = FB_WIDTH - CROSS_THICK;
+        if (y > FB_HEIGHT - CROSS_THICK)
+            y = FB_HEIGHT - CROSS_THICK;
+        cross_x[k] = (int)x;
+        cross_y[k] = (int)y;
+        for (t = 0; t < CROSS_THICK; t++)
+            for (i = 0; i < FB_HEIGHT; i++)
+                cross_saved_v[k][t][i] = *pixel_ptr(x + t, i);
+        for (t = 0; t < CROSS_THICK; t++)
+            for (i = 0; i < FB_WIDTH; i++)
+                cross_saved_h[k][t][i] = *pixel_ptr(i, y + t);
+    }
 
-    cross_x = -1;
-    cross_y = -1;
+    cross_n = n;
+
+    for (k = 0; k < (u32)n; k++) {
+        x = (u32)cross_x[k];
+        y = (u32)cross_y[k];
+        for (t = 0; t < CROSS_THICK; t++)
+            for (i = 0; i < FB_HEIGHT; i++)
+                *pixel_ptr(x + t, i) = CROSS_COLOR;
+        for (t = 0; t < CROSS_THICK; t++)
+            for (i = 0; i < FB_WIDTH; i++)
+                *pixel_ptr(i, y + t) = CROSS_COLOR;
+    }
 }
 
 void console_crosshair(int x, int y)
 {
-    u32 t, i, ux, uy;
-
-    console_crosshair_hide();
-    if (x < 0 || y < 0)
-        return;
-
-    ux = (u32)x;
-    uy = (u32)y;
-    if (ux > FB_WIDTH - CROSS_THICK)
-        ux = FB_WIDTH - CROSS_THICK;
-    if (uy > FB_HEIGHT - CROSS_THICK)
-        uy = FB_HEIGHT - CROSS_THICK;
-
-    for (t = 0; t < CROSS_THICK; t++)
-        for (i = 0; i < FB_HEIGHT; i++)
-            cross_saved_v[t][i] = *pixel_ptr(ux + t, i);
-    for (t = 0; t < CROSS_THICK; t++)
-        for (i = 0; i < FB_WIDTH; i++)
-            cross_saved_h[t][i] = *pixel_ptr(i, uy + t);
-
-    for (t = 0; t < CROSS_THICK; t++)
-        for (i = 0; i < FB_HEIGHT; i++)
-            *pixel_ptr(ux + t, i) = CROSS_COLOR;
-    for (t = 0; t < CROSS_THICK; t++)
-        for (i = 0; i < FB_WIDTH; i++)
-            *pixel_ptr(i, uy + t) = CROSS_COLOR;
-
-    cross_x = (int)ux;
-    cross_y = (int)uy;
+    console_crosshairs(&x, &y, 1);
 }

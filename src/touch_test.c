@@ -653,12 +653,22 @@ static int fts_read(u8 reg, u8 *val, u32 n)
  *   [XH(event[7:6]) XL YH(id[7:4]) YL AREA PRE]
  * The raw axes are 16x the panel: X max 17279, Y max 38975.
  */
+#define FTS_MAX_POINTS	10u
+
+struct fts_point {
+	u32 x, y;		/* screen pixels */
+	u32 raw_x, raw_y;	/* 16x panel units */
+	u8 id;
+	u8 down;
+	u8 b[6];		/* XH XL YH YL AREA PRE */
+};
+
 static u8 fts_last_touch[7];
 
-static int fts_read_touch(u32 *x, u32 *y, int *down)
+static int fts_read_touch(struct fts_point *pts, u32 max)
 {
 	u8 buf[FTS_BUF_SIZE];
-	u32 i, count, rx, ry;
+	u32 i, j, count, base, rx, ry;
 	u8 xh, xl, yh, yl, area, pre;
 	int rc;
 
@@ -672,35 +682,52 @@ static int fts_read_touch(u32 *x, u32 *y, int *down)
 	/*
 	 * The 62-byte report starts with a dummy byte (Android's
 	 * fts_touch_point shows 00 01 ...); the point count is at [1]
-	 * and the first point starts at [2].  fts_input_report_touch
-	 * reads the count with ldrb [x1, #1] and the point at [x1+2].
+	 * and each point is six bytes starting at [2 + 6 * i].
+	 * fts_input_report_touch reads the count with ldrb [x1, #1]
+	 * and the point at [x1 + 2], [x1 + 8], ...
 	 */
 	count = buf[1] & 0x0Fu;
-	if (count == 0u || count > 10u) {
-		*down = 0;
+	if (count > FTS_MAX_POINTS)
+		count = 0u;
+	if (count > max)
+		count = max;
+	if (count == 0u)
 		return 0;
+
+	for (i = 0; i < count; i++) {
+		base = 2u + 6u * i;
+		xh = buf[base + 0u];
+		xl = buf[base + 1u];
+		yh = buf[base + 2u];
+		yl = buf[base + 3u];
+		area = buf[base + 4u];
+		pre = buf[base + 5u];
+
+		rx = ((u32)xl << 3) | ((u32)(xh & 0x0Fu) << 11) |
+		     ((u32)(xh >> 5) & 1u) | ((u32)(area >> 5) & 6u);
+		ry = ((u32)yl << 4) | ((u32)(yh & 0x0Fu) << 12) |
+		     ((u32)(area >> 2) & 0x0Cu) | ((u32)(xh >> 3) & 2u) |
+		     ((u32)(pre >> 7) & 1u);
+
+		pts[i].raw_x = rx;
+		pts[i].raw_y = ry;
+		pts[i].x = rx / 16u;
+		pts[i].y = ry / 16u;
+		if (pts[i].x >= 1080u)
+			pts[i].x = 1079u;
+		if (pts[i].y >= 2436u)
+			pts[i].y = 2435u;
+		pts[i].id = (u8)(yh >> 4);
+		pts[i].down = ((xh >> 6) != 1u) ? 1u : 0u;
+		for (j = 0; j < 6u; j++)
+			pts[i].b[j] = buf[base + j];
 	}
 
-	xh = buf[2];
-	xl = buf[3];
-	yh = buf[4];
-	yl = buf[5];
-	area = buf[6];
-	pre = buf[7];
+	fts_last_touch[0] = buf[1];
+	for (j = 0; j < 6u; j++)
+		fts_last_touch[1u + j] = buf[2u + j];
 
-	rx = ((u32)xl << 3) | ((u32)(xh & 0x0Fu) << 11) |
-	     ((u32)(xh >> 5) & 1u) | ((u32)(area >> 5) & 6u);
-	ry = ((u32)yl << 4) | ((u32)(yh & 0x0Fu) << 12) |
-	     ((u32)(area >> 2) & 0x0Cu) | ((u32)(xh >> 3) & 2u) |
-	     ((u32)(pre >> 7) & 1u);
-
-	for (i = 0; i < 7u; i++)
-		fts_last_touch[i] = buf[1u + i];
-
-	*x = rx;
-	*y = ry;
-	*down = ((xh >> 6) != 1u);
-	return 0;
+	return (int)count;
 }
 
 void touch_test(void)
@@ -855,33 +882,61 @@ void touch_test(void)
 			u64 start = ticks();
 			u64 end = start + 15u * timer_freq();
 			int shown = 0;
-			int logged = 0;
+			u32 logged_mask = 0u;
 
 			logf("TOUCH: crosshair 15s, touch the panel");
 			while (ticks() < end) {
-				u32 rx = 0u, ry = 0u, sx, sy;
-				int down = 0;
-				int trc = fts_read_touch(&rx, &ry, &down);
+				struct fts_point pts[FTS_MAX_POINTS];
+				int xs[FTS_MAX_POINTS], ys[FTS_MAX_POINTS];
+				int trc, k, ndown = 0;
 
-				if (trc == 0 && down) {
-					sx = rx / 16u;
-					sy = ry / 16u;
-					if (sx >= 1080u)
-						sx = 1079u;
-					if (sy >= 2436u)
-						sy = 2435u;
-					console_crosshair((int)sx, (int)sy);
-					if (!logged) {
-						logf("TOUCH: first x=%d y=%d raw=%d,%d b=%x,%x,%x,%x,%x,%x,%x",
-						     (u64)sx, (u64)sy, (u64)rx, (u64)ry,
-						     (u64)fts_last_touch[0], (u64)fts_last_touch[1],
-						     (u64)fts_last_touch[2], (u64)fts_last_touch[3],
-						     (u64)fts_last_touch[4], (u64)fts_last_touch[5],
-						     (u64)fts_last_touch[6]);
-						logged = 1;
+				trc = fts_read_touch(pts, FTS_MAX_POINTS);
+				if (trc > 0) {
+					for (k = 0; k < trc; k++) {
+						if (!pts[k].down)
+							continue;
+						xs[ndown] = (int)pts[k].x;
+						ys[ndown] = (int)pts[k].y;
+						ndown++;
+						if ((logged_mask &
+						     (1u << (u32)k)) == 0u) {
+							if (logged_mask == 0u)
+								logf("TOUCH: first id=%d x=%d y=%d raw=%d,%d n=%d b=%x,%x,%x,%x,%x,%x,%x",
+								     (u64)pts[k].id,
+								     (u64)pts[k].x, (u64)pts[k].y,
+								     (u64)pts[k].raw_x,
+								     (u64)pts[k].raw_y,
+								     (u64)fts_last_touch[0],
+								     (u64)pts[k].b[0],
+								     (u64)pts[k].b[1],
+								     (u64)pts[k].b[2],
+								     (u64)pts[k].b[3],
+								     (u64)pts[k].b[4],
+								     (u64)pts[k].b[5]);
+							else
+								logf("TOUCH: p%d id=%d x=%d y=%d raw=%d,%d b=%x,%x,%x,%x,%x,%x",
+								     (u64)(u32)k,
+								     (u64)pts[k].id,
+								     (u64)pts[k].x, (u64)pts[k].y,
+								     (u64)pts[k].raw_x,
+								     (u64)pts[k].raw_y,
+								     (u64)pts[k].b[0],
+								     (u64)pts[k].b[1],
+								     (u64)pts[k].b[2],
+								     (u64)pts[k].b[3],
+								     (u64)pts[k].b[4],
+								     (u64)pts[k].b[5]);
+							logged_mask |= 1u << (u32)k;
+						}
 					}
-					shown = 1;
-				} else if (shown) {
+					if (ndown > 0) {
+						console_crosshairs(xs, ys, ndown);
+						shown = 1;
+					} else if (shown) {
+						console_crosshair_hide();
+						shown = 0;
+					}
+				} else if (trc == 0 && shown) {
 					console_crosshair_hide();
 					shown = 0;
 				}
