@@ -669,18 +669,24 @@ static int fts_read_touch(u32 *x, u32 *y, int *down)
 	if (rc)
 		return rc;
 
-	count = buf[0] & 0x0Fu;
+	/*
+	 * The 62-byte report starts with a dummy byte (Android's
+	 * fts_touch_point shows 00 01 ...); the point count is at [1]
+	 * and the first point starts at [2].  fts_input_report_touch
+	 * reads the count with ldrb [x1, #1] and the point at [x1+2].
+	 */
+	count = buf[1] & 0x0Fu;
 	if (count == 0u || count > 10u) {
 		*down = 0;
 		return 0;
 	}
 
-	xh = buf[1];
-	xl = buf[2];
-	yh = buf[3];
-	yl = buf[4];
-	area = buf[5];
-	pre = buf[6];
+	xh = buf[2];
+	xl = buf[3];
+	yh = buf[4];
+	yl = buf[5];
+	area = buf[6];
+	pre = buf[7];
 
 	rx = ((u32)xl << 3) | ((u32)(xh & 0x0Fu) << 11) |
 	     ((u32)(xh >> 5) & 1u) | ((u32)(area >> 5) & 6u);
@@ -689,7 +695,7 @@ static int fts_read_touch(u32 *x, u32 *y, int *down)
 	     ((u32)(pre >> 7) & 1u);
 
 	for (i = 0; i < 7u; i++)
-		fts_last_touch[i] = buf[i];
+		fts_last_touch[i] = buf[1u + i];
 
 	*x = rx;
 	*y = ry;
