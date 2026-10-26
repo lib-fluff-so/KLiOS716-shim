@@ -70,6 +70,7 @@ typedef unsigned long long u64;
 #define SPI_RX_DATA_REG		0x0014u
 #define SPI_CMD_REG		0x0018u
 #define SPI_STATUS0_REG		0x001Cu
+#define SPI_STATUS1_REG		0x0020u
 #define SPI_PAD_SEL_REG		0x0024u
 #define SPI_CFG2_REG		0x0028u
 
@@ -358,11 +359,17 @@ static int spi_xfer(const u8 *tx, u8 *rx, u32 len)
 	while ((spi_rd(SPI_STATUS0_REG) &
 		(SPI_STATUS_FINISH | SPI_STATUS_PAUSE)) == 0u) {
 		if (ticks() - start > timeout) {
-			logf("TOUCH: spi timeout st=%x cmd=%x cfg1=%x cfg2=%x",
-			     (u64)spi_rd(SPI_STATUS0_REG),
+			u32 st = spi_rd(SPI_STATUS0_REG);
+			u32 s1 = spi_rd(SPI_STATUS1_REG);
+			u32 r0 = spi_rd(SPI_RX_DATA_REG);
+			u32 r1 = spi_rd(SPI_RX_DATA_REG);
+			u32 r2 = spi_rd(SPI_RX_DATA_REG);
+			u32 r3 = spi_rd(SPI_RX_DATA_REG);
+			logf("TOUCH: spi timeout st=%x s1=%x cmd=%x cfg1=%x rx=%x,%x,%x,%x",
+			     (u64)st, (u64)s1,
 			     (u64)spi_rd(SPI_CMD_REG),
 			     (u64)spi_rd(SPI_CFG1_REG),
-			     (u64)spi_rd(SPI_CFG2_REG));
+			     (u64)r0, (u64)r1, (u64)r2, (u64)r3);
 			spi_cs_deassert();
 			return -2;
 		}
@@ -436,7 +443,7 @@ static int fts_read_touch(u32 *x, u32 *y, int *down)
 	for (i = 0; i < FTS_BUF_SIZE; i++)
 		buf[i] = 0u;
 
-	rc = fts_read(FTS_CMD_READ_TOUCH_DATA, buf, 16u);
+	rc = fts_read(FTS_CMD_READ_TOUCH_DATA, buf, 7u);
 	if (rc)
 		return rc;
 
