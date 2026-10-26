@@ -69,14 +69,21 @@ typedef unsigned long long u64;
 #define SPI_TX_DATA_REG		0x0010u
 #define SPI_RX_DATA_REG		0x0014u
 #define SPI_CMD_REG		0x0018u
+#define SPI_TX_SRC_REG		0x0008u
+#define SPI_RX_DST_REG		0x000Cu
 #define SPI_STATUS0_REG		0x001Cu
 #define SPI_STATUS1_REG		0x0020u
+#define SPI_TX_SRC_REG_64	0x002Cu
+#define SPI_RX_DST_REG_64	0x0030u
 #define SPI_PAD_SEL_REG		0x0024u
 #define SPI_CFG2_REG		0x0028u
 
 #define SPI_CMD_ACT		(1u << 0)
+#define SPI_CMD_RESUME		(1u << 1)
 #define SPI_CMD_RST		(1u << 2)
 #define SPI_CMD_PAUSE_EN	(1u << 4)
+#define SPI_CMD_RX_DMA		(1u << 10)
+#define SPI_CMD_TX_DMA		(1u << 11)
 #define SPI_CMD_TXMSBF		(1u << 12)
 #define SPI_CMD_RXMSBF		(1u << 13)
 #define SPI_CMD_FINISH_IE	(1u << 16)
@@ -109,7 +116,7 @@ static u32 spi_cs_time = 36u;
 #define FTS_HDR_LEN		4u
 #define FTS_CRC_LEN		2u
 #define FTS_DATA_OFF		(FTS_HDR_LEN + FTS_DUMMY_BYTE)
-#define FTS_BUF_SIZE		32u
+#define FTS_BUF_SIZE		96u
 
 #define FTS_REG_CHIP_ID_H	0xA3u
 #define FTS_REG_CHIP_ID_L	0x9Fu
@@ -390,6 +397,113 @@ static int spi_xfer(const u8 *tx, u8 *rx, u32 len)
 	return 0;
 }
 
+/*
+ * Same packet as spi_xfer(), but using the MTK SPI controller's internal
+ * DMA.  The FTS touch report is 62 bytes (Android reads exactly 0x3e),
+ * so the full packet is 4 header + 3 dummy + 62 data + 2 CRC = 71 bytes.
+ * The FIFO path cannot complete this; DMA is what the Android driver uses.
+ */
+static int spi_xfer_dma(const u8 *tx, u8 *rx, u32 len)
+{
+	u32 cmd, st, s1;
+	u64 start, timeout;
+	int done = 0;
+
+	if (len == 0u || len > FTS_BUF_SIZE)
+		return -1;
+
+	cmd = spi_rd(SPI_CMD_REG);
+	spi_wr(SPI_CMD_REG, cmd | SPI_CMD_RST);
+	delay_us(2);
+	spi_wr(SPI_CMD_REG, cmd & ~SPI_CMD_RST);
+	delay_us(2);
+
+	spi_wr(SPI_CMD_REG, SPI_CMD_TXMSBF | SPI_CMD_RXMSBF |
+			    SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE |
+			    SPI_CMD_PAUSE_EN);
+	spi_wr(SPI_PAD_SEL_REG, 0u);
+
+	spi_wr(SPI_CFG2_REG, (spi_sck_time - 1u) |
+			     ((spi_sck_time - 1u) << 16));
+	spi_wr(SPI_CFG0_REG, (spi_cs_time - 1u) |
+			     ((spi_cs_time - 1u) << 16));
+
+	/* One packet; packet loop = 0. */
+	spi_wr(SPI_CFG1_REG, (spi_cs_time - 1u) | ((len - 1u) << 16));
+
+	spi_wr(SPI_TX_SRC_REG, (u32)(u64)tx);
+	spi_wr(SPI_RX_DST_REG, (u32)(u64)rx);
+	spi_wr(SPI_TX_SRC_REG_64, 0u);
+	spi_wr(SPI_RX_DST_REG_64, 0u);
+
+	cmd = spi_rd(SPI_CMD_REG);
+	spi_wr(SPI_CMD_REG, cmd | SPI_CMD_TX_DMA | SPI_CMD_RX_DMA |
+			    SPI_CMD_ACT);
+
+	start = ticks();
+	timeout = timer_freq() / 10u;	/* 100 ms */
+	while (1) {
+		st = spi_rd(SPI_STATUS0_REG);
+		if (st & SPI_STATUS_FINISH) {
+			done = 1;
+			break;
+		}
+		if (st & SPI_STATUS_PAUSE) {
+			/* FIFO starved: tell the controller to resume. */
+			cmd = spi_rd(SPI_CMD_REG);
+			spi_wr(SPI_CMD_REG, cmd | SPI_CMD_RESUME);
+			delay_us(2);
+		} else {
+			cmd = spi_rd(SPI_CMD_REG);
+			if ((cmd & SPI_CMD_ACT) == 0u) {
+				/* ACT clears when the DMA has finished. */
+				done = 1;
+				break;
+			}
+		}
+		if (ticks() - start > timeout)
+			break;
+	}
+
+	if (!done) {
+		s1 = spi_rd(SPI_STATUS1_REG);
+		logf("TOUCH: dma timeout st=%x s1=%x cmd=%x cfg1=%x rx=%x,%x,%x,%x",
+		     (u64)spi_rd(SPI_STATUS0_REG), (u64)s1,
+		     (u64)spi_rd(SPI_CMD_REG),
+		     (u64)spi_rd(SPI_CFG1_REG),
+		     (u64)((u32)rx[0] | ((u32)rx[1] << 8) |
+			   ((u32)rx[2] << 16) | ((u32)rx[3] << 24)),
+		     (u64)((u32)rx[4] | ((u32)rx[5] << 8) |
+			   ((u32)rx[6] << 16) | ((u32)rx[7] << 24)),
+		     0ULL, 0ULL);
+		spi_cs_deassert();
+		return -2;
+	}
+
+	delay_us(10);
+	spi_cs_deassert();
+
+	/* First DMA read only: prove the engine and show the raw bytes. */
+	{
+		static int dma_logged;
+
+		if (!dma_logged) {
+			logf("TOUCH: dma ok len=%d st=%x cmd=%x rx=%x,%x,%x,%x",
+			     (u64)len, (u64)st, (u64)cmd,
+			     (u64)((u32)rx[0] | ((u32)rx[1] << 8) |
+				   ((u32)rx[2] << 16) | ((u32)rx[3] << 24)),
+			     (u64)((u32)rx[4] | ((u32)rx[5] << 8) |
+				   ((u32)rx[6] << 16) | ((u32)rx[7] << 24)),
+			     (u64)((u32)rx[8] | ((u32)rx[9] << 8) |
+				   ((u32)rx[10] << 16) | ((u32)rx[11] << 24)),
+			     (u64)((u32)rx[12] | ((u32)rx[13] << 8) |
+				   ((u32)rx[14] << 16) | ((u32)rx[15] << 24)));
+			dma_logged = 1;
+		}
+	}
+	return 0;
+}
+
 /* FTS register read: rx[7] is the first data byte, rx[3] is status. */
 static int fts_read(u8 reg, u8 *val, u32 n)
 {
@@ -398,7 +512,7 @@ static int fts_read(u8 reg, u8 *val, u32 n)
 	u32 i, total;
 	int rc;
 
-	if (n == 0u || n > 16u)
+	if (n == 0u || n > 62u)
 		return -1;
 	total = FTS_HDR_LEN + FTS_DUMMY_BYTE + n + FTS_CRC_LEN;
 	if (total > FTS_BUF_SIZE)
@@ -413,7 +527,10 @@ static int fts_read(u8 reg, u8 *val, u32 n)
 	tx[2] = 0u;
 	tx[3] = (u8)n;
 
-	rc = spi_xfer(tx, rx, total);
+	if (total > 32u)
+		rc = spi_xfer_dma(tx, rx, total);
+	else
+		rc = spi_xfer(tx, rx, total);
 	if (rc)
 		return rc;
 
@@ -433,6 +550,8 @@ static int fts_read(u8 reg, u8 *val, u32 n)
  *   [XH(event[7:6]) XL YH(id[7:4]) YL AREA PRE]
  * The raw axes are 16x the panel: X max 17279, Y max 38975.
  */
+static u8 fts_last_touch[7];
+
 static int fts_read_touch(u32 *x, u32 *y, int *down)
 {
 	u8 buf[FTS_BUF_SIZE];
@@ -443,7 +562,7 @@ static int fts_read_touch(u32 *x, u32 *y, int *down)
 	for (i = 0; i < FTS_BUF_SIZE; i++)
 		buf[i] = 0u;
 
-	rc = fts_read(FTS_CMD_READ_TOUCH_DATA, buf, 7u);
+	rc = fts_read(FTS_CMD_READ_TOUCH_DATA, buf, 62u);
 	if (rc)
 		return rc;
 
@@ -465,6 +584,9 @@ static int fts_read_touch(u32 *x, u32 *y, int *down)
 	ry = ((u32)yl << 4) | ((u32)(yh & 0x0Fu) << 12) |
 	     ((u32)(area >> 2) & 0x0Cu) | ((u32)(xh >> 3) & 2u) |
 	     ((u32)(pre >> 7) & 1u);
+
+	for (i = 0; i < 7u; i++)
+		fts_last_touch[i] = buf[i];
 
 	*x = rx;
 	*y = ry;
@@ -581,8 +703,14 @@ void touch_test(void)
 						sy = 2435u;
 					console_crosshair((int)sx, (int)sy);
 					if (!logged) {
-						logf("TOUCH: first x=%d y=%d raw=%d,%d",
-						     (u64)sx, (u64)sy, (u64)rx, (u64)ry);
+						u8 *bb = (u8 *)0;
+						(void)bb;
+						logf("TOUCH: first x=%d y=%d raw=%d,%d b=%x,%x,%x,%x,%x,%x,%x",
+						     (u64)sx, (u64)sy, (u64)rx, (u64)ry,
+						     (u64)fts_last_touch[0], (u64)fts_last_touch[1],
+						     (u64)fts_last_touch[2], (u64)fts_last_touch[3],
+						     (u64)fts_last_touch[4], (u64)fts_last_touch[5],
+						     (u64)fts_last_touch[6]);
 						logged = 1;
 					}
 					shown = 1;
