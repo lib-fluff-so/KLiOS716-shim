@@ -568,9 +568,28 @@ void touch_test(void)
 	 * with the default mux 4 while SPI1 does not, the shared clock path
 	 * is fine and the problem is SPI1-specific.
 	 */
+	logf("TOUCH: alive raw spi1=%d", (u64)spi_regs_alive());
+
+	/* Step 1: only the ifrao_spi1 gate, boot mux 4 and boot PLL. */
+	infra_wr(IFRAO_SPI1_SET, IFRAO_SPI1_BIT);
+	delay_us(100);
+	logf("TOUCH: alive gate1=%d", (u64)spi_regs_alive());
+
+	/* Step 2: reprogram mux 4 (gate off/on), same PLL. */
+	top_mux_set(4u);
+	delay_us(100);
+	logf("TOUCH: alive gate1 mux4=%d", (u64)spi_regs_alive());
+
+	/* Step 3: restart msdcpll. */
+	msdcpll_disable();
+	msdcpll_enable();
+	delay_us(100);
+	logf("TOUCH: alive gate1 mux4 pll=%d", (u64)spi_regs_alive());
+
+	/* Common spi_ck path: SPI2/3 use the same mux. */
 	infra_wr(IFRAO_SPI1_SET, IFRAO_SPI2_BIT | IFRAO_SPI3_BIT);
 	delay_us(100);
-	logf("TOUCH: alive spi2=%d spi3=%d (default mux)",
+	logf("TOUCH: alive spi2=%d spi3=%d",
 	     (u64)spi_regs_alive_at(SPI2_BASE), (u64)spi_regs_alive_at(SPI3_BASE));
 
 	spi_clocks_up();
