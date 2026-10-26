@@ -406,7 +406,6 @@ static int spi_xfer(const u8 *tx, u8 *rx, u32 len)
 static int spi_xfer_long(const u8 *tx, u8 *rx, u32 len)
 {
 	u32 off, chunk, i, w, cmd;
-	u64 start, timeout;
 
 	if (len == 0u || len > FTS_BUF_SIZE)
 		return -1;
@@ -448,18 +447,14 @@ static int spi_xfer_long(const u8 *tx, u8 *rx, u32 len)
 		cmd = spi_rd(SPI_CMD_REG);
 		spi_wr(SPI_CMD_REG, cmd | SPI_CMD_ACT);
 
-		start = ticks();
-		timeout = timer_freq() / 10u;
-		while ((spi_rd(SPI_CMD_REG) & SPI_CMD_ACT) != 0u) {
-			if (ticks() - start > timeout) {
-				logf("TOUCH: pio timeout off=%d st=%x s1=%x cmd=%x",
-				     (u64)off, (u64)spi_rd(SPI_STATUS0_REG),
-				     (u64)spi_rd(SPI_STATUS1_REG),
-				     (u64)spi_rd(SPI_CMD_REG));
-				spi_cs_deassert();
-				return -2;
-			}
-		}
+		/*
+		 * ACT clears immediately on this controller, before the
+		 * FIFO has actually been clocked out, and the finish/pause
+		 * status is a transient that MMIO polling misses.  Wait
+		 * long enough for a 32-byte chunk (well under 100 us at
+		 * the configured SCK) before draining the RX FIFO.
+		 */
+		delay_us(2000);
 
 		for (i = 0u; i < chunk; i += 4u) {
 			w = spi_rd(SPI_RX_DATA_REG);
