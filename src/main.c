@@ -14,12 +14,16 @@ typedef __builtin_va_list va_list;
 #include "memmap.h"
 #include "loader.h"
 #include "xnu_payload.h"
+#include "touch_test.h"
 
 #ifndef RAMOOPS_LOG
 #define RAMOOPS_LOG 1
 #endif
 #ifndef XNU_PAYLOAD
 #define XNU_PAYLOAD 0
+#endif
+#ifndef TOUCH_TEST
+#define TOUCH_TEST 0
 #endif
 #ifndef AUTO_REBOOT_TEST
 #if XNU_PAYLOAD
@@ -758,6 +762,18 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
     logf("console: framebuffer + ramoops");
     wdt_report("entry");
     logf("entry: DTB=%x shim=%x size=%x", dtb_address, shim_base, (u64)(_end - _start));
+
+#if TOUCH_TEST
+    logf("TOUCH TEST: SPI1 probe (XNU will not be loaded)");
+    touch_test();
+    logf("TOUCH TEST: probe returned");
+#if AUTO_REBOOT_TEST
+    finish_test_attempt("TOUCH probe done");
+#else
+    logf("TOUCH TEST: halting (no reboot path)");
+    for (;;) __asm__ volatile("wfe");
+#endif
+#endif
 
     const u8 *dtb = (const u8 *)dtb_address;
     u32 dtb_size = 0;
