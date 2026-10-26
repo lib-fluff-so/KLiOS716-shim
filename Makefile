@@ -11,13 +11,14 @@ RAMOOPS_LOG ?= 1
 XNU_PAYLOAD ?= 0
 UFS_TEST ?= 0
 UFS_HS_GEAR ?= 3
+TOUCH_TEST ?= 0
 PSCI_RESET_TIMER ?= 0
 XNU_KERNEL ?=
 XNU_RAMDISK ?=
 XNU_CMDLINE ?= debug=0xc serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsroot=iosroot ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin wdt=-1
 D22AP_ADT ?= research/ipsw-x/d22ap.adt
 
-CFLAGS += -DRAMOOPS_LOG=$(RAMOOPS_LOG) -DXNU_PAYLOAD=$(XNU_PAYLOAD) -DUFS_TEST=$(UFS_TEST) -DUFS_HS_GEAR=$(UFS_HS_GEAR) -DPSCI_RESET_TIMER=$(PSCI_RESET_TIMER)
+CFLAGS += -DRAMOOPS_LOG=$(RAMOOPS_LOG) -DXNU_PAYLOAD=$(XNU_PAYLOAD) -DUFS_TEST=$(UFS_TEST) -DUFS_HS_GEAR=$(UFS_HS_GEAR) -DTOUCH_TEST=$(TOUCH_TEST) -DPSCI_RESET_TIMER=$(PSCI_RESET_TIMER)
 ifneq ($(strip $(AUTO_REBOOT_TEST)),)
 CFLAGS += -DAUTO_REBOOT_TEST=$(AUTO_REBOOT_TEST)
 endif
@@ -66,13 +67,15 @@ $(OUT)/console.o: src/console.c src/console.h src/font.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/ufs_test.o: src/ufs_test.c src/ufs_test.h src/console.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
+$(OUT)/touch_test.o: src/touch_test.c src/touch_test.h src/console.h | $(OUT)
+	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/memmap.o: src/memmap.c src/memmap.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/loader.o: src/loader.c src/loader.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/xnu_payload.o: src/xnu_payload.c src/xnu_payload.h src/loader.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(OUT)/shim.elf: $(OUT)/start.o $(OUT)/vectors.o $(OUT)/handoff.o $(OUT)/main.o $(OUT)/console.o $(OUT)/memmap.o $(OUT)/loader.o $(OUT)/xnu_payload.o $(OUT)/ufs_test.o link.ld
+$(OUT)/shim.elf: $(OUT)/start.o $(OUT)/vectors.o $(OUT)/handoff.o $(OUT)/main.o $(OUT)/console.o $(OUT)/memmap.o $(OUT)/loader.o $(OUT)/xnu_payload.o $(OUT)/ufs_test.o $(OUT)/touch_test.o link.ld
 	$(LD) --gc-sections -nostdlib -T link.ld -o $@ $(filter %.o,$^)
 $(OUT)/Image: $(OUT)/shim.elf
 	$(OBJCOPY) -O binary $< $@

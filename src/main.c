@@ -15,6 +15,7 @@ typedef __builtin_va_list va_list;
 #include "loader.h"
 #include "xnu_payload.h"
 #include "ufs_test.h"
+#include "touch_test.h"
 
 #ifndef RAMOOPS_LOG
 #define RAMOOPS_LOG 1
@@ -24,6 +25,9 @@ typedef __builtin_va_list va_list;
 #endif
 #ifndef UFS_TEST
 #define UFS_TEST 0
+#endif
+#ifndef TOUCH_TEST
+#define TOUCH_TEST 0
 #endif
 #ifndef AUTO_REBOOT_TEST
 #if XNU_PAYLOAD
@@ -783,6 +787,18 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
     finish_test_attempt("UFS probe done");
 #else
     logf("UFS TEST: halting (no reboot path)");
+    for (;;) __asm__ volatile("wfe");
+#endif
+#endif
+
+#if TOUCH_TEST
+    logf("TOUCH TEST: SPI1 probe (XNU will not be loaded)");
+    touch_test();
+    logf("TOUCH TEST: probe returned");
+#if AUTO_REBOOT_TEST
+    finish_test_attempt("TOUCH probe done");
+#else
+    logf("TOUCH TEST: halting (no reboot path)");
     for (;;) __asm__ volatile("wfe");
 #endif
 #endif
