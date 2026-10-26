@@ -70,11 +70,13 @@ typedef unsigned long long u64;
 #define SPI_STATUS_PAUSE	(1u << 1)
 
 /*
- * Parent tck_26m_mx9_ck (26 MHz), SCK = 26 / (2 * 5) = 2.6 MHz.
- * cs_time = 2 * sck_time, same math as mtk_spi_prepare_transfer().
+ * sck_time/cs_time are selected after the topckgen parent is chosen.
+ * sck_time is the half period in parent clock cycles, so
+ * SCK = parent / (2 * sck_time), same math as mtk_spi_prepare_transfer().
+ * Defaults match msdcpll_d2 (192 MHz) at ~5.3 MHz.
  */
-#define SPI_SCK_TIME		5u
-#define SPI_CS_TIME		(SPI_SCK_TIME * 2u)
+static u32 spi_sck_time = 18u;
+static u32 spi_cs_time = 36u;
 
 /* Board pins from the live KL7 device tree. */
 #define TOUCH_SPI_PIN_FIRST	34u
@@ -212,29 +214,96 @@ static u32 gpio_get(u32 pin)
 }
 
 /*
- * Enable the SPI1 clock tree:
- *  - topckgen spi_sel mux -> tck_26m_mx9_ck (index 0), pdn cleared;
- *  - infracfg_ao ifrao_spi1 gate (SET 0xA4, status 0xAC, bit 6).
+ * Select a topckgen spi_sel parent.  CFG6_SET/CLR are write-1-to-set /
+ * write-1-to-clear registers (mtk_mux_clr_set_upd_ops), so the new mux
+ * value must be written to SET, not to the read/write CFG6 register.
+ * SPI pdn (bit 23) is active high, clear it to ungate the mux.
  */
-static void spi_clock_on(void)
+static void top_mux_set(u32 idx)
 {
-	u32 v;
-
-	v = top_rd(TOP_CLK_CFG6);
-	logf("TOUCH: top cfg6=%x", (u64)v);
-
 	top_wr(TOP_CLK_CFG6_CLR, TOP_SPI_MUX_MASK | TOP_SPI_PDN);
-	top_wr(TOP_CLK_CFG6_SET, 0u);
+	top_wr(TOP_CLK_CFG6_SET,
+	       (idx << TOP_SPI_MUX_SHIFT) & TOP_SPI_MUX_MASK);
 	top_wr(TOP_CLK_UPDATE, TOP_SPI_UPDATE);
-	delay_us(50);
+}
 
-	v = top_rd(TOP_CLK_CFG6);
-	logf("TOUCH: top cfg6=%x", (u64)v);
+/*
+ * Prove that the SPI controller register block is really clocked:
+ * write a known packet length to CFG1 and the MSB-first bits to CMD,
+ * then read both back.  A dead bus returns zero for every register.
+ */
+static int spi_regs_alive(void)
+{
+	u32 cmd, cfg1;
+
+	spi_wr(SPI_CMD_REG, SPI_CMD_RST);
+	delay_us(5);
+	spi_wr(SPI_CMD_REG, 0u);
+	delay_us(5);
+
+	spi_wr(SPI_CFG1_REG, 0u);
+	delay_us(2);
+	spi_wr(SPI_CFG1_REG, 0x00050000u);
+	delay_us(5);
+	cfg1 = spi_rd(SPI_CFG1_REG);
+
+	spi_wr(SPI_CMD_REG, SPI_CMD_TXMSBF | SPI_CMD_RXMSBF |
+			    SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE);
+	delay_us(5);
+	cmd = spi_rd(SPI_CMD_REG);
+
+	return ((cfg1 & 0x001F0000u) == 0x00050000u) &&
+	       ((cmd & (SPI_CMD_TXMSBF | SPI_CMD_RXMSBF)) ==
+		(SPI_CMD_TXMSBF | SPI_CMD_RXMSBF));
+}
+
+/*
+ * Bring SPI1 up.  Android leaves ifrao_spi1 disabled and uses
+ * msdcpll_d2 (192 MHz); after a PSCI reset msdcpll is not guaranteed
+ * to be running.  univpll_d5_d4 (124.8 MHz) is already a live clock
+ * (UFS consumer), so try it first, then other live PLL parents.
+ * The controller is considered up only when CFG1/CMD writes stick.
+ */
+static int spi_bus_up(void)
+{
+	static const u32 muxes[] = { 7u, 5u, 4u, 0u };
+	static const u32 sck[] = { 12u, 17u, 18u, 3u };
+	static const u32 cs[] = { 24u, 34u, 36u, 6u };
+	u32 i;
+
+	logf("TOUCH: top cfg6=%x", (u64)top_rd(TOP_CLK_CFG6));
+	logf("TOUCH: ifrao sta=%x", (u64)infra_rd(IFRAO_SPI1_STA));
 
 	infra_wr(IFRAO_SPI1_SET, IFRAO_SPI1_BIT);
 	delay_us(50);
-	v = infra_rd(IFRAO_SPI1_STA);
-	logf("TOUCH: ifrao sta=%x", (u64)v);
+
+	for (i = 0; i < sizeof(muxes) / sizeof(muxes[0]); i++) {
+		u32 cfg6, sta;
+		int alive;
+
+		top_mux_set(muxes[i]);
+		delay_us(200);
+
+		cfg6 = top_rd(TOP_CLK_CFG6);
+		sta = infra_rd(IFRAO_SPI1_STA);
+		alive = spi_regs_alive();
+		logf("TOUCH: mux%d cfg6=%x sta=%x cfg1=%x cmd=%x alive=%d",
+		     (u64)muxes[i], (u64)cfg6, (u64)sta,
+		     (u64)spi_rd(SPI_CFG1_REG), (u64)spi_rd(SPI_CMD_REG),
+		     (u64)alive);
+
+		if (alive) {
+			spi_sck_time = sck[i];
+			spi_cs_time = cs[i];
+			logf("TOUCH: SPI1 up mux=%d sck=%d cs=%d",
+			     (u64)muxes[i], (u64)spi_sck_time,
+			     (u64)spi_cs_time);
+			return 0;
+		}
+	}
+
+	logf("TOUCH: SPI1 bus dead (no mux works)");
+	return -1;
 }
 
 /* One full-duplex SPI packet, mode 0, MSB first. */
@@ -258,13 +327,13 @@ static int spi_xfer(const u8 *tx, u8 *rx, u32 len)
 	spi_wr(SPI_PAD_SEL_REG, 0u);
 
 	/* enhance_timing: SCK in CFG2, CS setup/hold in CFG0. */
-	spi_wr(SPI_CFG2_REG, (SPI_SCK_TIME - 1u) |
-			     ((SPI_SCK_TIME - 1u) << 16));
-	spi_wr(SPI_CFG0_REG, (SPI_CS_TIME - 1u) |
-			     ((SPI_CS_TIME - 1u) << 16));
+	spi_wr(SPI_CFG2_REG, (spi_sck_time - 1u) |
+			     ((spi_sck_time - 1u) << 16));
+	spi_wr(SPI_CFG0_REG, (spi_cs_time - 1u) |
+			     ((spi_cs_time - 1u) << 16));
 
 	/* CS idle time + packet length in bytes; packet loop = 0. */
-	spi_wr(SPI_CFG1_REG, (SPI_CS_TIME - 1u) | ((len - 1u) << 16));
+	spi_wr(SPI_CFG1_REG, (spi_cs_time - 1u) | ((len - 1u) << 16));
 
 	/* 32-bit FIFO: four wire bytes per word, little endian. */
 	for (i = 0; i < len; i += 4u) {
@@ -356,7 +425,10 @@ void touch_test(void)
 	logf("TOUCH: rst=gpio%d irq=gpio%d avdd=gpio%d",
 	     (u64)TOUCH_RESET_GPIO, (u64)TOUCH_IRQ_GPIO, (u64)TOUCH_AVDD_GPIO);
 
-	spi_clock_on();
+	if (spi_bus_up() != 0) {
+		logf("TOUCH: RESULT FAIL bus");
+		return;
+	}
 
 	mode_old = gpio_rd(GPIO_MODE(TOUCH_SPI_PIN_FIRST));
 	for (i = TOUCH_SPI_PIN_FIRST; i <= TOUCH_SPI_PIN_LAST; i++)
