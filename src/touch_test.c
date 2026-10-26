@@ -397,6 +397,86 @@ static int spi_xfer(const u8 *tx, u8 *rx, u32 len)
 	return 0;
 }
 
+/*
+ * Long PIO read: the MTK FIFO is 32 bytes, so send the packet in chunks
+ * with the CS kept asserted between chunks.  This is the same chunking
+ * the mtk_spi_interrupt() FIFO path uses for transfers > 32 bytes.  It
+ * avoids the internal DMA engine entirely.
+ */
+static int spi_xfer_long(const u8 *tx, u8 *rx, u32 len)
+{
+	u32 off, chunk, i, w, cmd;
+	u64 start, timeout;
+
+	if (len == 0u || len > FTS_BUF_SIZE)
+		return -1;
+
+	cmd = spi_rd(SPI_CMD_REG);
+	spi_wr(SPI_CMD_REG, cmd | SPI_CMD_RST);
+	delay_us(2);
+	spi_wr(SPI_CMD_REG, cmd & ~SPI_CMD_RST);
+	delay_us(2);
+
+	spi_wr(SPI_CMD_REG, SPI_CMD_TXMSBF | SPI_CMD_RXMSBF |
+			    SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE |
+			    SPI_CMD_PAUSE_EN);
+	spi_wr(SPI_PAD_SEL_REG, 0u);
+	spi_wr(SPI_CFG2_REG, (spi_sck_time - 1u) |
+			     ((spi_sck_time - 1u) << 16));
+	spi_wr(SPI_CFG0_REG, (spi_cs_time - 1u) |
+			     ((spi_cs_time - 1u) << 16));
+
+	for (off = 0u; off < len; off += chunk) {
+		chunk = len - off;
+		if (chunk > 32u)
+			chunk = 32u;
+
+		spi_wr(SPI_CFG1_REG,
+		       (spi_cs_time - 1u) | ((chunk - 1u) << 16));
+
+		for (i = 0u; i < chunk; i += 4u) {
+			w = (u32)tx[off + i];
+			if (i + 1u < chunk)
+				w |= (u32)tx[off + i + 1u] << 8;
+			if (i + 2u < chunk)
+				w |= (u32)tx[off + i + 2u] << 16;
+			if (i + 3u < chunk)
+				w |= (u32)tx[off + i + 3u] << 24;
+			spi_wr(SPI_TX_DATA_REG, w);
+		}
+
+		cmd = spi_rd(SPI_CMD_REG);
+		spi_wr(SPI_CMD_REG, cmd | SPI_CMD_ACT);
+
+		start = ticks();
+		timeout = timer_freq() / 10u;
+		while ((spi_rd(SPI_CMD_REG) & SPI_CMD_ACT) != 0u) {
+			if (ticks() - start > timeout) {
+				logf("TOUCH: pio timeout off=%d st=%x s1=%x cmd=%x",
+				     (u64)off, (u64)spi_rd(SPI_STATUS0_REG),
+				     (u64)spi_rd(SPI_STATUS1_REG),
+				     (u64)spi_rd(SPI_CMD_REG));
+				spi_cs_deassert();
+				return -2;
+			}
+		}
+
+		for (i = 0u; i < chunk; i += 4u) {
+			w = spi_rd(SPI_RX_DATA_REG);
+			rx[off + i] = (u8)w;
+			if (i + 1u < chunk)
+				rx[off + i + 1u] = (u8)(w >> 8);
+			if (i + 2u < chunk)
+				rx[off + i + 2u] = (u8)(w >> 16);
+			if (i + 3u < chunk)
+				rx[off + i + 3u] = (u8)(w >> 24);
+		}
+	}
+
+	spi_cs_deassert();
+	return 0;
+}
+
 /* Clean+invalidate by VA if the D-cache is enabled.  The shim normally
  * runs with SCTLR.C clear, but the bootloader may leave it on, and then
  * the CPU would read stale zeros from the stack after an SPI DMA write. */
@@ -556,7 +636,7 @@ static int fts_read(u8 reg, u8 *val, u32 n)
 	tx[3] = (u8)n;
 
 	if (total > 32u)
-		rc = spi_xfer_dma(tx, rx, total);
+		rc = spi_xfer_long(tx, rx, total);
 	else
 		rc = spi_xfer(tx, rx, total);
 	if (rc)
@@ -735,6 +815,34 @@ void touch_test(void)
 			     (u64)(u32)drc, (u64)fts_last_status,
 			     (u64)spi_rd(SPI_STATUS1_REG),
 			     (u64)drx[7], (u64)drx[8]);
+		}
+
+		/* Same 71-byte packet, but through the chunked PIO path. */
+		{
+			u8 ptx[FTS_BUF_SIZE] __attribute__((aligned(64)));
+			u8 prx[FTS_BUF_SIZE] __attribute__((aligned(64)));
+			u32 j;
+			int prc;
+
+			for (j = 0; j < FTS_BUF_SIZE; j++) {
+				ptx[j] = 0u;
+				prx[j] = 0xAAu;
+			}
+			ptx[0] = FTS_REG_CHIP_ID_H;
+			ptx[1] = FTS_CMD_READ;
+			ptx[2] = 0u;
+			ptx[3] = 62u;
+			prc = spi_xfer_long(ptx, prx, 71u);
+			logf("TOUCH: pio id rc=%d d0=%x d1=%x rx=%x,%x,%x,%x",
+			     (u64)(u32)prc, (u64)prx[7], (u64)prx[8],
+			     (u64)((u32)prx[0] | ((u32)prx[1] << 8) |
+				   ((u32)prx[2] << 16) | ((u32)prx[3] << 24)),
+			     (u64)((u32)prx[4] | ((u32)prx[5] << 8) |
+				   ((u32)prx[6] << 16) | ((u32)prx[7] << 24)),
+			     (u64)((u32)prx[8] | ((u32)prx[9] << 8) |
+				   ((u32)prx[10] << 16) | ((u32)prx[11] << 24)),
+			     (u64)((u32)prx[12] | ((u32)prx[13] << 8) |
+				   ((u32)prx[14] << 16) | ((u32)prx[15] << 24)));
 		}
 
 		/*
