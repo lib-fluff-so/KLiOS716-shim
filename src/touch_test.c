@@ -313,20 +313,13 @@ static void msdcpll_enable(void)
 }
 
 /*
- * Bring SPI1 up.  Android's live spi_sel parent is msdcpll_d2 (192 MHz)
- * and the driver enables the whole chain through msdcpll; the kernel
- * leaves msdcpll off at idle, so every PSCI reset starts with the
- * default mux pointing at a stopped PLL.  Enable msdcpll, then walk
- * the parent list.  The controller is considered up only when
- * CFG1/CMD writes stick.
+ * Enable the SPI1 clock chain like Android: msdcpll -> msdcpll_d2 ->
+ * spi_sel -> spi_ck -> ifrao_spi1.  The default mux is already 4
+ * (msdcpll_d2), so program that first.  No register test here: the
+ * caller checks alive after pinmux/power too, to find the missing enable.
  */
-static int spi_bus_up(void)
+static void spi_clocks_up(void)
 {
-	static const u32 muxes[] = { 4u, 7u, 5u, 0u };
-	static const u32 sck[] = { 18u, 12u, 17u, 3u };
-	static const u32 cs[] = { 36u, 24u, 34u, 6u };
-	u32 i;
-
 	logf("TOUCH: top cfg6=%x", (u64)top_rd(TOP_CLK_CFG6));
 	logf("TOUCH: ifrao sta=%x", (u64)infra_rd(IFRAO_SPI1_STA));
 	logf("TOUCH: apmixed pre con0=%x con1=%x con3=%x",
@@ -339,23 +332,30 @@ static int spi_bus_up(void)
 	     (u64)ap_rd(MSDCPLL_CON0), (u64)ap_rd(MSDCPLL_CON1),
 	     (u64)ap_rd(MSDCPLL_CON3));
 
+	infra_wr(IFRAO_SPI1_CLR, IFRAO_SPI1_BIT);
+	delay_us(20);
+	top_mux_set(4u);
+	delay_us(100);
+	infra_wr(IFRAO_SPI1_SET, IFRAO_SPI1_BIT);
+	delay_us(100);
+}
+
+/* Walk the spi_sel parents; a live mux makes CFG1/CMD writes stick. */
+static int spi_try_muxes(void)
+{
+	static const u32 muxes[] = { 4u, 7u, 5u, 0u };
+	static const u32 sck[] = { 18u, 12u, 17u, 3u };
+	static const u32 cs[] = { 36u, 24u, 34u, 6u };
+	u32 i;
+
 	for (i = 0; i < sizeof(muxes) / sizeof(muxes[0]); i++) {
 		u32 cfg6, sta;
 		int alive;
 
-		/* Keep the bus gate off while switching the parent. */
 		infra_wr(IFRAO_SPI1_CLR, IFRAO_SPI1_BIT);
 		delay_us(20);
-
 		top_mux_set(muxes[i]);
 		delay_us(100);
-
-		/*
-		 * INFRA_AO ICGs latch the enable on the input clock.  The
-		 * clock framework enables parents first and the gate last;
-		 * enabling the gate while spi_ck is still dead leaves it
-		 * latched off even though the status bit reads 1.
-		 */
 		infra_wr(IFRAO_SPI1_SET, IFRAO_SPI1_BIT);
 		delay_us(100);
 
@@ -521,16 +521,15 @@ void touch_test(void)
 	logf("TOUCH: rst=gpio%d irq=gpio%d avdd=gpio%d",
 	     (u64)TOUCH_RESET_GPIO, (u64)TOUCH_IRQ_GPIO, (u64)TOUCH_AVDD_GPIO);
 
-	if (spi_bus_up() != 0) {
-		logf("TOUCH: RESULT FAIL bus");
-		return;
-	}
+	spi_clocks_up();
+	logf("TOUCH: alive clocks=%d", (u64)spi_regs_alive());
 
 	mode_old = gpio_rd(GPIO_MODE(TOUCH_SPI_PIN_FIRST));
 	for (i = TOUCH_SPI_PIN_FIRST; i <= TOUCH_SPI_PIN_LAST; i++)
 		gpio_set_mode(i, TOUCH_SPI_PIN_FUNC);
 	mode_new = gpio_rd(GPIO_MODE(TOUCH_SPI_PIN_FIRST));
-	logf("TOUCH: mode34 old=%x new=%x", (u64)mode_old, (u64)mode_new);
+	logf("TOUCH: mode34 old=%x new=%x alive=%d",
+	     (u64)mode_old, (u64)mode_new, (u64)spi_regs_alive());
 
 	/* AVDD / reset / IRQ are plain GPIOs. */
 	gpio_set_mode(TOUCH_AVDD_GPIO, 0u);
@@ -541,6 +540,7 @@ void touch_test(void)
 	gpio_set(TOUCH_AVDD_GPIO, 1u);
 	gpio_set_dir(TOUCH_AVDD_GPIO, 1u);
 	delay_ms(2);
+	logf("TOUCH: alive avdd=%d", (u64)spi_regs_alive());
 
 	gpio_set(TOUCH_RESET_GPIO, 0u);
 	gpio_set_dir(TOUCH_RESET_GPIO, 1u);
@@ -548,8 +548,14 @@ void touch_test(void)
 
 	gpio_set(TOUCH_RESET_GPIO, 1u);
 	delay_ms(100);
+	logf("TOUCH: alive reset=%d", (u64)spi_regs_alive());
 
 	logf("TOUCH: irq din=%d", (u64)gpio_get(TOUCH_IRQ_GPIO));
+
+	if (spi_try_muxes() != 0) {
+		logf("TOUCH: RESULT FAIL bus");
+		return;
+	}
 
 	idh = 0u;
 	idl = 0u;
