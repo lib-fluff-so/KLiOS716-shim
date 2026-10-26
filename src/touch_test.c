@@ -397,6 +397,24 @@ static int spi_xfer(const u8 *tx, u8 *rx, u32 len)
 	return 0;
 }
 
+/* Clean+invalidate by VA if the D-cache is enabled.  The shim normally
+ * runs with SCTLR.C clear, but the bootloader may leave it on, and then
+ * the CPU would read stale zeros from the stack after an SPI DMA write. */
+static void dcache_sync(const void *p, u32 len)
+{
+	u64 sctlr, addr, end;
+
+	asm volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+	if ((sctlr & 4u) == 0u)
+		return;
+
+	addr = (u64)p & ~63ULL;
+	end = ((u64)p + (u64)len + 63ULL) & ~63ULL;
+	for (; addr < end; addr += 64ULL)
+		asm volatile("dc civac, %0" :: "r"(addr) : "memory");
+	asm volatile("dsb sy" ::: "memory");
+}
+
 /*
  * Same packet as spi_xfer(), but using the MTK SPI controller's internal
  * DMA.  The FTS touch report is 62 bytes (Android reads exactly 0x3e),
@@ -431,10 +449,13 @@ static int spi_xfer_dma(const u8 *tx, u8 *rx, u32 len)
 	/* One packet; packet loop = 0. */
 	spi_wr(SPI_CFG1_REG, (spi_cs_time - 1u) | ((len - 1u) << 16));
 
+	dcache_sync(tx, len);
+	dcache_sync(rx, len);
+
 	spi_wr(SPI_TX_SRC_REG, (u32)(u64)tx);
 	spi_wr(SPI_RX_DST_REG, (u32)(u64)rx);
-	spi_wr(SPI_TX_SRC_REG_64, 0u);
-	spi_wr(SPI_RX_DST_REG_64, 0u);
+	spi_wr(SPI_TX_SRC_REG_64, (u32)((u64)tx >> 32));
+	spi_wr(SPI_RX_DST_REG_64, (u32)((u64)rx >> 32));
 
 	cmd = spi_rd(SPI_CMD_REG);
 	spi_wr(SPI_CMD_REG, cmd | SPI_CMD_TX_DMA | SPI_CMD_RX_DMA |
@@ -482,12 +503,18 @@ static int spi_xfer_dma(const u8 *tx, u8 *rx, u32 len)
 
 	delay_us(10);
 	spi_cs_deassert();
+	dcache_sync(rx, len);
 
 	/* First DMA read only: prove the engine and show the raw bytes. */
 	{
 		static int dma_logged;
 
 		if (!dma_logged) {
+			logf("TOUCH: dma addr tx=%x rx=%x hi=%x,%x s1=%x",
+			     (u64)tx, (u64)rx,
+			     (u64)spi_rd(SPI_TX_SRC_REG_64),
+			     (u64)spi_rd(SPI_RX_DST_REG_64),
+			     (u64)spi_rd(SPI_STATUS1_REG));
 			logf("TOUCH: dma ok len=%d st=%x cmd=%x rx=%x,%x,%x,%x",
 			     (u64)len, (u64)st, (u64)cmd,
 			     (u64)((u32)rx[0] | ((u32)rx[1] << 8) |
@@ -507,8 +534,8 @@ static int spi_xfer_dma(const u8 *tx, u8 *rx, u32 len)
 /* FTS register read: rx[7] is the first data byte, rx[3] is status. */
 static int fts_read(u8 reg, u8 *val, u32 n)
 {
-	u8 tx[FTS_BUF_SIZE];
-	u8 rx[FTS_BUF_SIZE];
+	u8 tx[FTS_BUF_SIZE] __attribute__((aligned(64)));
+	u8 rx[FTS_BUF_SIZE] __attribute__((aligned(64)));
 	u32 i, total;
 	int rc;
 
@@ -600,6 +627,11 @@ void touch_test(void)
 	u32 i, mode_old, mode_new, nonce;
 	int rc;
 
+	{
+		u64 sctlr;
+		asm volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+		logf("TOUCH: sctlr=%x", sctlr);
+	}
 	logf("TOUCH: FTS SPI1 probe");
 	logf("TOUCH: rst=gpio%d irq=gpio%d avdd=gpio%d",
 	     (u64)TOUCH_RESET_GPIO, (u64)TOUCH_IRQ_GPIO, (u64)TOUCH_AVDD_GPIO);
@@ -703,8 +735,6 @@ void touch_test(void)
 						sy = 2435u;
 					console_crosshair((int)sx, (int)sy);
 					if (!logged) {
-						u8 *bb = (u8 *)0;
-						(void)bb;
 						logf("TOUCH: first x=%d y=%d raw=%d,%d b=%x,%x,%x,%x,%x,%x,%x",
 						     (u64)sx, (u64)sy, (u64)rx, (u64)ry,
 						     (u64)fts_last_touch[0], (u64)fts_last_touch[1],
