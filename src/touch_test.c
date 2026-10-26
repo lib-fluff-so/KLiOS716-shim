@@ -61,6 +61,7 @@ typedef unsigned long long u64;
 
 #define SPI_CMD_ACT		(1u << 0)
 #define SPI_CMD_RST		(1u << 2)
+#define SPI_CMD_PAUSE_EN	(1u << 4)
 #define SPI_CMD_TXMSBF		(1u << 12)
 #define SPI_CMD_RXMSBF		(1u << 13)
 #define SPI_CMD_FINISH_IE	(1u << 16)
@@ -217,14 +218,31 @@ static u32 gpio_get(u32 pin)
  * Select a topckgen spi_sel parent.  CFG6_SET/CLR are write-1-to-set /
  * write-1-to-clear registers (mtk_mux_clr_set_upd_ops), so the new mux
  * value must be written to SET, not to the read/write CFG6 register.
- * SPI pdn (bit 23) is active high, clear it to ungate the mux.
+ *
+ * The clock framework calls set_parent() before the first
+ * clk_prepare_enable(), i.e. with the mux gate powered down, and
+ * mtk_clk_mux_enable_setclr() clears pdn + updates afterwards.  Do the
+ * same here: pdn=1, change mux + update, pdn=0 + update.  Changing the
+ * mux while the gate is running does not latch on this hardware.
  */
 static void top_mux_set(u32 idx)
 {
-	top_wr(TOP_CLK_CFG6_CLR, TOP_SPI_MUX_MASK | TOP_SPI_PDN);
+	/* Gate off (pdn=1). */
+	top_wr(TOP_CLK_CFG6_SET, TOP_SPI_PDN);
+	top_wr(TOP_CLK_UPDATE, TOP_SPI_UPDATE);
+	delay_us(10);
+
+	/* Change the parent with the gate off. */
+	top_wr(TOP_CLK_CFG6_CLR, TOP_SPI_MUX_MASK);
 	top_wr(TOP_CLK_CFG6_SET,
 	       (idx << TOP_SPI_MUX_SHIFT) & TOP_SPI_MUX_MASK);
 	top_wr(TOP_CLK_UPDATE, TOP_SPI_UPDATE);
+	delay_us(10);
+
+	/* Gate on (pdn=0), then update like mtk_clk_mux_enable_setclr(). */
+	top_wr(TOP_CLK_CFG6_CLR, TOP_SPI_PDN);
+	top_wr(TOP_CLK_UPDATE, TOP_SPI_UPDATE);
+	delay_us(50);
 }
 
 /*
@@ -306,6 +324,23 @@ static int spi_bus_up(void)
 	return -1;
 }
 
+/*
+ * mtk_spi_set_cs(true): drop PAUSE_EN to release CS, then soft reset.
+ * The driver does this after every message; without it CS stays low and
+ * the FTS state machine rejects the next header.
+ */
+static void spi_cs_deassert(void)
+{
+	u32 cmd = spi_rd(SPI_CMD_REG);
+
+	cmd &= ~(SPI_CMD_PAUSE_EN | SPI_CMD_ACT);
+	spi_wr(SPI_CMD_REG, cmd);
+	delay_us(2);
+	spi_wr(SPI_CMD_REG, cmd | SPI_CMD_RST);
+	delay_us(2);
+	spi_wr(SPI_CMD_REG, cmd & ~SPI_CMD_RST);
+}
+
 /* One full-duplex SPI packet, mode 0, MSB first. */
 static int spi_xfer(const u8 *tx, u8 *rx, u32 len)
 {
@@ -322,8 +357,10 @@ static int spi_xfer(const u8 *tx, u8 *rx, u32 len)
 	spi_wr(SPI_CMD_REG, cmd & ~SPI_CMD_RST);
 	delay_us(2);
 
+	/* PAUSE_EN must be set before the FIFO and ACT (mtk_spi_set_cs). */
 	spi_wr(SPI_CMD_REG, SPI_CMD_TXMSBF | SPI_CMD_RXMSBF |
-			    SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE);
+			    SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE |
+			    SPI_CMD_PAUSE_EN);
 	spi_wr(SPI_PAD_SEL_REG, 0u);
 
 	/* enhance_timing: SCK in CFG2, CS setup/hold in CFG0. */
@@ -361,6 +398,7 @@ static int spi_xfer(const u8 *tx, u8 *rx, u32 len)
 			     (u64)spi_rd(SPI_CMD_REG),
 			     (u64)spi_rd(SPI_CFG1_REG),
 			     (u64)spi_rd(SPI_CFG2_REG));
+			spi_cs_deassert();
 			return -2;
 		}
 	}
@@ -376,6 +414,7 @@ static int spi_xfer(const u8 *tx, u8 *rx, u32 len)
 			rx[i + 3u] = (u8)(w >> 24);
 	}
 
+	spi_cs_deassert();
 	return 0;
 }
 
