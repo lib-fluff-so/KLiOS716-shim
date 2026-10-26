@@ -40,6 +40,15 @@ typedef unsigned long long u64;
 #define TOP_SPI_MUX_SHIFT	16u
 #define TOP_SPI_MUX_MASK	(7u << TOP_SPI_MUX_SHIFT)
 #define TOP_SPI_PDN		(1u << 23)	/* 1 = gated */
+
+/* APMIXEDSYS: MSDCPLL is the default spi_sel parent (msdcpll_d2). */
+#define APMIXED_BASE		0x1000C000ul
+#define MSDCPLL_CON0		0x0350u
+#define MSDCPLL_CON1		0x0354u
+#define MSDCPLL_CON3		0x035Cu
+#define PLL_PWR_ON		(1u << 0)
+#define PLL_ISO_EN		(1u << 1)
+#define PLL_EN			(1u << 0)
 #define TOP_SPI_UPDATE		(1u << 26)
 
 /* MT6789 infracfg_ao, base 0x10001000 (clk-mt6789-bus.c). */
@@ -123,6 +132,16 @@ static inline u32 top_rd(u32 off)
 static inline void top_wr(u32 off, u32 v)
 {
 	*(volatile u32 *)(TOPCKGEN_BASE + off) = v;
+}
+
+static inline u32 ap_rd(u32 off)
+{
+	return *(volatile u32 *)(APMIXED_BASE + off);
+}
+
+static inline void ap_wr(u32 off, u32 v)
+{
+	*(volatile u32 *)(APMIXED_BASE + off) = v;
 }
 
 static inline u32 infra_rd(u32 off)
@@ -228,9 +247,8 @@ static u32 gpio_get(u32 pin)
  */
 static void top_mux_set(u32 idx)
 {
-	/* Gate off (pdn=1). */
+	/* Gate off (pdn=1); mtk_clk_mux_disable_setclr writes SET only. */
 	top_wr(TOP_CLK_CFG6_SET, TOP_SPI_PDN);
-	top_wr(TOP_CLK_UPDATE, TOP_SPI_UPDATE);
 	delay_us(10);
 
 	/* Change the parent with the gate off. */
@@ -276,22 +294,50 @@ static int spi_regs_alive(void)
 		(SPI_CMD_TXMSBF | SPI_CMD_RXMSBF));
 }
 
+/* mtk_pll_prepare() for MSDCPLL: CON3 PWR_ON, clear ISO_EN, CON0 EN. */
+static void msdcpll_enable(void)
+{
+	u32 r;
+
+	r = ap_rd(MSDCPLL_CON3) | PLL_PWR_ON;
+	ap_wr(MSDCPLL_CON3, r);
+	delay_us(1);
+
+	r = ap_rd(MSDCPLL_CON3) & ~PLL_ISO_EN;
+	ap_wr(MSDCPLL_CON3, r);
+	delay_us(1);
+
+	r = ap_rd(MSDCPLL_CON0) | PLL_EN;
+	ap_wr(MSDCPLL_CON0, r);
+	delay_us(50);
+}
+
 /*
- * Bring SPI1 up.  Android leaves ifrao_spi1 disabled and uses
- * msdcpll_d2 (192 MHz); after a PSCI reset msdcpll is not guaranteed
- * to be running.  univpll_d5_d4 (124.8 MHz) is already a live clock
- * (UFS consumer), so try it first, then other live PLL parents.
- * The controller is considered up only when CFG1/CMD writes stick.
+ * Bring SPI1 up.  Android's live spi_sel parent is msdcpll_d2 (192 MHz)
+ * and the driver enables the whole chain through msdcpll; the kernel
+ * leaves msdcpll off at idle, so every PSCI reset starts with the
+ * default mux pointing at a stopped PLL.  Enable msdcpll, then walk
+ * the parent list.  The controller is considered up only when
+ * CFG1/CMD writes stick.
  */
 static int spi_bus_up(void)
 {
-	static const u32 muxes[] = { 7u, 5u, 4u, 0u };
-	static const u32 sck[] = { 12u, 17u, 18u, 3u };
-	static const u32 cs[] = { 24u, 34u, 36u, 6u };
+	static const u32 muxes[] = { 4u, 7u, 5u, 0u };
+	static const u32 sck[] = { 18u, 12u, 17u, 3u };
+	static const u32 cs[] = { 36u, 24u, 34u, 6u };
 	u32 i;
 
 	logf("TOUCH: top cfg6=%x", (u64)top_rd(TOP_CLK_CFG6));
 	logf("TOUCH: ifrao sta=%x", (u64)infra_rd(IFRAO_SPI1_STA));
+	logf("TOUCH: apmixed pre con0=%x con1=%x con3=%x",
+	     (u64)ap_rd(MSDCPLL_CON0), (u64)ap_rd(MSDCPLL_CON1),
+	     (u64)ap_rd(MSDCPLL_CON3));
+
+	msdcpll_enable();
+
+	logf("TOUCH: apmixed post con0=%x con1=%x con3=%x",
+	     (u64)ap_rd(MSDCPLL_CON0), (u64)ap_rd(MSDCPLL_CON1),
+	     (u64)ap_rd(MSDCPLL_CON3));
 
 	for (i = 0; i < sizeof(muxes) / sizeof(muxes[0]); i++) {
 		u32 cfg6, sta;
