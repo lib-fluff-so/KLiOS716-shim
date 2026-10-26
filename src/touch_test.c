@@ -439,6 +439,8 @@ static int spi_xfer_dma(const u8 *tx, u8 *rx, u32 len)
 	spi_wr(SPI_CMD_REG, SPI_CMD_TXMSBF | SPI_CMD_RXMSBF |
 			    SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE |
 			    SPI_CMD_PAUSE_EN);
+	cmd = spi_rd(SPI_CMD_REG);
+	spi_wr(SPI_CMD_REG, cmd | SPI_CMD_TX_DMA | SPI_CMD_RX_DMA);
 	spi_wr(SPI_PAD_SEL_REG, 0u);
 
 	spi_wr(SPI_CFG2_REG, (spi_sck_time - 1u) |
@@ -458,8 +460,7 @@ static int spi_xfer_dma(const u8 *tx, u8 *rx, u32 len)
 	spi_wr(SPI_RX_DST_REG_64, (u32)((u64)rx >> 32));
 
 	cmd = spi_rd(SPI_CMD_REG);
-	spi_wr(SPI_CMD_REG, cmd | SPI_CMD_TX_DMA | SPI_CMD_RX_DMA |
-			    SPI_CMD_ACT);
+	spi_wr(SPI_CMD_REG, cmd | SPI_CMD_ACT);
 
 	start = ticks();
 	timeout = timer_freq() / 10u;	/* 100 ms */
@@ -708,6 +709,33 @@ void touch_test(void)
 		fts_read(FTS_REG_FW_VER, &fw, 1u);
 		fts_read(FTS_REG_POWER_MODE, &pm, 1u);
 		logf("TOUCH: RESULT OK fw=%x pm=%x", (u64)fw, (u64)pm);
+
+		/*
+		 * DMA sanity check without a finger: read 62 bytes starting at
+		 * the chip-ID register over the same 71-byte packet used for
+		 * touch.  A working DMA must put 0x54 at rx[7]; 0xAA means the
+		 * DMA never wrote, 0x00 means it wrote zeros.
+		 */
+		{
+			u8 dtx[FTS_BUF_SIZE] __attribute__((aligned(64)));
+			u8 drx[FTS_BUF_SIZE] __attribute__((aligned(64)));
+			u32 j;
+			int drc;
+
+			for (j = 0; j < FTS_BUF_SIZE; j++) {
+				dtx[j] = 0u;
+				drx[j] = 0xAAu;
+			}
+			dtx[0] = FTS_REG_CHIP_ID_H;
+			dtx[1] = FTS_CMD_READ;
+			dtx[2] = 0u;
+			dtx[3] = 62u;
+			drc = spi_xfer_dma(dtx, drx, 71u);
+			logf("TOUCH: dmaid rc=%d st=%x s1=%x d0=%x d1=%x",
+			     (u64)(u32)drc, (u64)fts_last_status,
+			     (u64)spi_rd(SPI_STATUS1_REG),
+			     (u64)drx[7], (u64)drx[8]);
+		}
 
 		/*
 		 * Live coordinate test: draw a full-width/full-height
