@@ -57,9 +57,13 @@ typedef unsigned long long u64;
 #define IFRAO_SPI1_CLR		0x00A8u
 #define IFRAO_SPI1_STA		0x00ACu
 #define IFRAO_SPI1_BIT		(1u << 6)
+#define IFRAO_SPI2_BIT		(1u << 9)
+#define IFRAO_SPI3_BIT		(1u << 10)
 
 /* MTK SPI1 controller, base 0x11010000 (spi-mt65xx.c). */
 #define SPI1_BASE		0x11010000UL
+#define SPI2_BASE		0x11012000UL
+#define SPI3_BASE		0x11013000UL
 #define SPI_CFG0_REG		0x0000u
 #define SPI_CFG1_REG		0x0004u
 #define SPI_TX_DATA_REG		0x0010u
@@ -162,6 +166,16 @@ static inline u32 spi_rd(u32 off)
 static inline void spi_wr(u32 off, u32 v)
 {
 	*(volatile u32 *)(SPI1_BASE + off) = v;
+}
+
+static inline u32 spi_rd_at(u64 base, u32 off)
+{
+	return *(volatile u32 *)(base + off);
+}
+
+static inline void spi_wr_at(u64 base, u32 off, u32 v)
+{
+	*(volatile u32 *)(base + off) = v;
 }
 
 static u64 ticks(void)
@@ -269,29 +283,51 @@ static void top_mux_set(u32 idx)
  * write a known packet length to CFG1 and the MSB-first bits to CMD,
  * then read both back.  A dead bus returns zero for every register.
  */
-static int spi_regs_alive(void)
+static int spi_regs_alive_at(u64 base)
 {
 	u32 cmd, cfg1;
 
-	spi_wr(SPI_CMD_REG, SPI_CMD_RST);
+	spi_wr_at(base, SPI_CMD_REG, SPI_CMD_RST);
 	delay_us(5);
-	spi_wr(SPI_CMD_REG, 0u);
+	spi_wr_at(base, SPI_CMD_REG, 0u);
 	delay_us(5);
 
-	spi_wr(SPI_CFG1_REG, 0u);
+	spi_wr_at(base, SPI_CFG1_REG, 0u);
 	delay_us(2);
-	spi_wr(SPI_CFG1_REG, 0x00050000u);
+	spi_wr_at(base, SPI_CFG1_REG, 0x00050000u);
 	delay_us(5);
-	cfg1 = spi_rd(SPI_CFG1_REG);
+	cfg1 = spi_rd_at(base, SPI_CFG1_REG);
 
-	spi_wr(SPI_CMD_REG, SPI_CMD_TXMSBF | SPI_CMD_RXMSBF |
-			    SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE);
+	spi_wr_at(base, SPI_CMD_REG, SPI_CMD_TXMSBF | SPI_CMD_RXMSBF |
+				    SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE);
 	delay_us(5);
-	cmd = spi_rd(SPI_CMD_REG);
+	cmd = spi_rd_at(base, SPI_CMD_REG);
 
 	return ((cfg1 & 0x001F0000u) == 0x00050000u) &&
 	       ((cmd & (SPI_CMD_TXMSBF | SPI_CMD_RXMSBF)) ==
 		(SPI_CMD_TXMSBF | SPI_CMD_RXMSBF));
+}
+
+static int spi_regs_alive(void)
+{
+	return spi_regs_alive_at(SPI1_BASE);
+}
+
+/* mtk_pll_unprepare(): clear EN, set ISO_EN, clear PWR_ON. */
+static void msdcpll_disable(void)
+{
+	u32 r;
+
+	r = ap_rd(MSDCPLL_CON0) & ~PLL_EN;
+	ap_wr(MSDCPLL_CON0, r);
+
+	r = ap_rd(MSDCPLL_CON3) | PLL_ISO_EN;
+	ap_wr(MSDCPLL_CON3, r);
+
+	r = ap_rd(MSDCPLL_CON3) & ~PLL_PWR_ON;
+	ap_wr(MSDCPLL_CON3, r);
+
+	delay_us(20);
 }
 
 /* mtk_pll_prepare() for MSDCPLL: CON3 PWR_ON, clear ISO_EN, CON0 EN. */
@@ -323,6 +359,11 @@ static void spi_clocks_up(void)
 	logf("TOUCH: top cfg6=%x", (u64)top_rd(TOP_CLK_CFG6));
 	logf("TOUCH: ifrao sta=%x", (u64)infra_rd(IFRAO_SPI1_STA));
 	logf("TOUCH: apmixed pre con0=%x con1=%x con3=%x",
+	     (u64)ap_rd(MSDCPLL_CON0), (u64)ap_rd(MSDCPLL_CON1),
+	     (u64)ap_rd(MSDCPLL_CON3));
+
+	msdcpll_disable();
+	logf("TOUCH: apmixed off con0=%x con1=%x con3=%x",
 	     (u64)ap_rd(MSDCPLL_CON0), (u64)ap_rd(MSDCPLL_CON1),
 	     (u64)ap_rd(MSDCPLL_CON3));
 
@@ -521,8 +562,21 @@ void touch_test(void)
 	logf("TOUCH: rst=gpio%d irq=gpio%d avdd=gpio%d",
 	     (u64)TOUCH_RESET_GPIO, (u64)TOUCH_IRQ_GPIO, (u64)TOUCH_AVDD_GPIO);
 
+	/*
+	 * Common spi_ck path check: SPI2/SPI3 use the same spi_sel/spi_ck
+	 * tree.  Their gates are bits 9/10 of ifrao2.  If they come alive
+	 * with the default mux 4 while SPI1 does not, the shared clock path
+	 * is fine and the problem is SPI1-specific.
+	 */
+	infra_wr(IFRAO_SPI1_SET, IFRAO_SPI2_BIT | IFRAO_SPI3_BIT);
+	delay_us(100);
+	logf("TOUCH: alive spi2=%d spi3=%d (default mux)",
+	     (u64)spi_regs_alive_at(SPI2_BASE), (u64)spi_regs_alive_at(SPI3_BASE));
+
 	spi_clocks_up();
 	logf("TOUCH: alive clocks=%d", (u64)spi_regs_alive());
+	logf("TOUCH: alive spi2 pll=%d spi3 pll=%d",
+	     (u64)spi_regs_alive_at(SPI2_BASE), (u64)spi_regs_alive_at(SPI3_BASE));
 
 	mode_old = gpio_rd(GPIO_MODE(TOUCH_SPI_PIN_FIRST));
 	for (i = TOUCH_SPI_PIN_FIRST; i <= TOUCH_SPI_PIN_LAST; i++)
