@@ -45,6 +45,7 @@ typedef unsigned long long u64;
 /* MT6789 infracfg_ao, base 0x10001000 (clk-mt6789-bus.c). */
 #define INFRACFG_AO_BASE	0x10001000UL
 #define IFRAO_SPI1_SET		0x00A4u
+#define IFRAO_SPI1_CLR		0x00A8u
 #define IFRAO_SPI1_STA		0x00ACu
 #define IFRAO_SPI1_BIT		(1u << 6)
 
@@ -292,15 +293,25 @@ static int spi_bus_up(void)
 	logf("TOUCH: top cfg6=%x", (u64)top_rd(TOP_CLK_CFG6));
 	logf("TOUCH: ifrao sta=%x", (u64)infra_rd(IFRAO_SPI1_STA));
 
-	infra_wr(IFRAO_SPI1_SET, IFRAO_SPI1_BIT);
-	delay_us(50);
-
 	for (i = 0; i < sizeof(muxes) / sizeof(muxes[0]); i++) {
 		u32 cfg6, sta;
 		int alive;
 
+		/* Keep the bus gate off while switching the parent. */
+		infra_wr(IFRAO_SPI1_CLR, IFRAO_SPI1_BIT);
+		delay_us(20);
+
 		top_mux_set(muxes[i]);
-		delay_us(200);
+		delay_us(100);
+
+		/*
+		 * INFRA_AO ICGs latch the enable on the input clock.  The
+		 * clock framework enables parents first and the gate last;
+		 * enabling the gate while spi_ck is still dead leaves it
+		 * latched off even though the status bit reads 1.
+		 */
+		infra_wr(IFRAO_SPI1_SET, IFRAO_SPI1_BIT);
+		delay_us(100);
 
 		cfg6 = top_rd(TOP_CLK_CFG6);
 		sta = infra_rd(IFRAO_SPI1_STA);
