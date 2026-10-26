@@ -133,19 +133,9 @@ static inline u32 top_rd(u32 off)
 	return *(volatile u32 *)(TOPCKGEN_BASE + off);
 }
 
-static inline void top_wr(u32 off, u32 v)
-{
-	*(volatile u32 *)(TOPCKGEN_BASE + off) = v;
-}
-
 static inline u32 ap_rd(u32 off)
 {
 	return *(volatile u32 *)(APMIXED_BASE + off);
-}
-
-static inline void ap_wr(u32 off, u32 v)
-{
-	*(volatile u32 *)(APMIXED_BASE + off) = v;
 }
 
 static inline u32 infra_rd(u32 off)
@@ -249,36 +239,6 @@ static u32 gpio_get(u32 pin)
 }
 
 /*
- * Select a topckgen spi_sel parent.  CFG6_SET/CLR are write-1-to-set /
- * write-1-to-clear registers (mtk_mux_clr_set_upd_ops), so the new mux
- * value must be written to SET, not to the read/write CFG6 register.
- *
- * The clock framework calls set_parent() before the first
- * clk_prepare_enable(), i.e. with the mux gate powered down, and
- * mtk_clk_mux_enable_setclr() clears pdn + updates afterwards.  Do the
- * same here: pdn=1, change mux + update, pdn=0 + update.  Changing the
- * mux while the gate is running does not latch on this hardware.
- */
-static void top_mux_set(u32 idx)
-{
-	/* Gate off (pdn=1); mtk_clk_mux_disable_setclr writes SET only. */
-	top_wr(TOP_CLK_CFG6_SET, TOP_SPI_PDN);
-	delay_us(10);
-
-	/* Change the parent with the gate off. */
-	top_wr(TOP_CLK_CFG6_CLR, TOP_SPI_MUX_MASK);
-	top_wr(TOP_CLK_CFG6_SET,
-	       (idx << TOP_SPI_MUX_SHIFT) & TOP_SPI_MUX_MASK);
-	top_wr(TOP_CLK_UPDATE, TOP_SPI_UPDATE);
-	delay_us(10);
-
-	/* Gate on (pdn=0), then update like mtk_clk_mux_enable_setclr(). */
-	top_wr(TOP_CLK_CFG6_CLR, TOP_SPI_PDN);
-	top_wr(TOP_CLK_UPDATE, TOP_SPI_UPDATE);
-	delay_us(50);
-}
-
-/*
  * Prove that the SPI controller register block is really clocked:
  * write a known packet length to CFG1 and the MSB-first bits to CMD,
  * then read both back.  A dead bus returns zero for every register.
@@ -313,113 +273,19 @@ static int spi_regs_alive(void)
 	return spi_regs_alive_at(SPI1_BASE);
 }
 
-/* mtk_pll_unprepare(): clear EN, set ISO_EN, clear PWR_ON. */
-static void msdcpll_disable(void)
-{
-	u32 r;
-
-	r = ap_rd(MSDCPLL_CON0) & ~PLL_EN;
-	ap_wr(MSDCPLL_CON0, r);
-
-	r = ap_rd(MSDCPLL_CON3) | PLL_ISO_EN;
-	ap_wr(MSDCPLL_CON3, r);
-
-	r = ap_rd(MSDCPLL_CON3) & ~PLL_PWR_ON;
-	ap_wr(MSDCPLL_CON3, r);
-
-	delay_us(20);
-}
-
-/* mtk_pll_prepare() for MSDCPLL: CON3 PWR_ON, clear ISO_EN, CON0 EN. */
-static void msdcpll_enable(void)
-{
-	u32 r;
-
-	r = ap_rd(MSDCPLL_CON3) | PLL_PWR_ON;
-	ap_wr(MSDCPLL_CON3, r);
-	delay_us(1);
-
-	r = ap_rd(MSDCPLL_CON3) & ~PLL_ISO_EN;
-	ap_wr(MSDCPLL_CON3, r);
-	delay_us(1);
-
-	r = ap_rd(MSDCPLL_CON0) | PLL_EN;
-	ap_wr(MSDCPLL_CON0, r);
-	delay_us(50);
-}
-
 /*
- * Enable the SPI1 clock chain like Android: msdcpll -> msdcpll_d2 ->
- * spi_sel -> spi_ck -> ifrao_spi1.  The default mux is already 4
- * (msdcpll_d2), so program that first.  No register test here: the
- * caller checks alive after pinmux/power too, to find the missing enable.
+ * Nonce readback: write a value that no previous FTS packet used, then
+ * read it back.  This rules out stale registers on a dead controller.
  */
-static void spi_clocks_up(void)
+static u32 spi_nonce(void)
 {
-	logf("TOUCH: top cfg6=%x", (u64)top_rd(TOP_CLK_CFG6));
-	logf("TOUCH: ifrao sta=%x", (u64)infra_rd(IFRAO_SPI1_STA));
-	logf("TOUCH: apmixed pre con0=%x con1=%x con3=%x",
-	     (u64)ap_rd(MSDCPLL_CON0), (u64)ap_rd(MSDCPLL_CON1),
-	     (u64)ap_rd(MSDCPLL_CON3));
-
-	msdcpll_disable();
-	logf("TOUCH: apmixed off con0=%x con1=%x con3=%x",
-	     (u64)ap_rd(MSDCPLL_CON0), (u64)ap_rd(MSDCPLL_CON1),
-	     (u64)ap_rd(MSDCPLL_CON3));
-
-	msdcpll_enable();
-
-	logf("TOUCH: apmixed post con0=%x con1=%x con3=%x",
-	     (u64)ap_rd(MSDCPLL_CON0), (u64)ap_rd(MSDCPLL_CON1),
-	     (u64)ap_rd(MSDCPLL_CON3));
-
-	infra_wr(IFRAO_SPI1_CLR, IFRAO_SPI1_BIT);
-	delay_us(20);
-	top_mux_set(4u);
-	delay_us(100);
-	infra_wr(IFRAO_SPI1_SET, IFRAO_SPI1_BIT);
-	delay_us(100);
-}
-
-/* Walk the spi_sel parents; a live mux makes CFG1/CMD writes stick. */
-static int spi_try_muxes(void)
-{
-	static const u32 muxes[] = { 4u, 7u, 5u, 0u };
-	static const u32 sck[] = { 18u, 12u, 17u, 3u };
-	static const u32 cs[] = { 36u, 24u, 34u, 6u };
-	u32 i;
-
-	for (i = 0; i < sizeof(muxes) / sizeof(muxes[0]); i++) {
-		u32 cfg6, sta;
-		int alive;
-
-		infra_wr(IFRAO_SPI1_CLR, IFRAO_SPI1_BIT);
-		delay_us(20);
-		top_mux_set(muxes[i]);
-		delay_us(100);
-		infra_wr(IFRAO_SPI1_SET, IFRAO_SPI1_BIT);
-		delay_us(100);
-
-		cfg6 = top_rd(TOP_CLK_CFG6);
-		sta = infra_rd(IFRAO_SPI1_STA);
-		alive = spi_regs_alive();
-		logf("TOUCH: mux%d cfg6=%x sta=%x cfg1=%x cmd=%x alive=%d",
-		     (u64)muxes[i], (u64)cfg6, (u64)sta,
-		     (u64)spi_rd(SPI_CFG1_REG), (u64)spi_rd(SPI_CMD_REG),
-		     (u64)alive);
-
-		if (alive) {
-			spi_sck_time = sck[i];
-			spi_cs_time = cs[i];
-			logf("TOUCH: SPI1 up mux=%d sck=%d cs=%d",
-			     (u64)muxes[i], (u64)spi_sck_time,
-			     (u64)spi_cs_time);
-			return 0;
-		}
-	}
-
-	logf("TOUCH: SPI1 bus dead (no mux works)");
-	return -1;
+	spi_wr(SPI_CMD_REG, SPI_CMD_RST);
+	delay_us(5);
+	spi_wr(SPI_CMD_REG, 0u);
+	delay_us(5);
+	spi_wr(SPI_CFG0_REG, 0x00000012u);
+	delay_us(5);
+	return spi_rd(SPI_CFG0_REG);
 }
 
 /*
@@ -555,47 +421,35 @@ static int fts_read(u8 reg, u8 *val, u32 n)
 void touch_test(void)
 {
 	u8 idh, idl, fw, pm;
-	u32 i, mode_old, mode_new;
+	u32 i, mode_old, mode_new, nonce;
 	int rc;
 
 	logf("TOUCH: FTS SPI1 probe");
 	logf("TOUCH: rst=gpio%d irq=gpio%d avdd=gpio%d",
 	     (u64)TOUCH_RESET_GPIO, (u64)TOUCH_IRQ_GPIO, (u64)TOUCH_AVDD_GPIO);
 
+	/* The bootloader already leaves SPI1 clocked.  Print the boot state
+	 * so the proof is in the log. */
+	logf("TOUCH: boot top cfg6=%x ifrao=%x",
+	     (u64)top_rd(TOP_CLK_CFG6), (u64)infra_rd(IFRAO_SPI1_STA));
+	logf("TOUCH: boot apmixed con0=%x con1=%x con3=%x",
+	     (u64)ap_rd(MSDCPLL_CON0), (u64)ap_rd(MSDCPLL_CON1),
+	     (u64)ap_rd(MSDCPLL_CON3));
+
 	/*
-	 * Common spi_ck path check: SPI2/SPI3 use the same spi_sel/spi_ck
-	 * tree.  Their gates are bits 9/10 of ifrao2.  If they come alive
-	 * with the default mux 4 while SPI1 does not, the shared clock path
-	 * is fine and the problem is SPI1-specific.
+	 * ifrao2 is a set/clr gate pair: writing SET asserts the gate
+	 * (disables the clock), writing CLR deasserts it (enables).
+	 * The LK leaves ifrao_spi1 enabled (bit 6 = 0).  Only ever use
+	 * CLR here; the old code wrote SET and killed the controller.
 	 */
 	logf("TOUCH: alive raw spi1=%d", (u64)spi_regs_alive());
-
-	/* Step 1: only the ifrao_spi1 gate, boot mux 4 and boot PLL. */
-	infra_wr(IFRAO_SPI1_SET, IFRAO_SPI1_BIT);
+	infra_wr(IFRAO_SPI1_CLR, IFRAO_SPI1_BIT);
 	delay_us(100);
-	logf("TOUCH: alive gate1=%d", (u64)spi_regs_alive());
+	logf("TOUCH: alive gate1=%d sta=%x",
+	     (u64)spi_regs_alive(), (u64)infra_rd(IFRAO_SPI1_STA));
 
-	/* Step 2: reprogram mux 4 (gate off/on), same PLL. */
-	top_mux_set(4u);
-	delay_us(100);
-	logf("TOUCH: alive gate1 mux4=%d", (u64)spi_regs_alive());
-
-	/* Step 3: restart msdcpll. */
-	msdcpll_disable();
-	msdcpll_enable();
-	delay_us(100);
-	logf("TOUCH: alive gate1 mux4 pll=%d", (u64)spi_regs_alive());
-
-	/* Common spi_ck path: SPI2/3 use the same mux. */
-	infra_wr(IFRAO_SPI1_SET, IFRAO_SPI2_BIT | IFRAO_SPI3_BIT);
-	delay_us(100);
-	logf("TOUCH: alive spi2=%d spi3=%d",
-	     (u64)spi_regs_alive_at(SPI2_BASE), (u64)spi_regs_alive_at(SPI3_BASE));
-
-	spi_clocks_up();
-	logf("TOUCH: alive clocks=%d", (u64)spi_regs_alive());
-	logf("TOUCH: alive spi2 pll=%d spi3 pll=%d",
-	     (u64)spi_regs_alive_at(SPI2_BASE), (u64)spi_regs_alive_at(SPI3_BASE));
+	nonce = spi_nonce();
+	logf("TOUCH: nonce cfg0=%x", (u64)nonce);
 
 	mode_old = gpio_rd(GPIO_MODE(TOUCH_SPI_PIN_FIRST));
 	for (i = TOUCH_SPI_PIN_FIRST; i <= TOUCH_SPI_PIN_LAST; i++)
@@ -613,22 +467,16 @@ void touch_test(void)
 	gpio_set(TOUCH_AVDD_GPIO, 1u);
 	gpio_set_dir(TOUCH_AVDD_GPIO, 1u);
 	delay_ms(2);
-	logf("TOUCH: alive avdd=%d", (u64)spi_regs_alive());
 
 	gpio_set(TOUCH_RESET_GPIO, 0u);
 	gpio_set_dir(TOUCH_RESET_GPIO, 1u);
 	delay_ms(10);
 
 	gpio_set(TOUCH_RESET_GPIO, 1u);
-	delay_ms(100);
-	logf("TOUCH: alive reset=%d", (u64)spi_regs_alive());
-
-	logf("TOUCH: irq din=%d", (u64)gpio_get(TOUCH_IRQ_GPIO));
-
-	if (spi_try_muxes() != 0) {
-		logf("TOUCH: RESULT FAIL bus");
-		return;
-	}
+	delay_ms(150);
+	logf("TOUCH: alive power=%d sta=%x irq=%d",
+	     (u64)spi_regs_alive(), (u64)infra_rd(IFRAO_SPI1_STA),
+	     (u64)gpio_get(TOUCH_IRQ_GPIO));
 
 	idh = 0u;
 	idl = 0u;
