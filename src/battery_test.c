@@ -164,6 +164,14 @@ pmic_read(const char *name, u16 adr, u16 *val)
 	return rc;
 }
 
+static void
+auxadc_stop(void)
+{
+	pwrap_write16(MT6358_AUXADC_RQST0, 0);
+	/* Let the stop command leave the PWRAP FSM before the next request. */
+	delay_us(10);
+}
+
 static int
 auxadc_read(const char *name, u32 req_bit, u16 out_reg, u32 res, u32 avg_num,
 	    u32 *out)
@@ -185,19 +193,19 @@ auxadc_read(const char *name, u32 req_bit, u16 out_reg, u32 res, u32 avg_num,
 		if (rc) {
 			logf("BAT: %s result read failed rc=%d", name,
 			     (u64)(rc < 0 ? -rc : rc));
-			pwrap_write16(MT6358_AUXADC_RQST0, 0);
+			auxadc_stop();
 			return rc;
 		}
 		if ((v >> AUXADC_RDY_SHIFT) & 1u) {
 			*out = v & ((1u << res) - 1u);
-			pwrap_write16(MT6358_AUXADC_RQST0, 0);
+			auxadc_stop();
 			return 0;
 		}
 		delay_us(AUXADC_POLL_US);
 	}
 
 	*out = v & ((1u << res) - 1u);
-	pwrap_write16(MT6358_AUXADC_RQST0, 0);
+	auxadc_stop();
 	logf("BAT: %s timeout last=%x", name, (u64)v);
 	return -3;
 }
