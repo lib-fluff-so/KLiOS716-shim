@@ -33,6 +33,9 @@ typedef __builtin_va_list va_list;
 #ifndef BATTERY_TEST
 #define BATTERY_TEST 0
 #endif
+#ifndef CHARGER_WRITE_TEST
+#define CHARGER_WRITE_TEST 0
+#endif
 #ifndef AUTO_REBOOT_TEST
 #if XNU_PAYLOAD
 #define AUTO_REBOOT_TEST 0
@@ -812,7 +815,11 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
 #if WDT_DISABLE_AT_HANDOFF
     wdt_disable();
 #endif
+#if CHARGER_WRITE_TEST
+    logf("BATTERY TEST: charger write/readback + MT6366 AUXADC probe (XNU will not be loaded)");
+#else
     logf("BATTERY TEST: charger i2c + MT6366 AUXADC read-only probe (XNU will not be loaded)");
+#endif
     battery_test();
     logf("BATTERY TEST: probe returned");
 #if AUTO_REBOOT_TEST
