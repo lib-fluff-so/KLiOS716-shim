@@ -34,6 +34,10 @@
 #include "console.h"
 #include "battery_test.h"
 
+#ifndef CHARGER_WRITE_TEST
+#define CHARGER_WRITE_TEST 0
+#endif
+
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
@@ -474,6 +478,93 @@ i2c5_read_reg(u8 addr, u8 reg, u8 *val, u16 *stat_out)
 	return 0;
 }
 
+#if CHARGER_WRITE_TEST
+/* Write one SGM41516D register.  This is a plain two-byte FIFO write:
+ * register address followed by the value, one I2C transaction. */
+static int
+i2c5_write_reg(u8 addr, u8 reg, u8 val, u16 *stat_out)
+{
+	u16 ctl, stat;
+	u64 start, timeout;
+
+	ctl = i2c5_rd16(I2C_CONTROL);
+	ctl &= (u16)~(I2C_CTRL_DMA_EN | I2C_CTRL_DMAACK | I2C_CTRL_ASYNC |
+		      I2C_CTRL_DIR_CHANGE | I2C_CTRL_RS);
+	ctl |= (u16)(I2C_CTRL_ACKERR | I2C_CTRL_CLK_EXT);
+	i2c5_wr16(I2C_CONTROL, ctl);
+	i2c5_wr16(I2C_SLAVE_ADDR1, (u16)((u16)addr << 1));
+	i2c5_wr16(I2C_INTR_STAT, I2C_INTR_ALL);
+	i2c5_wr16(I2C_FIFO_ADDR_CLR, I2C_FIFO_ADDR_CLR_VAL);
+	i2c5_wr16(I2C_INTR_MASK, I2C_INTR_ALL);
+	i2c5_wr16(I2C_TRANSFER_LEN, 2);
+	i2c5_wr16(I2C_TRANSFER_LEN_AUX, 0);
+	i2c5_wr16(I2C_TRANSAC_LEN, 1);
+	i2c5_wr8(I2C_DATA_PORT, reg);
+	i2c5_wr8(I2C_DATA_PORT, val);
+	i2c5_wr16(I2C_START, I2C_START_TRANSAC);
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	timeout = (u64)I2C5_TIMEOUT_US * timer_freq() / 1000000u;
+	start = ticks();
+	for (;;) {
+		stat = i2c5_rd16(I2C_INTR_STAT);
+		if (stat & (I2C_INTR_COMP | I2C_INTR_ACKERR |
+			    I2C_INTR_HS_NACKERR | I2C_INTR_ARB_LOST))
+			break;
+		if (ticks() - start >= timeout) {
+			*stat_out = stat;
+			i2c5_wr16(I2C_INTR_MASK, 0xffffu);
+			i2c5_reset();
+			return -1;
+		}
+	}
+	*stat_out = stat;
+	i2c5_wr16(I2C_INTR_MASK, 0xffffu);
+	if (stat & (I2C_INTR_ACKERR | I2C_INTR_HS_NACKERR |
+		    I2C_INTR_ARB_LOST)) {
+		i2c5_reset();
+		return -2;
+	}
+	if (!(stat & I2C_INTR_COMP)) {
+		i2c5_reset();
+		return -3;
+	}
+	i2c5_wr16(I2C_INTR_STAT, I2C_INTR_ALL);
+	i2c5_wr16(I2C_START, 0);
+	i2c5_wr16(I2C_FIFO_ADDR_CLR, I2C_FIFO_ADDR_CLR_VAL);
+	return 0;
+}
+
+static u32
+sgm_cv_mv(u8 reg04, u8 reg0f)
+{
+	u32 n = ((u32)reg04 >> 3) & 0x1fu;
+	u32 mv;
+
+	if (n == 15u)
+		mv = 4352u;
+	else {
+		if (n > 24u)
+			n = 24u;
+		mv = 3856u + 32u * n;
+	}
+	switch ((reg0f >> 6) & 3u) {
+	case 1u:
+		mv += 8u;
+		break;
+	case 2u:
+		mv -= 8u;
+		break;
+	case 3u:
+		mv -= 16u;
+		break;
+	default:
+		break;
+	}
+	return mv;
+}
+#endif /* CHARGER_WRITE_TEST */
+
 static void
 charger_test(void)
 {
@@ -485,8 +576,14 @@ charger_test(void)
 	int rc;
 
 	__asm__ volatile("msr daifset, #0xf" ::: "memory");
+#if CHARGER_WRITE_TEST
+	logf("CHG: SGM41516D write/readback probe over i2c5 addr=6b");
+	logf("CHG: targets 4.200 V, 480 mA, IINDPM 500 mA, OTG off");
+	logf("CHG: IRQs masked; watchdog 160 s petted; boot-arg gated in XNU");
+#else
 	logf("CHG: read-only SGM41516D probe over i2c5 addr=6b");
 	logf("CHG: IRQs masked; charger data writes disabled");
+#endif
 
 	gpio_off = GPIO_MODE_REG(I2C5_SCL_GPIO);
 	scl_shift = GPIO_MODE_SHIFT(I2C5_SCL_GPIO);
@@ -600,6 +697,107 @@ charger_test(void)
 		     (u64)((regs[8] >> 1) & 1u), (u64)(regs[8] & 1u));
 		logf("CHG: fault9=%x id_a=%x id_b=%x",
 		     (u64)regs[9], (u64)regs[10], (u64)regs[11]);
+#if CHARGER_WRITE_TEST
+		if (regs[9] != 0u) {
+			logf("CHG: fault9=%x; refusing write test",
+			     (u64)regs[9]);
+		} else {
+			u8 exp00 = (u8)((regs[0] & 0x60u) | 0x04u);
+			u8 exp01 = (u8)((regs[1] & (u8)~0x60u) | 0x10u);
+			u8 exp02 = (u8)((regs[2] & 0xc0u) | 0x08u);
+			u8 exp04 = (u8)((regs[4] & 0x07u) | (11u << 3));
+			u8 exp05 = (u8)((regs[5] & (u8)~0x30u) | 0x30u);
+			u8 exp0f = (u8)((regs[0x0f] & 0x3fu) | 0x80u);
+			const u8 wr_reg[6] = { 0x01u, 0x04u, 0x0fu,
+					       0x02u, 0x05u, 0x00u };
+			const u8 wr_val[6] = { exp01, exp04, exp0f,
+					       exp02, exp05, exp00 };
+			u8 rb[16];
+			u32 wr_ok = 0, rb_ok = 0, verify = 0, cv_mv;
+
+			logf("CHG: expected 00=%x 01=%x 02=%x 04=%x 05=%x 0f=%x",
+			     (u64)exp00, (u64)exp01, (u64)exp02,
+			     (u64)exp04, (u64)exp05, (u64)exp0f);
+			for (i = 0; i < 6u; i++) {
+				rc = i2c5_write_reg(I2C5_SLAVE_ADDR,
+						    wr_reg[i], wr_val[i],
+						    &stat);
+				if (rc) {
+					logf("CHG: wr[%x]=%x FAILED rc=%d stat=%x",
+					     (u64)wr_reg[i], (u64)wr_val[i],
+					     (u64)(rc < 0 ? -rc : rc),
+					     (u64)stat);
+					break;
+				}
+				wr_ok++;
+				logf("CHG: wr[%x]=%x ok stat=%x",
+				     (u64)wr_reg[i], (u64)wr_val[i],
+				     (u64)stat);
+				delay_us(1000u);
+			}
+
+			if (wr_ok == 6u) {
+				rc = i2c5_write_reg(I2C5_SLAVE_ADDR, 0x01u,
+						    (u8)(exp01 | 0x40u),
+						    &stat);
+				logf("CHG: wdt pet rc=%d stat=%x",
+				     (u64)(rc < 0 ? -rc : rc), (u64)stat);
+				delay_us(1000u);
+				rc = i2c5_write_reg(I2C5_SLAVE_ADDR, 0x01u,
+						    exp01, &stat);
+				logf("CHG: wdt pet clear rc=%d stat=%x",
+				     (u64)(rc < 0 ? -rc : rc), (u64)stat);
+				delay_us(1000u);
+			}
+
+			for (i = 0; i < 16u; i++) {
+				rc = i2c5_read_reg(I2C5_SLAVE_ADDR, (u8)i,
+						   &rb[i], &stat);
+				if (rc) {
+					logf("CHG: rb[%x] FAILED rc=%d stat=%x",
+					     (u64)i,
+					     (u64)(rc < 0 ? -rc : rc),
+					     (u64)stat);
+					break;
+				}
+				rb_ok++;
+				delay_us(100u);
+			}
+			if (rb_ok == 16u) {
+				logf("CHG: rb regs00-07 %x %x %x %x %x %x %x %x",
+				     (u64)rb[0], (u64)rb[1], (u64)rb[2],
+				     (u64)rb[3], (u64)rb[4], (u64)rb[5],
+				     (u64)rb[6], (u64)rb[7]);
+				logf("CHG: rb regs08-0f %x %x %x %x %x %x %x %x",
+				     (u64)rb[8], (u64)rb[9], (u64)rb[10],
+				     (u64)rb[11], (u64)rb[12], (u64)rb[13],
+				     (u64)rb[14], (u64)rb[15]);
+				cv_mv = sgm_cv_mv(rb[4], rb[0x0f]);
+				verify += (rb[0] == exp00);
+				verify += ((rb[1] & (u8)~0x40u) ==
+					   (exp01 & (u8)~0x40u));
+				verify += (rb[2] == exp02);
+				verify += (rb[4] == exp04);
+				verify += (rb[5] == exp05);
+				verify += (rb[0x0f] == exp0f);
+				verify += (rb[9] == 0u);
+				logf("CHG: verify cv=%d mV ichg=%d mA iindpm=%d mA otg=%d chg=%d wdt=%d wdrst=%d fault=%x",
+				     (u64)cv_mv,
+				     (u64)(((u32)rb[2] & 0x3fu) * 60u),
+				     (u64)(100u + 100u * ((u32)rb[0] & 0x1fu)),
+				     (u64)(((u32)rb[1] >> 5) & 1u),
+				     (u64)(((u32)rb[1] >> 4) & 1u),
+				     (u64)(((u32)rb[5] >> 4) & 3u),
+				     (u64)(((u32)rb[1] >> 6) & 1u),
+				     (u64)rb[9]);
+				logf("CHG: write test done wr=%d/6 rb=%d/16 verify=%d/7",
+				     (u64)wr_ok, (u64)rb_ok, (u64)verify);
+			} else {
+				logf("CHG: write test readback %d/16",
+				     (u64)rb_ok);
+			}
+		}
+#endif /* CHARGER_WRITE_TEST */
 	} else {
 		logf("CHG: read %d/16; partial dump above", (u64)ok);
 	}
