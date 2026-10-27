@@ -812,7 +812,7 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
 #if WDT_DISABLE_AT_HANDOFF
     wdt_disable();
 #endif
-    logf("BATTERY TEST: MT6366 AUXADC read-only probe (XNU will not be loaded)");
+    logf("BATTERY TEST: charger i2c + MT6366 AUXADC read-only probe (XNU will not be loaded)");
     battery_test();
     logf("BATTERY TEST: probe returned");
 #if AUTO_REBOOT_TEST

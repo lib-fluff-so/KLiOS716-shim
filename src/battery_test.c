@@ -2,11 +2,15 @@
  * Read-only battery telemetry probe for KL7 (MT6789 + MT6366 PMIC).
  *
  * The PMIC is reached through the MT6789 PMIC wrapper at 0x10026000, using
- * the same WACS2 sequence as the working key/vibrator code in XNU.  This
- * probe only reads PMIC state and issues a normal AUXADC conversion request
- * for the battery, battery-temperature and chip-temperature channels.  It
- * does not touch the SGM41516D charger, the charger watchdog or any charging
- * setting.
+ * the same WACS2 sequence as the working key/vibrator code in XNU.  The
+ * AUXADC part only reads PMIC state and issues a normal AUXADC conversion
+ * request for the battery, battery-temperature and chip-temperature channels.
+ * It does not touch the SGM41516D charger, the charger watchdog or any
+ * charging setting.
+ *
+ * The second part is a separate SGM41516D probe over i2c5.  It is read-only:
+ * registers 0x00..0x0f are read with a register-address write followed by a
+ * repeated-start read.  No charger configuration register is written.
  *
  * AUXADC facts come from the MT6358 vendor/mainline driver:
  *   BATADC   : request RQST0 bit 0, output ADC0, 15-bit, ratio 3:1
@@ -30,6 +34,7 @@
 #include "console.h"
 #include "battery_test.h"
 
+typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
 typedef unsigned long long u64;
@@ -66,6 +71,108 @@ typedef unsigned long long u64;
 #define AUXADC_MAX_POLLS	160u
 #define AUXADC_POLL_US		150u
 #define AUXADC_VOLT_FULL	1800u
+
+/*
+ * SGM41516D on i2c5 (0x11017000), address 0x6b.
+ *
+ * Clock tree from the live DTB and the downstream MT6789 clock driver:
+ *   topckgen i2c_sel (CLK_CFG_10) -> i2c_ck -> ifrao_i2c_pseudo
+ *   -> i2c_pseudo_ck -> impc_ap_clock_i2c5
+ * The top mux is gated by CLK_CFG_10 bit 15 in the active clock table.
+ * Gate enable is a write to the CLR register; status 0 means enabled.
+ *
+ * Pinmux: SCL5 = GPIO140, SDA5 = GPIO141, function 1.
+ *
+ * i2c controller offsets are the mt6983/mt_i2c_regs_v2 layout from
+ * drivers/i2c/busses/i2c-mt65xx.c.  A 400 kHz transfer is used because the
+ * driver's AC-timing search cannot produce a valid 100 kHz setting from the
+ * 124.8 MHz parent with this controller.
+ */
+#define I2C5_BASE		0x11017000UL
+#define TOPCKGEN_BASE		0x10000000UL
+#define INFRACFG_AO_BASE	0x10001000UL
+#define IMP_IIC_WRAP_C_BASE	0x1101b000UL
+#define GPIO_BASE		0x10005000UL
+
+#define TOP_CLK_CFG_10		0x00b0u
+#define TOP_CLK_CFG_10_SET	0x00b4u
+#define TOP_CLK_CFG_10_CLR	0x00b8u
+#define TOP_CLK_CFG_UPDATE1	0x0008u
+#define TOP_I2C_MUX_SHIFT	8u
+#define TOP_I2C_MUX_MASK	0x0300u
+#define TOP_I2C_MUX_UPDATE	10u
+#define TOP_I2C_MUX_GATE	15u
+#define TOP_I2C_PARENT_MAINPLL	1u
+#define I2C_MUX_UPDATE_BIT	(1u << TOP_I2C_MUX_UPDATE)
+#define I2C_MUX_GATE_BIT	(1u << TOP_I2C_MUX_GATE)
+
+#define IFRAO_GATE_CLR		0x0084u
+#define IFRAO_GATE_STA		0x0090u
+#define IFRAO_I2C_PSEUDO_BIT	(1u << 11)
+#define IMPC_GATE_CLR		0x0e04u
+#define IMPC_GATE_STA		0x0e00u
+#define IMPC_I2C5_BIT		(1u << 1)
+
+#define I2C5_SCL_GPIO		140u
+#define I2C5_SDA_GPIO		141u
+#define I2C5_PIN_FUNC		1u
+#define GPIO_MODE_REG(pin)	(0x0300u + ((u32)(pin) / 8u) * 0x10u)
+#define GPIO_MODE_SHIFT(pin)	(((u32)(pin) % 8u) * 4u)
+#define GPIO_MODE_MASK		0x0fu
+
+#define I2C5_SLAVE_ADDR		0x6bu
+
+#define I2C_DATA_PORT		0x0000u
+#define I2C_SLAVE_ADDR1		0x0094u
+#define I2C_INTR_MASK		0x0008u
+#define I2C_INTR_STAT		0x000cu
+#define I2C_CONTROL		0x0010u
+#define I2C_TRANSFER_LEN	0x0014u
+#define I2C_TRANSAC_LEN		0x0018u
+#define I2C_DELAY_LEN		0x001cu
+#define I2C_TIMING		0x0020u
+#define I2C_START		0x0024u
+#define I2C_EXT_CONF		0x0028u
+#define I2C_LTIMING		0x002cu
+#define I2C_HS			0x0030u
+#define I2C_IO_CONFIG		0x0034u
+#define I2C_FIFO_ADDR_CLR	0x0038u
+#define I2C_SDA_TIMING		0x003cu
+#define I2C_TRANSFER_LEN_AUX	0x0044u
+#define I2C_CLOCK_DIV		0x0048u
+#define I2C_SOFTRESET		0x0050u
+#define I2C_SCL_MIS_COMP_POINT	0x0090u
+#define I2C_FIFO_STAT		0x00f4u
+#define I2C_DEBUGSTAT		0x00e4u
+
+#define I2C_CTRL_RS		(1u << 1)
+#define I2C_CTRL_DMA_EN		(1u << 2)
+#define I2C_CTRL_CLK_EXT	(1u << 3)
+#define I2C_CTRL_DIR_CHANGE	(1u << 4)
+#define I2C_CTRL_ACKERR		(1u << 5)
+#define I2C_CTRL_DMAACK		(1u << 8)
+#define I2C_CTRL_ASYNC		(1u << 9)
+
+#define I2C_INTR_ARB_LOST	(1u << 3)
+#define I2C_INTR_HS_NACKERR	(1u << 2)
+#define I2C_INTR_ACKERR		(1u << 1)
+#define I2C_INTR_COMP		(1u << 0)
+#define I2C_INTR_ALL		0x001fu
+
+#define I2C_START_TRANSAC	(1u << 0)
+#define I2C_SOFT_RST		(1u << 0)
+#define I2C_FIFO_ADDR_CLR_VAL	(1u << 0)
+#define I2C_IO_OPEN_DRAIN	0x0003u
+#define I2C_CONTROL_FIFO	(I2C_CTRL_ACKERR | I2C_CTRL_CLK_EXT)
+#define I2C_DELAY_LEN_VAL	0x0002u
+
+/* 400 kHz from 124.8 MHz (mtk_i2c_calculate_speed + check_ac_timing). */
+#define I2C5_TIMING_400K	0x0229u
+#define I2C5_LTIMING_400K	0x00bdu
+#define I2C5_EXT_CONF_400K	0x5e01u
+#define I2C5_SDA_TIMING_400K	0x100fu
+
+#define I2C5_TIMEOUT_US		100000u
 
 static u64
 ticks(void)
@@ -226,6 +333,287 @@ log_adc_mv(const char *name, u32 raw, u32 r0, u32 r1, u32 res)
 	     mv10 / 10u, mv10 % 10u);
 }
 
+static u32
+reg_rd32(u64 base, u32 off)
+{
+	u32 v = *(volatile u32 *)(base + off);
+
+	__asm__ volatile("dmb oshld" ::: "memory");
+	return v;
+}
+
+static void
+reg_wr32(u64 base, u32 off, u32 val)
+{
+	__asm__ volatile("dmb oshst" ::: "memory");
+	*(volatile u32 *)(base + off) = val;
+	__asm__ volatile("dsb osh" ::: "memory");
+}
+
+static u16
+i2c5_rd16(u32 off)
+{
+	u16 v = *(volatile u16 *)(I2C5_BASE + off);
+
+	__asm__ volatile("dmb oshld" ::: "memory");
+	return v;
+}
+
+static void
+i2c5_wr16(u32 off, u16 val)
+{
+	__asm__ volatile("dmb oshst" ::: "memory");
+	*(volatile u16 *)(I2C5_BASE + off) = val;
+	__asm__ volatile("dsb osh" ::: "memory");
+}
+
+static u8
+i2c5_rd8(u32 off)
+{
+	u8 v = *(volatile u8 *)(I2C5_BASE + off);
+
+	__asm__ volatile("dmb oshld" ::: "memory");
+	return v;
+}
+
+static void
+i2c5_wr8(u32 off, u8 val)
+{
+	__asm__ volatile("dmb oshst" ::: "memory");
+	*(volatile u8 *)(I2C5_BASE + off) = val;
+	__asm__ volatile("dsb osh" ::: "memory");
+}
+
+static void
+i2c5_reset(void)
+{
+	i2c5_wr16(I2C_START, 0);
+	i2c5_wr16(I2C_INTR_STAT, I2C_INTR_ALL);
+	i2c5_wr16(I2C_SOFTRESET, I2C_SOFT_RST);
+	delay_us(50);
+	i2c5_wr16(I2C_SOFTRESET, 0);
+	delay_us(50);
+	i2c5_wr16(I2C_INTR_MASK, 0xffffu);
+	i2c5_wr16(I2C_FIFO_ADDR_CLR, I2C_FIFO_ADDR_CLR_VAL);
+}
+
+static void
+i2c5_init(void)
+{
+	i2c5_reset();
+	i2c5_wr16(I2C_IO_CONFIG, I2C_IO_OPEN_DRAIN);
+	i2c5_wr16(I2C_TIMING, I2C5_TIMING_400K);
+	i2c5_wr16(I2C_HS, 0);
+	i2c5_wr16(I2C_LTIMING, I2C5_LTIMING_400K);
+	i2c5_wr16(I2C_CLOCK_DIV, 0);
+	i2c5_wr16(I2C_SCL_MIS_COMP_POINT, 0);
+	i2c5_wr16(I2C_SDA_TIMING, I2C5_SDA_TIMING_400K);
+	i2c5_wr16(I2C_EXT_CONF, I2C5_EXT_CONF_400K);
+	i2c5_wr16(I2C_CONTROL, I2C_CONTROL_FIFO);
+	i2c5_wr16(I2C_DELAY_LEN, I2C_DELAY_LEN_VAL);
+	i2c5_wr16(I2C_TRANSFER_LEN, 0);
+	i2c5_wr16(I2C_TRANSFER_LEN_AUX, 0);
+	i2c5_wr16(I2C_TRANSAC_LEN, 0);
+	i2c5_wr16(I2C_INTR_MASK, 0xffffu);
+	i2c5_wr16(I2C_FIFO_ADDR_CLR, I2C_FIFO_ADDR_CLR_VAL);
+}
+
+/* Read one SGM41516D register.  This is a combined write-address/read-data
+ * transfer: the only byte sent to the charger is the register number. */
+static int
+i2c5_read_reg(u8 addr, u8 reg, u8 *val, u16 *stat_out)
+{
+	u16 ctl, stat;
+	u64 start, timeout;
+
+	ctl = i2c5_rd16(I2C_CONTROL);
+	ctl &= (u16)~(I2C_CTRL_DMA_EN | I2C_CTRL_DMAACK | I2C_CTRL_ASYNC);
+	ctl |= (u16)(I2C_CTRL_DIR_CHANGE | I2C_CTRL_RS | I2C_CTRL_ACKERR |
+		     I2C_CTRL_CLK_EXT);
+	i2c5_wr16(I2C_CONTROL, ctl);
+	i2c5_wr16(I2C_SLAVE_ADDR1, (u16)((u16)addr << 1));
+	i2c5_wr16(I2C_INTR_STAT, I2C_INTR_ALL);
+	i2c5_wr16(I2C_FIFO_ADDR_CLR, I2C_FIFO_ADDR_CLR_VAL);
+	i2c5_wr16(I2C_INTR_MASK, I2C_INTR_ALL);
+	i2c5_wr16(I2C_TRANSFER_LEN, 1);
+	i2c5_wr16(I2C_TRANSFER_LEN_AUX, 1);
+	i2c5_wr16(I2C_TRANSAC_LEN, 2);
+	i2c5_wr8(I2C_DATA_PORT, reg);
+	i2c5_wr16(I2C_START, I2C_START_TRANSAC);
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	timeout = (u64)I2C5_TIMEOUT_US * timer_freq() / 1000000u;
+	start = ticks();
+	for (;;) {
+		stat = i2c5_rd16(I2C_INTR_STAT);
+		if (stat & (I2C_INTR_COMP | I2C_INTR_ACKERR |
+			    I2C_INTR_HS_NACKERR | I2C_INTR_ARB_LOST))
+			break;
+		if (ticks() - start >= timeout) {
+			*stat_out = stat;
+			i2c5_wr16(I2C_INTR_MASK, 0xffffu);
+			i2c5_reset();
+			return -1;
+		}
+	}
+	*stat_out = stat;
+	i2c5_wr16(I2C_INTR_MASK, 0xffffu);
+	if (stat & (I2C_INTR_ACKERR | I2C_INTR_HS_NACKERR |
+		    I2C_INTR_ARB_LOST)) {
+		i2c5_reset();
+		return -2;
+	}
+	if (!(stat & I2C_INTR_COMP)) {
+		i2c5_reset();
+		return -3;
+	}
+	*val = i2c5_rd8(I2C_DATA_PORT);
+	i2c5_wr16(I2C_INTR_STAT, I2C_INTR_ALL);
+	i2c5_wr16(I2C_START, 0);
+	i2c5_wr16(I2C_FIFO_ADDR_CLR, I2C_FIFO_ADDR_CLR_VAL);
+	return 0;
+}
+
+static void
+charger_test(void)
+{
+	u32 top_pre, ifrao_pre, impc_pre, gpio_pre, gpio_now, gpio_new;
+	u32 gpio_off, scl_shift, sda_shift;
+	u16 stat = 0;
+	u8 regs[16];
+	u32 i, ok = 0;
+	int rc;
+
+	__asm__ volatile("msr daifset, #0xf" ::: "memory");
+	logf("CHG: read-only SGM41516D probe over i2c5 addr=6b");
+	logf("CHG: IRQs masked; charger data writes disabled");
+
+	gpio_off = GPIO_MODE_REG(I2C5_SCL_GPIO);
+	scl_shift = GPIO_MODE_SHIFT(I2C5_SCL_GPIO);
+	sda_shift = GPIO_MODE_SHIFT(I2C5_SDA_GPIO);
+
+	top_pre = reg_rd32(TOPCKGEN_BASE, TOP_CLK_CFG_10);
+	ifrao_pre = reg_rd32(INFRACFG_AO_BASE, IFRAO_GATE_STA);
+	impc_pre = reg_rd32(IMP_IIC_WRAP_C_BASE, IMPC_GATE_STA);
+	gpio_pre = reg_rd32(GPIO_BASE, gpio_off);
+	logf("CHG: pre top=%x mux=%d gate=%d ifrao=%x impc=%x gpio=%x",
+	     (u64)top_pre, (u64)((top_pre >> TOP_I2C_MUX_SHIFT) & 3u),
+	     (u64)((top_pre >> TOP_I2C_MUX_GATE) & 1u), (u64)ifrao_pre,
+	     (u64)impc_pre, (u64)gpio_pre);
+	logf("CHG: gpio old scl=%d sda=%d",
+	     (u64)((gpio_pre >> scl_shift) & GPIO_MODE_MASK),
+	     (u64)((gpio_pre >> sda_shift) & GPIO_MODE_MASK));
+
+	if (((top_pre >> TOP_I2C_MUX_SHIFT) & 3u) != TOP_I2C_PARENT_MAINPLL) {
+		reg_wr32(TOPCKGEN_BASE, TOP_CLK_CFG_10_CLR, TOP_I2C_MUX_MASK);
+		reg_wr32(TOPCKGEN_BASE, TOP_CLK_CFG_10_SET,
+			 TOP_I2C_PARENT_MAINPLL << TOP_I2C_MUX_SHIFT);
+		reg_wr32(TOPCKGEN_BASE, TOP_CLK_CFG_UPDATE1, I2C_MUX_UPDATE_BIT);
+		delay_us(20);
+	}
+	reg_wr32(TOPCKGEN_BASE, TOP_CLK_CFG_10_CLR, I2C_MUX_GATE_BIT);
+	reg_wr32(TOPCKGEN_BASE, TOP_CLK_CFG_UPDATE1, I2C_MUX_UPDATE_BIT);
+	reg_wr32(INFRACFG_AO_BASE, IFRAO_GATE_CLR, IFRAO_I2C_PSEUDO_BIT);
+	reg_wr32(IMP_IIC_WRAP_C_BASE, IMPC_GATE_CLR, IMPC_I2C5_BIT);
+	delay_us(50);
+
+	top_pre = reg_rd32(TOPCKGEN_BASE, TOP_CLK_CFG_10);
+	ifrao_pre = reg_rd32(INFRACFG_AO_BASE, IFRAO_GATE_STA);
+	impc_pre = reg_rd32(IMP_IIC_WRAP_C_BASE, IMPC_GATE_STA);
+	logf("CHG: clk post top=%x mux=%d gate=%d ifrao=%x impc=%x",
+	     (u64)top_pre, (u64)((top_pre >> TOP_I2C_MUX_SHIFT) & 3u),
+	     (u64)((top_pre >> TOP_I2C_MUX_GATE) & 1u), (u64)ifrao_pre,
+	     (u64)impc_pre);
+	if (((top_pre >> TOP_I2C_MUX_SHIFT) & 3u) != TOP_I2C_PARENT_MAINPLL ||
+	    ((top_pre >> TOP_I2C_MUX_GATE) & 1u) != 0u ||
+	    (ifrao_pre & IFRAO_I2C_PSEUDO_BIT) != 0u ||
+	    (impc_pre & IMPC_I2C5_BIT) != 0u) {
+		logf("CHG: clock enable not confirmed; i2c untouched");
+		return;
+	}
+
+	gpio_new = gpio_pre;
+	gpio_new &= ~(GPIO_MODE_MASK << scl_shift);
+	gpio_new |= I2C5_PIN_FUNC << scl_shift;
+	gpio_new &= ~(GPIO_MODE_MASK << sda_shift);
+	gpio_new |= I2C5_PIN_FUNC << sda_shift;
+	if (gpio_new != gpio_pre)
+		reg_wr32(GPIO_BASE, gpio_off, gpio_new);
+	delay_us(20);
+	gpio_now = reg_rd32(GPIO_BASE, gpio_off);
+	logf("CHG: gpio new scl=%d sda=%d reg=%x",
+	     (u64)((gpio_now >> scl_shift) & GPIO_MODE_MASK),
+	     (u64)((gpio_now >> sda_shift) & GPIO_MODE_MASK),
+	     (u64)gpio_now);
+	if (((gpio_now >> scl_shift) & GPIO_MODE_MASK) != I2C5_PIN_FUNC ||
+	    ((gpio_now >> sda_shift) & GPIO_MODE_MASK) != I2C5_PIN_FUNC) {
+		logf("CHG: pinmux not confirmed; restoring and aborting");
+		reg_wr32(GPIO_BASE, gpio_off, gpio_pre);
+		return;
+	}
+
+	logf("CHG: i2c pre sa=%x ctl=%x tl=%x aux=%x txn=%x start=%x stat=%x mask=%x",
+	     (u64)i2c5_rd16(I2C_SLAVE_ADDR1), (u64)i2c5_rd16(I2C_CONTROL),
+	     (u64)i2c5_rd16(I2C_TRANSFER_LEN),
+	     (u64)i2c5_rd16(I2C_TRANSFER_LEN_AUX),
+	     (u64)i2c5_rd16(I2C_TRANSAC_LEN), (u64)i2c5_rd16(I2C_START),
+	     (u64)i2c5_rd16(I2C_INTR_STAT), (u64)i2c5_rd16(I2C_INTR_MASK));
+	logf("CHG: i2c pre timing=%x ltiming=%x hs=%x ext=%x clkdiv=%x sda=%x io=%x fifo=%x dbg=%x",
+	     (u64)i2c5_rd16(I2C_TIMING), (u64)i2c5_rd16(I2C_LTIMING),
+	     (u64)i2c5_rd16(I2C_HS), (u64)i2c5_rd16(I2C_EXT_CONF),
+	     (u64)i2c5_rd16(I2C_CLOCK_DIV), (u64)i2c5_rd16(I2C_SDA_TIMING),
+	     (u64)i2c5_rd16(I2C_IO_CONFIG), (u64)i2c5_rd16(I2C_FIFO_STAT),
+	     (u64)i2c5_rd16(I2C_DEBUGSTAT));
+
+	i2c5_init();
+	logf("CHG: i2c init ctl=%x timing=%x ltiming=%x hs=%x ext=%x clkdiv=%x sda=%x io=%x",
+	     (u64)i2c5_rd16(I2C_CONTROL), (u64)i2c5_rd16(I2C_TIMING),
+	     (u64)i2c5_rd16(I2C_LTIMING), (u64)i2c5_rd16(I2C_HS),
+	     (u64)i2c5_rd16(I2C_EXT_CONF), (u64)i2c5_rd16(I2C_CLOCK_DIV),
+	     (u64)i2c5_rd16(I2C_SDA_TIMING), (u64)i2c5_rd16(I2C_IO_CONFIG));
+
+	for (i = 0; i < 16u; i++) {
+		rc = i2c5_read_reg(I2C5_SLAVE_ADDR, (u8)i, &regs[i], &stat);
+		if (rc) {
+			logf("CHG: reg[%x] FAILED rc=%d stat=%x", (u64)i,
+			     (u64)(rc < 0 ? -rc : rc), (u64)stat);
+			break;
+		}
+		ok++;
+		logf("CHG: reg[%x]=%x stat=%x", (u64)i, (u64)regs[i],
+		     (u64)stat);
+		delay_us(100);
+	}
+
+	if (ok == 16u) {
+		logf("CHG: read 16/16");
+		logf("CHG: regs00-07 %x %x %x %x %x %x %x %x",
+		     (u64)regs[0], (u64)regs[1], (u64)regs[2], (u64)regs[3],
+		     (u64)regs[4], (u64)regs[5], (u64)regs[6], (u64)regs[7]);
+		logf("CHG: regs08-0f %x %x %x %x %x %x %x %x",
+		     (u64)regs[8], (u64)regs[9], (u64)regs[10], (u64)regs[11],
+		     (u64)regs[12], (u64)regs[13], (u64)regs[14], (u64)regs[15]);
+		logf("CHG: android ref 04 9b 88 73 98 bf b7 4b 34 00 a0 74 75 01 00 c0");
+		logf("CHG: status8=%x chgstat=%d pg=%d vbus=%d therm=%d vsys=%d",
+		     (u64)regs[8], (u64)((regs[8] >> 3) & 3u),
+		     (u64)((regs[8] >> 2) & 1u), (u64)((regs[8] >> 5) & 7u),
+		     (u64)((regs[8] >> 1) & 1u), (u64)(regs[8] & 1u));
+		logf("CHG: fault9=%x id_a=%x id_b=%x",
+		     (u64)regs[9], (u64)regs[10], (u64)regs[11]);
+	} else {
+		logf("CHG: read %d/16; partial dump above", (u64)ok);
+	}
+
+	i2c5_reset();
+	reg_wr32(GPIO_BASE, gpio_off, gpio_pre);
+	delay_us(20);
+	logf("CHG: gpio restored=%x", (u64)reg_rd32(GPIO_BASE, gpio_off));
+	logf("CHG: i2c post start=%x stat=%x fifo=%x dbg=%x",
+	     (u64)i2c5_rd16(I2C_START), (u64)i2c5_rd16(I2C_INTR_STAT),
+	     (u64)i2c5_rd16(I2C_FIFO_STAT), (u64)i2c5_rd16(I2C_DEBUGSTAT));
+	logf("CHG: probe done ok=%d/16, clocks left for PSCI reset", (u64)ok);
+}
+
 void
 battery_test(void)
 {
@@ -236,6 +624,8 @@ battery_test(void)
 	u32 vbat = 0, battemp = 0, chiptemp = 0, vcdt = 0;
 	u32 chip;
 	int vbat_ok, battemp_ok, chiptemp_ok, vcdt_ok;
+
+	charger_test();
 
 	init = pwrap_rd(PWRAP_INIT_DONE2);
 	rdata = pwrap_rd(PWRAP_WACS2_RDATA);
