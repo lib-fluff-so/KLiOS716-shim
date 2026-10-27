@@ -88,11 +88,12 @@ typedef __builtin_va_list va_list;
  * A watchdog reset loses DRAM/ramoops, so it must never fire first. */
 #define WDT_TIMEOUT_AT_HANDOFF 0u
 #endif
-/* WDT_DISABLE_AT_HANDOFF=1: stop the watchdog right before jumping to XNU so a
- * multi-minute kernel boot is not reset. Default on only for XNU_PAYLOAD=1;
- * the test build keeps the watchdog as a safety net. */
+/* WDT_DISABLE_AT_HANDOFF=1: stop the watchdog before a long-running path so a
+ * multi-minute kernel boot or a halted diagnostic is not reset. Default on for
+ * XNU_PAYLOAD=1 and BATTERY_TEST=1; the short auto-reset test builds keep the
+ * watchdog as a safety net. */
 #ifndef WDT_DISABLE_AT_HANDOFF
-#define WDT_DISABLE_AT_HANDOFF XNU_PAYLOAD
+#define WDT_DISABLE_AT_HANDOFF (XNU_PAYLOAD || BATTERY_TEST)
 #endif
 
 #define RD(reg) ({ u64 v_; __asm__ volatile("mrs %0, " #reg : "=r"(v_)); v_; })
@@ -808,6 +809,9 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
 #endif
 
 #if BATTERY_TEST
+#if WDT_DISABLE_AT_HANDOFF
+    wdt_disable();
+#endif
     logf("BATTERY TEST: MT6366 AUXADC read-only probe (XNU will not be loaded)");
     battery_test();
     logf("BATTERY TEST: probe returned");
