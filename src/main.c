@@ -16,6 +16,7 @@ typedef __builtin_va_list va_list;
 #include "xnu_payload.h"
 #include "ufs_test.h"
 #include "touch_test.h"
+#include "battery_test.h"
 
 #ifndef RAMOOPS_LOG
 #define RAMOOPS_LOG 1
@@ -28,6 +29,9 @@ typedef __builtin_va_list va_list;
 #endif
 #ifndef TOUCH_TEST
 #define TOUCH_TEST 0
+#endif
+#ifndef BATTERY_TEST
+#define BATTERY_TEST 0
 #endif
 #ifndef AUTO_REBOOT_TEST
 #if XNU_PAYLOAD
@@ -346,7 +350,7 @@ static __attribute__((noreturn)) void psci_system_reset(void)
 }
 #endif /* AUTO_REBOOT_TEST */
 
-#if AUTO_REBOOT_TEST || UFS_TEST
+#if AUTO_REBOOT_TEST || UFS_TEST || !XNU_PAYLOAD
 static __attribute__((noreturn)) void finish_test_attempt(const char *reason)
 {
 #if AUTO_REBOOT_TEST
@@ -799,6 +803,18 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
     finish_test_attempt("TOUCH probe done");
 #else
     logf("TOUCH TEST: halting (no reboot path)");
+    for (;;) __asm__ volatile("wfe");
+#endif
+#endif
+
+#if BATTERY_TEST
+    logf("BATTERY TEST: MT6366 AUXADC read-only probe (XNU will not be loaded)");
+    battery_test();
+    logf("BATTERY TEST: probe returned");
+#if AUTO_REBOOT_TEST
+    finish_test_attempt("BATTERY probe done");
+#else
+    logf("BATTERY TEST: halting (power-cycle to fastboot)");
     for (;;) __asm__ volatile("wfe");
 #endif
 #endif

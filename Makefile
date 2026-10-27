@@ -12,6 +12,7 @@ XNU_PAYLOAD ?= 0
 UFS_TEST ?= 0
 UFS_HS_GEAR ?= 3
 TOUCH_TEST ?= 0
+BATTERY_TEST ?= 0
 PSCI_RESET_TIMER ?= 0
 XNU_KERNEL ?=
 XNU_RAMDISK ?=
@@ -24,7 +25,7 @@ XNU_RAMDISK ?=
 XNU_CMDLINE ?= debug=0xc serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsroot=iosroot ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin wdt=-1 sweetfb_noconsole=1 sweetvib=300
 D22AP_ADT ?= research/ipsw-x/d22ap.adt
 
-CFLAGS += -DRAMOOPS_LOG=$(RAMOOPS_LOG) -DXNU_PAYLOAD=$(XNU_PAYLOAD) -DUFS_TEST=$(UFS_TEST) -DUFS_HS_GEAR=$(UFS_HS_GEAR) -DTOUCH_TEST=$(TOUCH_TEST) -DPSCI_RESET_TIMER=$(PSCI_RESET_TIMER)
+CFLAGS += -DRAMOOPS_LOG=$(RAMOOPS_LOG) -DXNU_PAYLOAD=$(XNU_PAYLOAD) -DUFS_TEST=$(UFS_TEST) -DUFS_HS_GEAR=$(UFS_HS_GEAR) -DTOUCH_TEST=$(TOUCH_TEST) -DBATTERY_TEST=$(BATTERY_TEST) -DPSCI_RESET_TIMER=$(PSCI_RESET_TIMER)
 ifneq ($(strip $(AUTO_REBOOT_TEST)),)
 CFLAGS += -DAUTO_REBOOT_TEST=$(AUTO_REBOOT_TEST)
 endif
@@ -67,7 +68,7 @@ $(OUT)/vectors.o: src/vectors.S | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/handoff.o: src/handoff.S | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(OUT)/main.o: src/main.c src/console.h src/memmap.h src/loader.h src/xnu_payload.h src/ufs_test.h | $(OUT)
+$(OUT)/main.o: src/main.c src/console.h src/memmap.h src/loader.h src/xnu_payload.h src/ufs_test.h src/touch_test.h src/battery_test.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/console.o: src/console.c src/console.h src/font.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -75,13 +76,15 @@ $(OUT)/ufs_test.o: src/ufs_test.c src/ufs_test.h src/console.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/touch_test.o: src/touch_test.c src/touch_test.h src/console.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
+$(OUT)/battery_test.o: src/battery_test.c src/battery_test.h src/console.h | $(OUT)
+	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/memmap.o: src/memmap.c src/memmap.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/loader.o: src/loader.c src/loader.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/xnu_payload.o: src/xnu_payload.c src/xnu_payload.h src/loader.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(OUT)/shim.elf: $(OUT)/start.o $(OUT)/vectors.o $(OUT)/handoff.o $(OUT)/main.o $(OUT)/console.o $(OUT)/memmap.o $(OUT)/loader.o $(OUT)/xnu_payload.o $(OUT)/ufs_test.o $(OUT)/touch_test.o link.ld
+$(OUT)/shim.elf: $(OUT)/start.o $(OUT)/vectors.o $(OUT)/handoff.o $(OUT)/main.o $(OUT)/console.o $(OUT)/memmap.o $(OUT)/loader.o $(OUT)/xnu_payload.o $(OUT)/ufs_test.o $(OUT)/touch_test.o $(OUT)/battery_test.o link.ld
 	$(LD) --gc-sections -nostdlib -T link.ld -o $@ $(filter %.o,$^)
 $(OUT)/Image: $(OUT)/shim.elf
 	$(OBJCOPY) -O binary $< $@
