@@ -97,10 +97,23 @@ several possibilities after ruling out a few descriptor/header mistakes:
    clear/render, then report clear/sentinel/other counts and a compact row/tile
    mask.
 
-The current `gpu_job_status_dump()` helper adds item 4 for the isolated
-fragment job. The next code step is to implement a separately gated,
-stage-by-stage `MALLOC_VERTEX_JOB` diagnostic rather than re-enabling the
-old suite or submitting vertex and fragment jobs with no intermediate evidence.
+The current `gpu_job_status_dump()` decodes the GPU-written exception
+status. The NOP vertex-shader attempt on the KL7 returned
+`status=0x00120258`: source ID `0x12`, access `READ`, exception
+`DATA_INVALID_FAULT` (`0x58`). The same log had `mraw=0`, `fstat=0` and
+`faddr=0`, so this was not an AS MMU translation fault.
+
+The original Vertex-stage `NOP.end` did not produce the required position
+output and was a bad baseline. The branch has since replaced it with a
+six-instruction position-store smoke shader:
+four register initialisations, `LEA_ATTR` into `r4:r5`, and
+`STORE.i128.pos` of `(0,0,0,1)`. Its code words and shader descriptor are
+logged before job submission. All three invocations are expected to write the
+same position, so a visible triangle is not expected.
+
+This replacement has **not yet been built or run**. The next measurement is
+whether the position-store job returns DONE and what happens to the tiler heap.
+Do not treat the previous NOP fault as the result of this newer shader.
 
 ## Current measured milestone
 
