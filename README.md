@@ -1,8 +1,8 @@
-# ios-kl7 v0.9.1
+# ios-kl7 v0.10.0
 
-Minimal ARM64 shim for the TECNO KL7 / MediaTek MT6789. This release focuses on the loader contract: read the live DTB and initrd, validate memory destinations, prepare either the test payload or a `SWEETXNU` container, then hand off with MMU/caches disabled. The shim no longer builds page tables, probes GIC/timers, or starts secondary CPUs.
+Minimal ARM64 shim for the TECNO KL7 / MediaTek MT6789. The v0.10.0 release keeps the compact loader contract: read the live DTB and initrd, validate memory destinations, prepare either the test payload or a `SWEETXNU` container, then hand off with MMU/caches disabled. It adds a PSCI reset timer and a watchdog backstop for warm-reset testing.
 
-## What v0.9.1 does
+## What v0.10.0 does
 
 - Displays shim log lines directly on the existing 1080x2436 framebuffer.
 - Sends the same lines to the KL7 ramoops console region.
@@ -11,8 +11,11 @@ Minimal ARM64 shim for the TECNO KL7 / MediaTek MT6789. This release focuses on 
 - Default test mode validates and launches `ios-kl7-test.bin`; the payload returns to the shim, which validates `HANDOFF PASS` and calls PSCI `SYSTEM_RESET` instead of halting. Any test-mode error also triggers an automatic reset, so a multi-try B-slot test does not require manual power-cycling.
 - Optional `XNU_PAYLOAD=1` mode parses `ios-kl7-xnu.bin`, preflights Mach-O segment destinations, copies segments and BSS, copies the ADT, constructs `boot_args` rev. 2 (736 bytes), and branches to the payload entry with `x0 = physical boot_args`.
 - Keeps a compact exception report (`ESR`, `FAR`, `ELR`, `SPSR`) on the framebuffer and in ramoops.
+- Starts a PSCI `CPU_ON` timer on cpu1; after 50 seconds it issues PSCI `SYSTEM_RESET`, so a test attempt returns through a warm reset and preserves ramoops.
+- Reports WDT restart/arm state and disables the watchdog at handoff by default, leaving the PSCI timer as the reset source.
+- Uses `VISIBLE_OFFSET 0` for the shim console and puts the XNU framebuffer base at the start of the region.
 
-The shim does **not** initialize XNU's GIC, timer, SMP, UFS, or drivers. It also does not enable the MMU. The `XNU_PAYLOAD=1` loader path being compiled is not proof that a real XNU kernel boots on KL7.
+The shim does **not** initialize XNU's GIC, UFS, or other drivers, and it does not enable the MMU. v0.10.0 does start the PSCI reset timer on cpu1; the `XNU_PAYLOAD=1` loader path being compiled is not proof that a real XNU kernel boots on KL7.
 
 ## Build and test
 
@@ -37,7 +40,7 @@ Artifacts:
 - `out/shim_raw_b.img`: same test ramdisk, uncompressed `Image`.
 - `out/Image.gz`: gzip-compressed shim image.
 
-Measured v0.9.1 test sizes: `out/shim_b.img` is **20,480 bytes (20 KiB)** and `out/shim_raw_b.img` is **98,304 bytes (96 KiB)**. The v0.8.0 build was 28,672 bytes (28 KiB) / 106,496 bytes (104 KiB), respectively. `make sizes` is authoritative for a local build. The actual output of `make sizes` is authoritative for a local build.
+Artifact sizes depend on the selected build switches. Run `make sizes` after a build; its output is authoritative for the local toolchain and tree.
 
 The test image is intended to verify the screen console and the test-payload handoff. It automatically requests PSCI SYSTEM_RESET after each result. The ramoops header is preserved across warm attempts when it has a valid signature and bounds, so logs from the seven B-slot retries can be read after the bootloader falls back to Android. Framebuffer behavior and PSCI reset availability still require confirmation on the physical device.
 
@@ -77,6 +80,10 @@ make OUT=out-xnu XNU_PAYLOAD=1 XNU_KERNEL=/path/to/kernelcache all
 
 `XNU_PAYLOAD=0` is the safe default test-payload path. Build artifacts live under `OUT` (default `out`). `make clean` cleans that `OUT` directory only.
 
-## Scope removed in v0.9.0 and kept in v0.9.1
+## Scope removed in v0.9.0
 
 The firmware no longer includes the shim page-table/MMU builder, MMU-fault experiment, PSCI `CPU_ON` experiment, GIC/timer probes, emulator-only build path, progress strip, or verbose bootconfig/register dumps. The DTB memory/reservation parser stays because payload placement must avoid memory owned by the OS, reserved devices, ramoops, the DTB, the initrd, and the shim itself.
+
+v0.10.0 keeps the reduced v0.9.0 loader scope and adds only the PSCI reset timer,
+the watchdog backstop, and the framebuffer offset change described above. It
+does not add CPU scaling.
