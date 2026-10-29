@@ -848,8 +848,7 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
 #endif
     gpu_test();
 #if AUTO_REBOOT_TEST
-    /* The MMU-attribute matrix displays every mode for one second. Do not draw or
-     * log over the final mode; reset immediately after gpu_test returns. */
+    /* Keep the WB output-mapping test short; reset after its final log. */
     psci_system_reset();
 #else
     logf("GPU TEST: probe returned");
