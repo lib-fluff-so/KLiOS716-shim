@@ -168,6 +168,7 @@ typedef unsigned long long u64;
 #define JS_FEATURE_SET_VALUE_JOB	(1U << 2)
 #define JS_FEATURE_COMPUTE_JOB		(1U << 4)
 #define JS_FEATURE_FRAGMENT_JOB		(1U << 9)
+#define JS_FEATURE_MALLOC_VERTEX_JOB	(1U << 12)
 
 #define JOB_INT_RAWSTAT		0x1000U
 #define JOB_INT_CLEAR		0x1004U
@@ -1459,22 +1460,27 @@ build_compute_job(u64 *page, u64 shader_va, u64 tls_va)
 }
 
 /* Valhall Shader Program descriptor (32 bytes, 32-byte aligned).
- * The compute job's Shader Environment points here; the descriptor's
- * Binary field points at the instruction stream. */
+ * Stage values from v9.xml: Compute=1, Fragment=2, Vertex=3. */
 static void
-build_shader_desc(u64 *page, u64 code_va)
+build_shader_desc_stage(u64 *page, u64 code_va, u32 stage)
 {
 	volatile u32 *d = (volatile u32 *)page;
 
 	for (u32 i = 0; i < 1024; i++)
 		d[i] = 0;
 
-	/* Type=Shader (8), Stage=Compute (1), 32 registers/thread (2). */
-	d[0] = 8U | (1U << 4) | (2U << 30);
+	/* Type=Shader (8), selected stage, 32 registers/thread (2). */
+	d[0] = 8U | ((stage & 0xfU) << 4) | (2U << 30);
 	d[1] = 0;		/* Preload r48-r63 */
 	d[2] = (u32)code_va;
 	d[3] = (u32)(code_va >> 32);
 	dsb_sy();
+}
+
+static void
+build_shader_desc(u64 *page, u64 code_va)
+{
+	build_shader_desc_stage(page, code_va, 1U);
 }
 
 /* Valhall v9 tiler heap descriptor (32 bytes): Buffer type 9, Tiler heap
@@ -1914,6 +1920,207 @@ gpu_fragment_wb_test(u32 js_present)
 	return 0;
 }
 
+
+/* First v9 MALLOC_VERTEX_JOB probe. It deliberately uses a Vertex-stage
+ * NOP.end shader: this validates job routing/header/position descriptor and
+ * gives us a tiler-heap baseline without claiming that geometry was generated.
+ * The actual triangle shader is a separate next step. */
+static int
+find_malloc_vertex_slot(u32 present)
+{
+	for (int slot = 15; slot >= 0; slot--) {
+		u32 feat;
+
+		if (!(present & (1U << slot)))
+			continue;
+		feat = rd32(GPU_BASE + GPU_JS_FEATURES(slot));
+		if (feat & JS_FEATURE_MALLOC_VERTEX_JOB) {
+			logf("GPU: MALLOCV slot=%d features=%x", (u64)slot,
+			     (u64)feat);
+			return slot;
+		}
+	}
+	return -1;
+}
+
+static void
+build_malloc_vertex_nop_job(u64 *page)
+{
+	volatile u32 *h = (volatile u32 *)page;
+
+	for (u32 i = 0; i < 96; i++)
+		h[i] = 0;
+
+	/* Job header: MALLOC_VERTEX=11, index=1, no chained job. */
+	h[4] = (11U << 1) | (1U << 16);
+
+	/* Primitive: triangle-list, rotating primitives and depth cull enabled. */
+	h[8] = 8U | (1U << 15) | (1U << 16) | (1U << 17);
+	h[9] = 0;	/* base vertex */
+	h[10] = 0;	/* instance offset */
+	h[11] = 3;	/* vertices */
+	h[12] = 1;	/* instance count */
+	h[13] = 16;	/* vertex packet stride; attribute stride = 0 */
+
+	/* Tiler context pointer. */
+	h[14] = (u32)GPU_VA_TILER_CTX;
+	h[15] = (u32)(GPU_VA_TILER_CTX >> 32);
+
+	/* 64x64 scissor, 1-pixel primitive size, no index buffer. */
+	h[26] = 0;
+	h[27] = 63U | (63U << 16);
+	h[28] = 0x3f800000U;	/* 1.0f */
+	h[30] = 0;
+	h[31] = 0;
+
+	/* Draw state: packet mode lets hardware fill vertex-array pointer/stride. */
+	h[32] = 0x00010000U;	/* DCD_FLAGS_0 */
+	h[33] = 0x0001ffffU;	/* DCD_FLAGS_1 */
+	h[34] = 1U;		/* Vertex Array.Packet = true */
+	h[35] = 0;
+	h[36] = 0;
+	h[38] = 0;		/* minimum Z */
+	h[39] = 0x3f800000U;	/* maximum Z = 1.0f */
+
+	/* Valid, mapped dummy depth/stencil and blend descriptors. These are
+	 * only needed to make the packet structurally complete; no fragment job
+	 * is submitted by this probe. */
+	h[42] = (u32)GPU_VA_OUT;
+	h[43] = (u32)(GPU_VA_OUT >> 32);
+	h[44] = (u32)(GPU_VA_OUT2 | 1ULL);	/* blend count=1, address=OUT2 */
+	h[45] = (u32)(GPU_VA_OUT2 >> 32);
+
+	/* Position shader environment at byte offset 256:
+	 * resources=0, shader=GPU_VA_SHADER_DESC, TLS=GPU_VA_TLS, FAU=0. */
+	h[64] = 0;	/* attribute offset */
+	h[65] = 0;	/* FAU count */
+	h[72] = 0;	/* resources low */
+	h[73] = 0;	/* resources high */
+	h[74] = (u32)GPU_VA_SHADER_DESC;
+	h[75] = (u32)(GPU_VA_SHADER_DESC >> 32);
+	h[76] = (u32)GPU_VA_TLS;
+	h[77] = (u32)(GPU_VA_TLS >> 32);
+	h[78] = 0;	/* FAU low */
+	h[79] = 0;	/* FAU high */
+
+	dsb_sy();
+}
+
+static void
+gpu_tiler_heap_scan(const char *tag)
+{
+	const volatile u64 *p = (const volatile u64 *)tiler_data_page;
+	u32 nonzero = 0;
+	u32 first_offset = (u32)GPU_TILER_HEAP_SIZE;
+	u64 first_value = 0;
+
+	__asm__ volatile("dmb oshld" ::: "memory");
+	for (u32 i = 0; i < (u32)(GPU_TILER_HEAP_SIZE / 8U); i++) {
+		u64 value = p[i];
+
+		if (value == 0)
+			continue;
+		nonzero++;
+		if (first_offset == (u32)GPU_TILER_HEAP_SIZE) {
+			first_offset = i * 8U;
+			first_value = value;
+		}
+	}
+	logf("GPU: TILERHEAP %s qwords=%d first_off=%x first=%w",
+	     tag, (u64)nonzero, (u64)first_offset, first_value);
+}
+
+static int
+gpu_malloc_vertex_nop_test(u32 js_present)
+{
+	volatile u32 *shader_code = (volatile u32 *)shader_nop_page;
+	volatile u32 *ds_desc = (volatile u32 *)out_page;
+	volatile u32 *blend_desc = (volatile u32 *)out_page2;
+	u64 tiler_ptr;
+	u32 raw = 0;
+	int slot, rc;
+
+	slot = find_malloc_vertex_slot(js_present);
+	if (slot < 0) {
+		logf("GPU: MALLOCV no compatible JS slot (feature bit 12 absent)");
+		return -1;
+	}
+
+	/* The two output pages are now free to hold structurally valid descriptors:
+	 * the pixel readback test has already completed. */
+	for (u32 i = 0; i < 512; i++) {
+		job_page[i] = 0;
+		shader_nop_page[i] = 0;
+		out_page[i] = 0;
+		out_page2[i] = 0;
+		tiler_heap_page[i] = 0;
+		tiler_ctx_page[i] = 0;
+	}
+	for (u32 i = 0; i < 32768; i++)
+		tiler_data_page[i] = 0;
+
+	shader_code[0] = (u32)compute_nop_code[0];
+	shader_code[1] = (u32)(compute_nop_code[0] >> 32);
+	build_shader_desc_stage(shader_desc_page, GPU_VA_SHADER_NOP, 3U);
+	ds_desc[0] = 7U;	/* Descriptor Type::Depth/stencil */
+	blend_desc[0] = 0U;	/* blending disabled */
+	build_tiler_heap_desc(tiler_heap_page, GPU_VA_TILER_DATA,
+			      GPU_TILER_HEAP_SIZE);
+	build_tiler_context(tiler_ctx_page, GPU_VA_TILER_HEAP, 64U, 64U);
+	build_malloc_vertex_nop_job(job_page);
+
+	tiler_ptr = (u64)rd32(GPU_BASE + GPU_AS_TRANSTAB_LO);
+	(void)tiler_ptr;	/* AS table is logged in the common startup probe. */
+
+	logf("GPU: MALLOCV start slot=%d job=%x shader=%x code=%x",
+	     (u64)slot, GPU_VA_JOB, GPU_VA_SHADER_DESC, GPU_VA_SHADER_NOP);
+	logf("GPU: MALLOCV hdr=%x/%x/%x/%x/%x",
+	     (u64)((volatile u32 *)job_page)[0],
+	     (u64)((volatile u32 *)job_page)[1],
+	     (u64)((volatile u32 *)job_page)[2],
+	     (u64)((volatile u32 *)job_page)[3],
+	     (u64)((volatile u32 *)job_page)[4]);
+	logf("GPU: MALLOCV primitive=%x/%x/%x/%x instance=%x stride=%x",
+	     (u64)((volatile u32 *)job_page)[8],
+	     (u64)((volatile u32 *)job_page)[9],
+	     (u64)((volatile u32 *)job_page)[10],
+	     (u64)((volatile u32 *)job_page)[11],
+	     (u64)((volatile u32 *)job_page)[12],
+	     (u64)((volatile u32 *)job_page)[13]);
+	logf("GPU: MALLOCV tiler=%w scissor=%x/%x",
+	     (u64)((volatile u32 *)job_page)[14] |
+		 ((u64)((volatile u32 *)job_page)[15] << 32),
+	     (u64)((volatile u32 *)job_page)[26],
+	     (u64)((volatile u32 *)job_page)[27]);
+	logf("GPU: MALLOCV position shader=%w tls=%w ds=%w blend=%w",
+	     (u64)((volatile u32 *)job_page)[74] |
+		 ((u64)((volatile u32 *)job_page)[75] << 32),
+	     (u64)((volatile u32 *)job_page)[76] |
+		 ((u64)((volatile u32 *)job_page)[77] << 32),
+	     (u64)((volatile u32 *)job_page)[42] |
+		 ((u64)((volatile u32 *)job_page)[43] << 32),
+	     (u64)((volatile u32 *)job_page)[44] & ~0xfULL);
+
+	gpu_tiler_heap_scan("before-MALLOCV");
+	rc = run_write_value_job(slot, GPU_VA_JOB, js_present, &raw);
+	gpu_job_status_dump("MALLOCV-NOP", (const volatile u32 *)job_page);
+	logf("GPU: MALLOCV rc=%d raw=%x js=%x state=%x", (u64)rc,
+	     (u64)raw, (u64)rd32(GPU_BASE + JS_STATUS(slot)),
+	     (u64)rd32(GPU_BASE + JOB_INT_JS_STATE));
+	if (rc != 0) {
+		u32 mraw = rd32(GPU_BASE + MMU_INT_RAWSTAT);
+		u32 fstat = rd32(GPU_BASE + AS_FAULTSTATUS);
+		u64 faddr = (u64)rd32(GPU_BASE + AS_FAULTADDRESS_LO) |
+			    ((u64)rd32(GPU_BASE + AS_FAULTADDRESS_HI) << 32);
+		logf("GPU: MALLOCV fault mraw=%x fstat=%x faddr=%w",
+		     (u64)mraw, (u64)fstat, faddr);
+		return -2;
+	}
+
+	gpu_tiler_heap_scan("after-MALLOCV");
+	logf("GPU: MALLOCV NOP JOB PASS (geometry not expected)");
+	return 0;
+}
 
 /* Unique-pixel sentinel.  A row that the GPU never wrote keeps its own
  * 0x80000000|(y<<8)|x value; a row written from a different source row
@@ -2640,6 +2847,14 @@ gpu_traffic_test(void)
 	if (rc != 0) {
 		logf("GPU: FRAGWB test stopped rc=%d", (u64)rc);
 		return -14;
+	}
+
+	/* First isolate the v9 MALLOC_VERTEX job/position-descriptor path. The
+	 * Vertex-stage NOP is intentional: no triangle is claimed at this stage. */
+	rc = gpu_malloc_vertex_nop_test(js_present);
+	if (rc != 0) {
+		logf("GPU: MALLOCV probe stopped rc=%d", (u64)rc);
+		return -15;
 	}
 	return GPU_TRAFFIC_WB_DONE;
 
