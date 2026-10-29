@@ -90,29 +90,42 @@ Every job completed with `raw=1`, yet stores at the failing offsets left the sen
 untouched. This proves the parity signature is not exclusive to the fragment clear-only
 path or its FBD. It points to a shared layer below the FBD, still to be identified.
 
-## Output-page MMU attribute matrix (source updated; hardware result pending)
+## Output-page MMU attribute matrix — completed on KL7 (2026-10-29)
 
-The prior JS_CONFIG flush-mode matrix was reported to show the same FAIL result in every
-mode. The targeted test now varies only the output page's PTE AttrIdx and matching AS_MEMATTR
-entry. Each of seven modes draws its pass/fail mask full-screen for one second; after mode 7,
-main issues warm PSCI `SYSTEM_RESET`. Later BO/compute/fragment probes are skipped.
+The text-console build completed all seven modes on-device. Every Write Value job in the
+112-address/mode combinations completed; no job stalled during this matrix.
 
-Modes 1-4 keep the output memory type non-cacheable (`0x4c`) while selecting different PTE
-AttrIdx values. Modes 5-7 apply write-back attributes (`0x88`, `0x8c`, `0x8f`) only to the
-output page. The job descriptor, job page, and other mapped buffers remain on the original
-non-cacheable AttrIdx=5. Each run logs the selected AttrIdx, attribute byte, PTE value, full
-AS_MEMATTR register pair, and the 16-address pass/fail masks.
-
-Build:
-
-```sh
-make OUT=out-gpu-memattr GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0
+```text
+GPU: WVALATTR mode=1 idx=5 attr=4c pass=0000000000006969 fail=0000000000009696
+GPU: WVALATTR first idx=5 attr=4c offset=100 raw=1 got=5a5a5a5a5a5a5a5a want=a57e000000000002
+GPU: WVALATTR mode=2 idx=4 attr=4c pass=0000000000006969 fail=0000000000009696
+GPU: WVALATTR mode=3 idx=6 attr=4c pass=0000000000006969 fail=0000000000009696
+GPU: WVALATTR mode=4 idx=7 attr=4c pass=0000000000006969 fail=0000000000009696
+GPU: WVALATTR mode=5 idx=4 attr=88 pass=000000000000ffff fail=0000000000000000
+GPU: WVALATTR mode=6 idx=4 attr=8c pass=000000000000ffff fail=0000000000000000
+GPU: WVALATTR mode=7 idx=4 attr=8f pass=000000000000ffff fail=0000000000000000
 ```
 
-Flash **only `boot_b`**, never `boot_a`. After Android returns, read
-`/sys/fs/pstore/console-ramoops-0`. Hardware results are pending until this image is built
-and run on KL7.
+Interpretation:
 
+- Modes 1–4 keep the output memory type non-cacheable (`0x4c`) and vary PTE AttrIdx.
+  The identical `6969/9696` mask means PTE AttrIdx alone does not fix the write-drop.
+- Modes 5–7 all pass all 16 offsets with write-back encodings `0x88`, `0x8c`, and `0x8f`.
+- The first non-cacheable failure is offset `0x100`; its sentinel remains unchanged.
+- The text-console version emits `WVALATTR ... start` before each job and no longer calls the
+  full-screen overlays from `gpu_test()` or the per-mode loop. This preserves useful stage
+  text when a later operation stalls. The attached artifact is a ramoops log, not a panel
+  photograph, so it records the test output rather than documenting the screen visually.
+
+Build used:
+
+```sh
+make OUT=out-gpu-text GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0 WDT_DISABLE_AT_HANDOFF=0
+```
+
+Next step: apply write-back `0x8c` to all GPU output/framebuffer mappings, but keep this
+matrix-only test path. Do not re-enable BO/compute/fragment probes until the mapping change
+has been tested on its own.
 
 ## FBD layout (from Mesa v9.xml, matches our code)
 
@@ -165,21 +178,21 @@ path that does not have the parity bug.
 - `GPU-ACCELERATION-PLAN.md` — GPU stack roadmap
 - `RECOVERY-NOTES.txt` — KL7 slot retry, PSCI reset, fastboot recovery rules
 
-## Build/flash commands
+## Current build and recovery procedure
 
 ```sh
-# Build seven-mode flush matrix (one second per result, then warm reset)
-make OUT=out-gpu-flush-matrix GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0
+make OUT=out-gpu-text GPU_TEST=1 GPU_POWER_TEST=1 \
+  AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0 WDT_DISABLE_AT_HANDOFF=0
+```
 
-# Flash only boot_b (device in fastboot/LK)
-fastboot flash boot_b out-gpu-flush-matrix/shim_b.img
-fastboot --set-active=b
-fastboot reboot
+Install the image into `boot_b` using the project's existing Antumbra recovery route.
+Do not attempt Fastboot recovery and never write `boot_a`. Keep `PSCI_RESET_TIMER=0`;
+the hardware watchdog stays enabled as a fallback during the test. After recovery/Android
+is available, retrieve `/sys/fs/pstore/console-ramoops-0`.
 
-# After Android returns, pull the log
-adb -s 13016374AF000229 shell 'su -c "cat /sys/fs/pstore/console-ramoops-0"' > ramoops-shim.txt
+Safe read-only probe (no GPU register writes):
 
-# Safe read-only probe (no GPU register writes)
+```sh
 make OUT=out-gpu-test GPU_TEST=1 GPU_POWER_TEST=0 AUTO_REBOOT_TEST=0
 ```
 
