@@ -2550,7 +2550,7 @@ gpu_traffic_test(void)
 		logf("GPU: WVALATTR grid stopped rc=%d", (u64)rc);
 		return -13;
 	}
-	return GPU_TRAFFIC_MATRIX_DONE;
+	return GPU_TRAFFIC_WB_DONE;
 
 	rc = gpu_bo_test((int)slot, js_present);
 	if (rc != 0) {
@@ -2727,7 +2727,7 @@ gpu_test(void)
 	{
 		int traffic_rc = gpu_traffic_test();
 
-		if (traffic_rc == GPU_TRAFFIC_MATRIX_DONE)
+		if (traffic_rc == GPU_TRAFFIC_WB_DONE)
 			return;
 		if (traffic_rc != 0)
 			logf("GPU: traffic test stopped before completion");
