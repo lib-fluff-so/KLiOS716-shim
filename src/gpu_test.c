@@ -1934,11 +1934,10 @@ find_malloc_vertex_slot(u32 present)
 		if (!(present & (1U << slot)))
 			continue;
 		feat = rd32(GPU_BASE + GPU_JS_FEATURES(slot));
-		if (feat & JS_FEATURE_MALLOC_VERTEX_JOB) {
-			logf("GPU: MALLOCV slot=%d features=%x", (u64)slot,
-			     (u64)feat);
+		logf("GPU: MALLOCV slot=%d features=%x", (u64)slot,
+		     (u64)feat);
+		if (feat & JS_FEATURE_MALLOC_VERTEX_JOB)
 			return slot;
-		}
 	}
 	return -1;
 }
@@ -2062,6 +2061,7 @@ gpu_malloc_vertex_nop_test(u32 js_present)
 	shader_code[1] = (u32)(compute_nop_code[0] >> 32);
 	build_shader_desc_stage(shader_desc_page, GPU_VA_SHADER_NOP, 3U);
 	ds_desc[0] = 7U;	/* Descriptor Type::Depth/stencil */
+	ds_desc[4] = 1U << 22;	/* Depth cull enable, matching primitive state */
 	blend_desc[0] = 0U;	/* blending disabled */
 	build_tiler_heap_desc(tiler_heap_page, GPU_VA_TILER_DATA,
 			      GPU_TILER_HEAP_SIZE);
