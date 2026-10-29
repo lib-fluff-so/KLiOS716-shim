@@ -117,9 +117,33 @@ Expected diagnostic line after setup:
 followed by `GPU: WVALATTR FB PTE=... memattr=...` and the final
 `GPU: WVALATTR idx=4 attr=8c pass=... fail=...`.
 
-This source change is not yet hardware-validated. Install only to `boot_b`
-through the existing Antumbra route, never Fastboot and never `boot_a`.
-After recovery, collect `/sys/fs/pstore/console-ramoops-0`.
+This build was subsequently run on KL7 and returned `pass=ffff fail=0`; see
+“All-output write-back test” above. The framebuffer clear remains to be tested.
+Install test builds only to `boot_b` through the existing Antumbra route, never
+Fastboot and never `boot_a`. After recovery, collect `/sys/fs/pstore/console-ramoops-0`.
+
+## All-output write-back test — completed on KL7 (2026-10-29)
+
+Hardware result from the isolated all-output WB build:
+
+```text
+GPU: WVALATTR setup idx=4 attr=8c out=4000c753 out2=40012753
+GPU: WVALATTR FB PTE=40007753/40008753/40009753/4000a753 memattr=4c4c4c4c/4c4c4c8c
+GPU: WVALATTR idx=4 attr=8c pass=000000000000ffff fail=0000000000000000
+```
+
+All 16 Write Value stores completed and read back correctly using AttrIdx=4 /
+`0x8c`. The logged PTEs show `GPU_VA_OUT`, `GPU_VA_OUT2`, and all four
+framebuffer pages using AttrIdx=4; AS_MEMATTR index 4 is `0x8c`, while other
+entries remain `0x4c`.
+
+This confirms the complete mapping setup does not break Write Value output and
+eliminates the prior `6969/9696` mask for this Write Value grid. The grid writes
+to `GPU_VA_OUT`; it does **not** itself test fragment writeback to the framebuffer.
+Next diagnostic: one isolated 64x64 fragment clear with the same WB mappings,
+without the previous size sweep, unique-pixel matrix, BO, multislot, or compute tests.
+A full `clear=ffffffffffffffff sent=0000000000000000 mixed=0000000000000000`
+row mask would establish full framebuffer clear-writeback for this case.
 
 ## Output-page MMU attribute matrix — completed on KL7 (2026-10-29)
 
