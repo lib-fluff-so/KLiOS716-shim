@@ -107,29 +107,6 @@ Word 40-41: Base address
 shader. This may be relevant: a normal fragment shader render might take a different writeback
 path that does not have the parity bug.
 
-## Next steps for the next AI
-
-1. **Pull the msaa4 log**: The image with `cfg=10` (sample count 4x) was flashed to boot_b.
-   Wait for Android, pull `/sys/fs/pstore/console-ramoops-0`, check if MSAA changes the row mask.
-
-2. **Try a fragment-shader render instead of RT clear**: Bind a trivial fragment shader that
-   outputs the clear color to every pixel. This uses the normal fragment shading writeback
-   path, not the fast-clear path. May bypass the parity bug entirely.
-
-3. **Try compute-path 2D fill as workaround**: The compute path is proven (writes
-   `0123456789abcdef` correctly). Write a compute shader that fills a 2D region with a
-   uniform color, bypassing the fragment tile-buffer writeback. Use this for the visual card
-   GPU readback if the fragment defect can't be fixed.
-
-4. **Audit d[33] swizzle field (0x688)**: Check against Mesa's `panfrost_translate_swizzle_4`
-   for RGBA8 identity swizzle. Wrong swizzle wouldn't cause missing rows, but worth verifying.
-
-5. **Check if Render Target Count field matters**: bits 19-22 of d[11] are 0 (stored),
-   minus(1) → 1 RT. Verify this is correct; a missing RT count could cause writeback issues.
-
-6. **Search for Mali-G57 clean-pixel-write errata**: Search Arm Mali documentation or kernel
-   driver source for known issues with the RT clear path on Valhall Gen1 (G57/G77).
-
 ## Files
 
 - `src/console.c` — `console_visual_result()`, `visual_card()`, draws at FB_BASE + 0 full screen
