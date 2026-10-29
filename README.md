@@ -4,7 +4,7 @@ Minimal ARM64 XNU launcher for the TECNO KL7 / MediaTek MT6789. This repository 
 
 ## Repository split
 
-The XNU side lives in a separate repository. That repository owns the XNU source, kernel patches, iOS rootfs, and the macOS VM/flash workflow, and it includes this shim as a git submodule.
+The XNU side lives in the separate [KLiOS716](https://github.com/lib-fluff-so/KLiOS716) repository. That repository owns the XNU source, kernel patches, iOS rootfs, and the macOS VM/flash workflow, and it includes this shim as a git submodule.
 
 This repository owns only the bootloader-facing shim:
 
