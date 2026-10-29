@@ -9,7 +9,7 @@ useful stage text on screen if a later register/job operation hung. The current
 test path does not call those overlays: startup and per-address progress remain
 in the regular framebuffer console, and the same lines are mirrored to ramoops.
 
-Build: `make OUT=out-gpu-text GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0`
+Build: `make OUT=out-gpu-text GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0 WDT_DISABLE_AT_HANDOFF=0`
 
 The seven output-page MMU attribute modes still run, with the pass/fail masks and
 the GPU virtual offset printed as text. Each mode keeps a one-second pause so
