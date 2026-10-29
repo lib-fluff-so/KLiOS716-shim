@@ -1,0 +1,102 @@
+# Mali-G57 / Valhall v9 triangle bring-up notes
+
+Status: 2026-10-29. This is a research note for `gpu-going-forward`; it does
+not claim that a triangle has been drawn by the KL7 shim.
+
+## Target architecture
+
+KL7 reports Mali-G57 MC2, GPU ID `0x90930010`, Valhall generation v9. The
+GPU uses the older Job Manager interface with Valhall shader programs and
+descriptors. For v9, the normal draw path uses one `MALLOC_VERTEX_JOB`
+(job type 11) for position processing, varying setup, and tiler work, followed
+by a fragment job (type 9). Do not substitute an older `IDVS Helper Job`
+layout for the v9 `MALLOC_VERTEX_JOB` aggregate.
+
+Useful references:
+
+- [Noysz/panvk-g99-jm: v9 draw porting log](https://github.com/Noysz/panvk-g99-jm/blob/main/docs/porting-log.md)
+- [Noysz/panvk-g99-jm: triangle draw test](https://github.com/Noysz/panvk-g99-jm/blob/main/tests/graphics/triangle_draw_test_v2.c)
+- [JimVulkan/mali-panvk: v9 Job Manager draw implementation](https://github.com/JimVulkan/mali-panvk/blob/main/src/panfrost/vulkan/jm/panvk_v9_cmd_draw.c)
+- [Mesa JM job-chain dependencies](https://github.com/vortexgpgpu/mesa/blob/vortex_3.x/src/panfrost/lib/pan_jc.h)
+
+These are reference implementations and experiments, not a ready-to-copy
+working draw packet: the G99 reference log explicitly records a case where a
+MALLOC_VERTEX job and a fragment job complete but the image contains only the
+clear color.
+
+## Descriptor checklist for a future shim test
+
+The G99 porting log decodes a v9 `MALLOC_VERTEX_JOB` as 384 bytes, 64-byte
+aligned. Its relevant byte offsets are:
+
+| Offset | Contents |
+|---:|---|
+| 0 | Job header |
+| 32 | Primitive descriptor |
+| 48 | Instance count and allocation fields |
+| 56 | Tiler context pointer |
+| 104 | Scissor |
+| 112 | Primitive size |
+| 120 | Index descriptor |
+| 128 | Draw state, including vertex array and shader environments |
+| 192 | Fragment shader environment |
+| 256 | Position shader environment |
+| 320 | Varying shader environment |
+
+The exact packed fields must be generated or checked against the matching v9
+genxml definitions, not assembled by guessing offsets. The currently available
+shim uses raw word arrays, so a first implementation should dump all 384 bytes
+after construction and before submission.
+
+The existing shim already has:
+- AS0 with 4-level, 48-bit GPU page tables;
+- a 256 KiB tiler heap buffer and its heap descriptor/context;
+- a known-good 64x64 linear RGBA8 framebuffer mapping with write-back
+  AttrIdx=4 (`0x8c`);
+- fragment clear-only job and CPU readback;
+- job submit/wait helpers and read-only MMU/GPU fault diagnostics.
+
+Before a `MALLOC_VERTEX_JOB` test, verify that every referenced GPU VA is
+mapped: position code and shader descriptor, vertex/attribute buffers,
+thread-local storage, tiler context, tiler heap descriptor, tiler heap storage,
+framebuffer descriptor, and render target.
+
+## Most useful failure discriminators
+
+The G99 experiment narrowed the “clear succeeds, triangle absent” case to
+several possibilities after ruling out a few descriptor/header mistakes:
+
+1. **Position shader output:** dump and verify that the actual machine code is
+   the intended triangle position shader, and that the job points at the
+   triangle-position variant rather than a point-position variant.
+2. **Vertex-array packet metadata:** determine whether the packet pointer and
+   stride fields are written by hardware for this exact mode or must be seeded
+   by software. The G99 log marks this as unresolved in its test.
+3. **Tiler heap activity:** inspect the heap after job completion. A completed
+   job with no tiler allocation/write is not evidence that primitives entered
+   the tiler.
+4. **Post-completion job header:** after waiting, record exception status,
+   first-incomplete-task, fault pointer, type, index, and next-job. Do not
+   infer the exception meaning from the interrupt bit alone.
+5. **Framebuffer readback:** initialise the buffer with a per-pixel sentinel,
+   clear/render, then report clear/sentinel/other counts and a compact row/tile
+   mask.
+
+The current `gpu_job_status_dump()` helper adds item 4 for the isolated
+fragment job. The next code step is to implement a separately gated,
+stage-by-stage `MALLOC_VERTEX_JOB` diagnostic rather than re-enabling the
+old suite or submitting vertex and fragment jobs with no intermediate evidence.
+
+## Current measured milestone
+
+The latest KL7 test supplied on 2026-10-29 returned:
+
+```text
+GPU: WVALATTR idx=4 attr=8c pass=000000000000ffff fail=0000000000000000
+GPU: FRAGWB pixels clear=4096 sent=0 other=0
+GPU: FRAGWB PASS clear=4096
+```
+
+That validates write-back mapping and clear-only fragment writeback for this
+test configuration. It does not yet validate vertex shading, tiler-generated
+primitive data, or a shader-coloured triangle.
