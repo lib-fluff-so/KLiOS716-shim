@@ -94,7 +94,7 @@ descriptor unchanged:
 | `0x81300` | clean+invalidate | clean |
 | `0x81000` | none | clean |
 | `0x81100` | clean | clean |
-| `0x81200` | invalidate | clean |
+| `0x81200` | INV_SHADER_OTHER | clean |
 | `0x80300` | clean+invalidate | none |
 | `0x83300` | clean+invalidate | clean+invalidate |
 | `0x80000` | none | none |

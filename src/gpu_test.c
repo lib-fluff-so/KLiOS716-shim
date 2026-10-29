@@ -2191,9 +2191,10 @@ static int
 gpu_write_value_grid_test(int slot, u32 js_present)
 {
 	/*
-	 * Bits [9:8] select start flush: 0=none, 1=clean, 2=invalidate,
-	 * 3=clean+invalidate. Bits [13:12] select end flush in the same way.
-	 * Keep thread priority at 8 and vary only the flush controls.
+	 * Start flush uses 0=no action, 1=clean, 2=INV_SHADER_OTHER,
+	 * 3=clean+invalidate. End flush supports no action, clean, or
+	 * clean+invalidate on this JM. Keep thread priority at 8 and vary
+	 * only the flush controls.
 	 */
 	static const u32 configs[] = {
 		0x81300U, /* baseline: start clean+invalidate, end clean */
