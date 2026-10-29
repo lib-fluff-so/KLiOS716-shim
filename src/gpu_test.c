@@ -2181,19 +2181,16 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 attr_index,
 	u64 passmask = 0, failmask = 0;
 	u64 first_off = 0, first_got = 0, first_want = 0;
 	u32 first_raw = 0;
-	u32 mode_id = (attr_index << 8) | attr_value;
 	int rc;
 
 	/* Keep the normal JS_CONFIG; vary only the output PTE attributes. */
 	gpu_js_config_override = 0;
-	logf("GPU: WVALATTR begin mode=%d idx=%d attr=%x",
-	     (u64)mode, (u64)attr_index, (u64)attr_value);
+	logf("GPU: WVALATTR begin mode=%d/%d idx=%d attr=%x",
+	     (u64)mode, (u64)total_modes, (u64)attr_index, (u64)attr_value);
 	rc = gpu_output_memattr_set(attr_index, attr_value);
 	if (rc != 0) {
 		logf("GPU: WVALATTR setup error=%d idx=%d attr=%x",
 		     (u64)rc, (u64)attr_index, (u64)attr_value);
-		console_gpu_mode_result(mode, total_modes, mode_id,
-		                        passmask, failmask, 1);
 		delay_us(1000000ULL);
 		return -1;
 	}
@@ -2208,14 +2205,13 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 attr_index,
 		u64 got;
 		u32 raw = 0;
 
+		logf("GPU: WVALATTR m=%d offset=%x start", (u64)mode, offset);
 		build_write_value_job(job_page, GPU_VA_OUT + offset, want);
 		rc = run_write_value_job(slot, GPU_VA_JOB, js_present, &raw);
 		if (rc != 0) {
 			logf("GPU: WVALATTR idx=%d attr=%x job offset=%x rc=%d raw=%x",
 			     (u64)attr_index, (u64)attr_value, offset,
 			     (u64)rc, (u64)raw);
-			console_gpu_mode_result(mode, total_modes, mode_id,
-			                        passmask, failmask, 1);
 			delay_us(1000000ULL);
 			return -1;
 		}
@@ -2243,8 +2239,6 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 attr_index,
 		     (u64)first_raw, first_got, first_want);
 	}
 
-	console_gpu_mode_result(mode, total_modes, mode_id,
-	                        passmask, failmask, 0);
 	delay_us(1000000ULL);
 	return failmask ? 1 : 0;
 }
@@ -2579,11 +2573,15 @@ gpu_traffic_test(void)
 	logf("GPU: WRITE VALUE PASS");
 
 	/*
-	 * This boot is dedicated to the seven-mode MMU-attribute matrix. The per-mode
-	 * card has been shown for one second; return so main resets before later
-	 * probes can overwrite the final result card.
+	 * This boot is dedicated to the seven-mode MMU-attribute matrix. Keep all
+	 * status on the normal text console so a stalled GPU operation leaves the
+	 * last progress line visible instead of replacing it with a full-screen card.
 	 */
-	(void)gpu_write_value_grid_test((int)slot, js_present);
+	rc = gpu_write_value_grid_test((int)slot, js_present);
+	if (rc != 0) {
+		logf("GPU: WVALATTR grid stopped rc=%d", (u64)rc);
+		return -13;
+	}
 	return GPU_TRAFFIC_MATRIX_DONE;
 
 	rc = gpu_bo_test((int)slot, js_present);
@@ -2705,11 +2703,8 @@ gpu_test(void)
 	int rails;
 #endif
 
-	/* Put the CPU-generated card on both candidate panel pages before any
-	 * GPU register access.  If the GPU test hangs, the card remains visible
-	 * on the scanned page; the ramoops log still records the last stage. */
-	gpu_visual_result();
-
+	/* Keep the text console intact during the hardware test. Full-screen
+	 * visual cards erase the stage log precisely when a register/job hangs. */
 	logf("GPU TEST: MT6789 Mali-G57 MC2 probe");
 	log_domains();
 #if GPU_POWER_TEST
