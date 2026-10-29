@@ -28,27 +28,47 @@ A read-only job-header dump now runs after the fragment job wait. It logs
 the GPU-written exception status, first-incomplete-task value, fault pointer,
 job type/index, and next-job pointer.
 
-A first `MALLOC_VERTEX_JOB` baseline now follows the passing clear. It selects
-a JS slot with feature bit 12 (expected slot 1 on this G57), builds a 384-byte
-v9 job descriptor with a Vertex-stage `NOP.end` shader, and scans the tiler
-heap before/after submission. The NOP deliberately produces no expected
-geometry; this test only isolates JM routing/descriptor acceptance and records
-status/fault/heap evidence. It is new code and has not yet been built or run on
-the phone.
+The first type-11 job used a Vertex-stage `NOP.end`. The latest device log
+from that build shows the JS slot was selected and the job ran far enough to
+write its header, but it failed:
+
+```text
+GPU: MALLOCV slot=1 features=1c9e
+GPU: JOBSTATUS MALLOCV-NOP status=120258 task=0 fault=0000000000000000
+GPU: JOBSTATUS MALLOCV-NOP type=11 index=1 next=0000000000000000
+GPU: MALLOCV rc=... raw=20000 js=58 state=0
+GPU: MALLOCV fault mraw=0 fstat=0 faddr=0000000000000000
+```
+
+Decode of `0x00120258` per Mesa's Job Manager status layout:
+- source ID: `0x12`
+- access: `READ`
+- exception: `0x58 = DATA_INVALID_FAULT`
+
+This is a job exception, not an AS MMU translation fault: the log has
+`mraw=0`, `fstat=0` and a zero AS fault address. The NOP shader did not emit
+the position output required by the position-processing path, so that NOP test
+was not a valid neutral test. The source has now replaced it with a minimal
+position-store shader. Every invocation writes clip-space `(0,0,0,1)`; all
+three vertices coincide, so a visible triangle is not expected from this smoke
+test. Machine code and descriptor words are logged before submission.
+
+**The replacement position-store test has not yet been built or run on the
+phone.** The old log above does not describe the replacement shader.
 
 ## Immediate next milestone
 
-First run the new `MALLOC_VERTEX_JOB` NOP baseline on-device and inspect:
-1. whether the selected JS slot accepts job type 11;
-2. the GPU-written header (exception status, first incomplete task, fault
-   pointer, type/index, next-job pointer);
-3. whether the zeroed tiler heap changes during a geometry-less job.
+Build and run the new `POS-SMOKE` test. Check its decoded job status:
+1. If the job completes, check whether the tiler heap changes and the job
+   reports DONE.
+2. If it faults, inspect the printed exception/access/source ID and the exact
+   six shader instruction words plus shader descriptor.
+3. Once position output completes, make vertex positions depend on vertex ID
+   to form a triangle, then test tiler allocation, and only then add the
+   fragment-shader colour path.
 
-Then replace the Vertex NOP with a real position shader and add the minimal
-required vertex/attribute packet. Only after that should we connect the
-vertex/tiler job to the already-working clear-only fragment path, then add a
-fragment shader for a coloured triangle. This follows the v9 layout rather
-than the older IDVS-helper descriptor used by early Mali examples.
+This follows the v9 layout rather than the older IDVS-helper descriptor used
+by early Mali examples.
 
 The external [Noysz/panvk-g99-jm porting log](https://github.com/Noysz/panvk-g99-jm/blob/main/docs/porting-log.md)
 is a highly relevant G57/G99 reference. It records a case where a v9
