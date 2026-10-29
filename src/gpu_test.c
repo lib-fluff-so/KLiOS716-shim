@@ -2036,7 +2036,6 @@ gpu_malloc_vertex_nop_test(u32 js_present)
 	volatile u32 *shader_code = (volatile u32 *)shader_nop_page;
 	volatile u32 *ds_desc = (volatile u32 *)out_page;
 	volatile u32 *blend_desc = (volatile u32 *)out_page2;
-	u64 tiler_ptr;
 	u32 raw = 0;
 	int slot, rc;
 
@@ -2068,9 +2067,6 @@ gpu_malloc_vertex_nop_test(u32 js_present)
 			      GPU_TILER_HEAP_SIZE);
 	build_tiler_context(tiler_ctx_page, GPU_VA_TILER_HEAP, 64U, 64U);
 	build_malloc_vertex_nop_job(job_page);
-
-	tiler_ptr = (u64)rd32(GPU_BASE + GPU_AS_TRANSTAB_LO);
-	(void)tiler_ptr;	/* AS table is logged in the common startup probe. */
 
 	logf("GPU: MALLOCV start slot=%d job=%x shader=%x code=%x",
 	     (u64)slot, GPU_VA_JOB, GPU_VA_SHADER_DESC, GPU_VA_SHADER_NOP);
