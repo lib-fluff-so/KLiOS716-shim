@@ -613,6 +613,8 @@ static u64 bo_job_pages[16];
 /* Set for one fragment run to exercise the vendor r32p1 JS_CONFIG
  * flush-reduction and job-chain bits. */
 static u32 gpu_js_vendor_cfg;
+/* Nonzero only while the Write Value flush-mode matrix is running. */
+static u32 gpu_js_config_override;
 
 static void build_write_value_job(u64 *page, u64 target, u64 value);
 static int run_write_value_job(int slot, u64 job_va, u32 js_present,
@@ -2054,24 +2056,23 @@ prepare_job(int slot, u64 job_va)
 	wr32(GPU_BASE + JS_AFFINITY_NEXT_LO(slot), (u32)affinity);
 	wr32(GPU_BASE + JS_AFFINITY_NEXT_HI(slot), (u32)(affinity >> 32));
 
-	/* AS0, medium priority, clean+invalidate at start, clean at end.
-	 * The G57 (product 0x9093, tBAx feature set) has
-	 * BASE_HW_FEATURE_CLEAN_ONLY_SAFE, so vendor r32p1 uses
-	 * JS_CONFIG_END_FLUSH_CLEAN rather than CLEAN_INVALIDATE.  An end
-	 * invalidate can discard dirty tile-buffer writeback lines and
-	 * leaves only half of each 16x16 tile in memory.  G57 does not set
-	 * JS_CONFIG_START_MMU: Linux only uses it for issue 10649 and the
-	 * r32p1 vendor driver never sets it for this GPU. */
-	cfg = 0;
-	cfg |= JS_CONFIG_START_FLUSH_CLEAN_INVALIDATE;
-	cfg |= JS_CONFIG_END_FLUSH_CLEAN;
-	cfg |= JS_CONFIG_THREAD_PRI(8);
-	if (gpu_js_vendor_cfg) {
-		cfg |= JS_CONFIG_ENABLE_FLUSH_REDUCTION;
-		cfg |= JS_CONFIG_JOB_CHAIN_FLAG;
+	/* AS0, medium priority.  Use the default vendor-like flush
+	 * configuration unless a diagnostic explicitly overrides it.
+	 * BASE_HW_FEATURE_CLEAN_ONLY_SAFE is set on this G57, so the normal
+	 * configuration is clean+invalidate at start and clean at end. */
+	if (gpu_js_config_override != 0) {
+		cfg = gpu_js_config_override;
+	} else {
+		cfg = JS_CONFIG_START_FLUSH_CLEAN_INVALIDATE |
+		      JS_CONFIG_END_FLUSH_CLEAN |
+		      JS_CONFIG_THREAD_PRI(8);
+		if (gpu_js_vendor_cfg) {
+			cfg |= JS_CONFIG_ENABLE_FLUSH_REDUCTION;
+			cfg |= JS_CONFIG_JOB_CHAIN_FLAG;
+		}
 	}
 	wr32(GPU_BASE + JS_CONFIG_NEXT(slot), cfg);
-	if (gpu_js_vendor_cfg)
+	if (gpu_js_vendor_cfg && gpu_js_config_override == 0)
 		wr32(GPU_BASE + JS_FLUSH_ID_NEXT(slot),
 		     rd32(GPU_BASE + LATEST_FLUSH));
 	wr32(GPU_BASE + JS_COMMAND_NEXT(slot), JS_COMMAND_START);
@@ -2125,7 +2126,7 @@ run_write_value_job(int slot, u64 job_va, u32 js_present, u32 *raw_out)
  * of address bits [10:8] twice while staying inside the mapped output page.
  */
 static int
-gpu_write_value_grid_test(int slot, u32 js_present)
+gpu_write_value_grid_once(int slot, u32 js_present, u32 config)
 {
 	const u32 count = 16;
 	const u64 sentinel = 0x5a5a5a5a5a5a5a5aULL;
@@ -2135,6 +2136,8 @@ gpu_write_value_grid_test(int slot, u32 js_present)
 	u32 first_raw = 0;
 	int rc;
 
+	gpu_js_config_override = config;
+	logf("GPU: WVALGRID begin cfg=%x", (u64)config);
 	for (u32 i = 0; i < count; i++)
 		out[i * 32U] = sentinel;
 	dsb_sy();
@@ -2148,8 +2151,9 @@ gpu_write_value_grid_test(int slot, u32 js_present)
 		build_write_value_job(job_page, GPU_VA_OUT + offset, want);
 		rc = run_write_value_job(slot, GPU_VA_JOB, js_present, &raw);
 		if (rc != 0) {
-			logf("GPU: WVALGRID job offset=%x rc=%d raw=%x",
-			     offset, (u64)rc, (u64)raw);
+			logf("GPU: WVALGRID cfg=%x job offset=%x rc=%d raw=%x",
+			     (u64)config, offset, (u64)rc, (u64)raw);
+			gpu_js_config_override = 0;
 			return -1;
 		}
 
@@ -2168,15 +2172,47 @@ gpu_write_value_grid_test(int slot, u32 js_present)
 		}
 	}
 
-	logf("GPU: WVALGRID pass=%w fail=%w", passmask, failmask);
+	gpu_js_config_override = 0;
+	logf("GPU: WVALGRID cfg=%x pass=%w fail=%w",
+	     (u64)config, passmask, failmask);
 	if (failmask != 0) {
-		logf("GPU: WVALGRID first offset=%x raw=%x got=%w want=%w",
-		     first_off, (u64)first_raw, first_got, first_want);
-		logf("GPU: WVALGRID MISMATCH; continuing to compute/fragment probes");
+		logf("GPU: WVALGRID cfg=%x first offset=%x raw=%x got=%w want=%w",
+		     (u64)config, first_off, (u64)first_raw, first_got,
+		     first_want);
 		return 1;
 	}
 
-	logf("GPU: WVALGRID PASS n=%d stride=%x", (u64)count, 0x100ULL);
+	logf("GPU: WVALGRID PASS cfg=%x n=%d stride=%x",
+	     (u64)config, (u64)count, 0x100ULL);
+	return 0;
+}
+
+static int
+gpu_write_value_grid_test(int slot, u32 js_present)
+{
+	/*
+	 * Bits [9:8] select start flush: 0=none, 1=clean, 2=invalidate,
+	 * 3=clean+invalidate. Bits [13:12] select end flush in the same way.
+	 * Keep thread priority at 8 and vary only the flush controls.
+	 */
+	static const u32 configs[] = {
+		0x81300U, /* baseline: start clean+invalidate, end clean */
+		0x81000U, /* no start flush, end clean */
+		0x81100U, /* start clean, end clean */
+		0x81200U, /* start invalidate, end clean */
+		0x80300U, /* start clean+invalidate, no end flush */
+		0x83300U, /* start clean+invalidate, end clean+invalidate */
+		0x80000U, /* no start or end flush */
+	};
+	for (u32 i = 0; i < sizeof(configs) / sizeof(configs[0]); i++) {
+		int rc = gpu_write_value_grid_once(slot, js_present, configs[i]);
+
+		if (rc < 0) {
+			logf("GPU: WVALGRID matrix stopped at cfg=%x",
+			     (u64)configs[i]);
+			return -1;
+		}
+	}
 	return 0;
 }
 

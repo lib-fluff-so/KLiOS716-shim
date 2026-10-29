@@ -69,23 +69,41 @@ clean-pixel/fast-clear path IS active and IS writing — but it drops half the r
 does not change that mask. The defect is currently isolated to this clear-only fragment
 result; the address-grid probe below checks the ordinary Write Value job path next.
 
-## Next discriminator: Write Value address grid (source added; hardware result pending)
+## Write Value address grid result (2026-10-29)
 
-`gpu_write_value_grid_test()` runs after the initial `WRITE VALUE PASS` and before the
-BO / compute / fragment tests. It submits 16 ordinary Write Value jobs to
-`GPU_VA_OUT + i*0x100` (`i=0..15`), covering all combinations of address bits [10:8]
-twice within the same mapped 4 KiB output page. Every target is initialized to a sentinel,
-then receives a distinct 64-bit value; the log reports a 16-bit pass/fail mask.
+The first 16-address test ran on KL7 and reproduced the fragment row mask using ordinary
+Write Value jobs:
 
-- Expected if the ordinary write path is healthy: `pass=000000000000ffff fail=0000000000000000`.
-- If it reproduces the same address-parity signature, expected masks are
-  `pass=0000000000006969 fail=0000000000009696` (or the reverse if the surviving parity
-  is opposite).
+```text
+GPU: WVALGRID pass=0000000000006969 fail=0000000000009696
+GPU: WVALGRID first offset=100 raw=1 got=5a5a5a5a5a5a5a5a want=a57e000000000002
+```
 
-A nonzero mismatch mask does not stop the later compute/fragment probes; a job submission
-or completion error does stop the run. The probe changes neither the FBD nor fragment
-configuration. Hardware outcome is still pending because this source has not yet been
-flashed and run on KL7.
+Every job completed with `raw=1`, yet stores at the failing offsets left the sentinel
+untouched. This proves the parity signature is not exclusive to the fragment clear-only
+path or its FBD. It points to a shared layer below the FBD, still to be identified.
+
+## Next discriminator: Write Value job-slot flush matrix (source added; hardware result pending)
+
+`gpu_write_value_grid_test()` now repeats the same 16 targets under seven JS_CONFIG modes,
+varying start and end flush controls while keeping the target page, values, slot and job
+descriptor unchanged:
+
+| Config | Start flush | End flush |
+|---|---|---|
+| `0x81300` | clean+invalidate | clean |
+| `0x81000` | none | clean |
+| `0x81100` | clean | clean |
+| `0x81200` | invalidate | clean |
+| `0x80300` | clean+invalidate | none |
+| `0x83300` | clean+invalidate | clean+invalidate |
+| `0x80000` | none | none |
+
+Each run logs `GPU: WVALGRID cfg=... pass=... fail=...`. If changing flush mode changes
+the address mask, the job-slot cache/flush path is implicated. If every mode reproduces
+`6969/9696`, the next experiment should vary GPU MMU memory attributes or the physical
+target layout rather than the fragment FBD. Hardware result is pending until this image
+is built and run on KL7.
 
 
 ## FBD layout (from Mesa v9.xml, matches our code)
