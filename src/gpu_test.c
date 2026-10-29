@@ -1845,13 +1845,13 @@ gpu_fragment_run(int slot, u32 width, u32 height, const char *tag, u32 cfg)
 static void
 gpu_job_status_dump(const char *tag, const volatile u32 *h)
 {
+	__asm__ volatile("dmb oshld" ::: "memory");
 	u32 status = h[0];
 	u32 task = h[1];
 	u64 fault = (u64)h[2] | ((u64)h[3] << 32);
 	u32 type = (h[4] >> 1) & 0x7fU;
 	u32 index = h[4] >> 16;
 
-	__asm__ volatile("dmb oshld" ::: "memory");
 	logf("GPU: JOBSTATUS %s status=%x task=%x fault=%w",
 	     tag, (u64)status, (u64)task, fault);
 	logf("GPU: JOBSTATUS %s type=%d index=%d next=%w",
