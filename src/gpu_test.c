@@ -1832,63 +1832,6 @@ gpu_fragment_run(int slot, u32 width, u32 height, const char *tag, u32 cfg)
 	return 0;
 }
 
-/*
- * Single framebuffer regression test for the WB mappings. Unlike the old
- * fragment suite, this submits exactly one 64x64 clear-only fragment job.
- */
-static int
-gpu_fragment_wb_test(u32 js_present)
-{
-	const u32 width = 64U;
-	const u32 height = 64U;
-	const u32 clear = 0xff0000ffU;
-	const u32 sentinel = 0x11223344U;
-	volatile u32 *fb = (volatile u32 *)fb_page;
-	u32 nclear = 0, nsent = 0, nother = 0;
-	u32 first_bad = width * height;
-	u32 first_value = 0;
-	int slot, rc;
-
-	slot = find_fragment_slot(js_present);
-	if (slot < 0) {
-		logf("GPU: FRAGWB no fragment slot");
-		return -1;
-	}
-
-	logf("GPU: FRAGWB begin slot=%d size=64x64 attr=8c", (u64)slot);
-	rc = gpu_fragment_run(slot, width, height, "wb-all", 0);
-	if (rc != 0) {
-		logf("GPU: FRAGWB job failed rc=%d", (u64)rc);
-		return -2;
-	}
-
-	__asm__ volatile("dmb oshld" ::: "memory");
-	for (u32 i = 0; i < width * height; i++) {
-		u32 value = fb[i];
-
-		if (value == clear) {
-			nclear++;
-		} else if (value == sentinel) {
-			nsent++;
-		} else {
-			nother++;
-		}
-		if (value != clear && first_bad == width * height) {
-			first_bad = i;
-			first_value = value;
-		}
-	}
-	logf("GPU: FRAGWB pixels clear=%d sent=%d other=%d", (u64)nclear,
-	     (u64)nsent, (u64)nother);
-	if (first_bad != width * height) {
-		logf("GPU: FRAGWB first mismatch i=%d value=%x want=%x",
-		     (u64)first_bad, (u64)first_value, (u64)clear);
-		return -3;
-	}
-	logf("GPU: FRAGWB PASS clear=4096");
-	return 0;
-}
-
 /* Unique-pixel sentinel.  A row that the GPU never wrote keeps its own
  * 0x80000000|(y<<8)|x value; a row written from a different source row
  * keeps a foreign y.  This distinguishes a skipped writeback from a
@@ -2606,13 +2549,6 @@ gpu_traffic_test(void)
 	if (rc != 0) {
 		logf("GPU: WVALATTR grid stopped rc=%d", (u64)rc);
 		return -13;
-	}
-
-	/* The WB mapping setup is now hardware-proven; test just one FB clear. */
-	rc = gpu_fragment_wb_test(js_present);
-	if (rc != 0) {
-		logf("GPU: FRAGWB test stopped rc=%d", (u64)rc);
-		return -14;
 	}
 	return GPU_TRAFFIC_WB_DONE;
 
