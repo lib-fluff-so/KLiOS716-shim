@@ -2,18 +2,22 @@
 
 ## Status (2026-10-29)
 
-**Visual diagnostic is now visible.** The `console_visual_result()` card draws at
-`FB_BASE + 0` (offset 0, full screen 1080×2436, stride 4352), matching the working
-`main` branch console. Previously it drew page B at `FB_ALT_OFFSET = 1230 * stride`
-(0xFE519E00) which is NOT the scanned page — nothing was visible.
+**Text-console recovery build (2026-10-29).** The GPU test had a full-screen
+visual-card call at its entry, then redrew the whole framebuffer after each MMU
+attribute mode. That intentionally erased the early text log and could leave no
+useful stage text on screen if a later register/job operation hung. The current
+test path does not call those overlays: startup and per-address progress remain
+in the regular framebuffer console, and the same lines are mirrored to ramoops.
 
-Build: `make OUT=out-gpu-memattr GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0`
+Build: `make OUT=out-gpu-text GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0`
 
-Each of the seven output-page MMU attribute modes is shown full-screen for one second with its pass/fail
-mask. After mode 7, the shim immediately issues PSCI `SYSTEM_RESET` (warm, keeps ramoops).
-This matrix-only path skips later BO/compute/fragment probes so they do not overwrite the
-final result card. Flash **only `boot_b`**, never `boot_a`; then `fastboot reboot`
-to return to Android and read `/sys/fs/pstore/console-ramoops-0`.
+The seven output-page MMU attribute modes still run, with the pass/fail masks and
+the GPU virtual offset printed as text. Each mode keeps a one-second pause so
+the last progress lines can be seen. After mode 7, the shim issues PSCI
+`SYSTEM_RESET` (warm, preserves ramoops). The matrix-only path skips later
+BO/compute/fragment probes. Flash **only `boot_b`**, never `boot_a`; use the
+project's Antumbra recovery route if the B-slot boot loop prevents Android from
+starting, and retrieve `/sys/fs/pstore/console-ramoops-0` after recovery.
 
 ## What works (proven)
 
