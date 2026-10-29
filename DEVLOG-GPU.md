@@ -1,4 +1,4 @@
-# DEVLOG-GPU — KL7 Mali-G57 Valhall fragment clear/writeback defect
+# DEVLOG-GPU — KL7 Mali-G57 Valhall output-memory attributes and fragment writeback
 
 ## Status (2026-10-29)
 
@@ -7,13 +7,14 @@
 `main` branch console. Previously it drew page B at `FB_ALT_OFFSET = 1230 * stride`
 (0xFE519E00) which is NOT the scanned page — nothing was visible.
 
-Build: `make OUT=out-gpu-memattr GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0`
+Build: `make OUT=out-gpu-wb-retest GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0`
 
-Each of the seven output-page MMU attribute modes is shown full-screen for one second with its pass/fail
-mask. After mode 7, the shim immediately issues PSCI `SYSTEM_RESET` (warm, keeps ramoops).
-This matrix-only path skips later BO/compute/fragment probes so they do not overwrite the
-final result card. Flash **only `boot_b`**, never `boot_a`; then `fastboot reboot`
-to return to Android and read `/sys/fs/pstore/console-ramoops-0`.
+The latest KL7 log shows that the Write Value 16-address grid fails for every AttrIdx tested
+with the non-cacheable byte `0x4c`, but passes all 16 addresses with Write-Back bytes `0x88`,
+`0x8c`, and `0x8f`. The next build fixes all GPU output targets at AttrIdx=4 / `AS_MEMATTR=0x8c`,
+confirms the grid once (one-second result card), then resumes BO, multi-slot, compute, fragment,
+and MMU-fault tests. The full GPU test path warm-resets to Android afterward. Flash **only
+`boot_b`**, never `boot_a`; read `/sys/fs/pstore/console-ramoops-0` after Android returns.
 
 ## What works (proven)
 
@@ -26,7 +27,7 @@ to return to Android and read `/sys/fs/pstore/console-ramoops-0`.
 - Panel path works: 8 color bars draw correctly (white yellow cyan green pink red blue + near-black)
 - Pixel format is RGBA8 as expected (no R/B swap)
 
-## The defect (unresolved)
+## Original fragment row-mask defect
 
 Fragment clear-only job writes only HALF the rows of the 64×64 render target.
 
@@ -68,9 +69,10 @@ writeback-drop, not a scrambling.
 
 Key observation: `noclean` (clean-pixel write enable = 0) produces ZERO writeback. So the
 clean-pixel/fast-clear path IS active and IS writing — but it drops half the rows. MSAA4
-does not change that mask. The subsequent Write Value grid reproduces the same parity mask
-on ordinary GPU jobs, so the defect is not isolated to the clear-only fragment/FBD path.
-The next discriminator is the job-slot flush matrix.
+does not change that mask. The initial Write Value grid reproduced the same parity mask on
+ordinary GPU jobs. The follow-up AS_MEMATTR test found a strong discriminator: all tested
+non-cacheable modes fail, while all three Write-Back modes pass every address. The fragment
+framebuffer still needs a full-suite rerun with Write-Back attributes.
 
 ## Write Value address grid result (2026-10-29)
 
@@ -86,29 +88,38 @@ Every job completed with `raw=1`, yet stores at the failing offsets left the sen
 untouched. This proves the parity signature is not exclusive to the fragment clear-only
 path or its FBD. It points to a shared layer below the FBD, still to be identified.
 
-## Output-page MMU attribute matrix (source updated; hardware result pending)
+## AS_MEMATTR matrix result and full-suite retest (2026-10-29)
 
-The prior JS_CONFIG flush-mode matrix was reported to show the same FAIL result in every
-mode. The targeted test now varies only the output page's PTE AttrIdx and matching AS_MEMATTR
-entry. Each of seven modes draws its pass/fail mask full-screen for one second; after mode 7,
-main issues warm PSCI `SYSTEM_RESET`. Later BO/compute/fragment probes are skipped.
+The seven-mode matrix ran on KL7 and produced:
 
-Modes 1-4 keep the output memory type non-cacheable (`0x4c`) while selecting different PTE
-AttrIdx values. Modes 5-7 apply write-back attributes (`0x88`, `0x8c`, `0x8f`) only to the
-output page. The job descriptor, job page, and other mapped buffers remain on the original
-non-cacheable AttrIdx=5. Each run logs the selected AttrIdx, attribute byte, PTE value, full
-AS_MEMATTR register pair, and the 16-address pass/fail masks.
+| Mode | PTE AttrIdx | AS_MEMATTR byte | Result |
+|---|---:|---:|---|
+| 1 | 5 | `0x4c` | `pass=6969 fail=9696` |
+| 2 | 4 | `0x4c` | `pass=6969 fail=9696` |
+| 3 | 6 | `0x4c` | `pass=6969 fail=9696` |
+| 4 | 7 | `0x4c` | `pass=6969 fail=9696` |
+| 5 | 4 | `0x88` | `pass=ffff fail=0000` |
+| 6 | 4 | `0x8c` | `pass=ffff fail=0000` |
+| 7 | 4 | `0x8f` | `pass=ffff fail=0000` |
+
+Changing AttrIdx while keeping `0x4c` does not change the failure. Switching the
+AS_MEMATTR byte to Write-Back makes the 16-address Write Value test pass. Mode 6
+(`AttrIdx=4`, `0x8c`) is the selected test configuration; allocation-bit variants are
+not being changed independently until the full-suite result is known.
+
+The next build changes AttrIdx to 4 for both Write Value output pages and all four framebuffer
+pages, sets entry 4 in AS_MEMATTR to `0x8c`, then runs one 16-address confirmation and continues
+through BO mapping/remap, multi-slot, compute store, fragment clear and the deliberate MMU fault.
+The fragment result remains pending until this new boot is run.
 
 Build:
 
 ```sh
-make OUT=out-gpu-memattr GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0
+make OUT=out-gpu-wb-retest GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0
 ```
 
 Flash **only `boot_b`**, never `boot_a`. After Android returns, read
-`/sys/fs/pstore/console-ramoops-0`. Hardware results are pending until this image is built
-and run on KL7.
-
+`/sys/fs/pstore/console-ramoops-0`.
 
 ## FBD layout (from Mesa v9.xml, matches our code)
 
@@ -165,7 +176,7 @@ path that does not have the parity bug.
 
 ```sh
 # Build seven-mode flush matrix (one second per result, then warm reset)
-make OUT=out-gpu-flush-matrix GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0
+make OUT=out-gpu-wb-retest GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0
 
 # Flash only boot_b (device in fastboot/LK)
 fastboot flash boot_b out-gpu-flush-matrix/shim_b.img
