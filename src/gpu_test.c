@@ -1836,6 +1836,29 @@ gpu_fragment_run(int slot, u32 width, u32 height, const char *tag, u32 cfg)
  * Single framebuffer regression test for the WB mappings. Unlike the old
  * fragment suite, this submits exactly one 64x64 clear-only fragment job.
  */
+/* Read back the hardware-written v9 job header after wait_job().
+ * Header words 0..3 contain exception status, first incomplete task, and the
+ * 64-bit fault pointer; word 4 contains the immutable type/index fields.
+ * Keep this diagnostic read-only and report raw values rather than guessing
+ * from JOB_INT_RAWSTAT alone.
+ */
+static void
+gpu_job_status_dump(const char *tag, const volatile u32 *h)
+{
+	u32 status = h[0];
+	u32 task = h[1];
+	u64 fault = (u64)h[2] | ((u64)h[3] << 32);
+	u32 type = (h[4] >> 1) & 0x7fU;
+	u32 index = h[4] >> 16;
+
+	__asm__ volatile("dmb oshld" ::: "memory");
+	logf("GPU: JOBSTATUS %s status=%x task=%x fault=%w",
+	     tag, (u64)status, (u64)task, fault);
+	logf("GPU: JOBSTATUS %s type=%d index=%d next=%w",
+	     tag, (u64)type, (u64)index,
+	     (u64)h[6] | ((u64)h[7] << 32));
+}
+
 static int
 gpu_fragment_wb_test(u32 js_present)
 {
@@ -1859,9 +1882,11 @@ gpu_fragment_wb_test(u32 js_present)
 	rc = gpu_fragment_run(slot, width, height, "wb-all", 0);
 	if (rc != 0) {
 		logf("GPU: FRAGWB job failed rc=%d", (u64)rc);
+		gpu_job_status_dump("FRAGWB-FAIL", (const volatile u32 *)frag_job_page);
 		return -2;
 	}
 
+	gpu_job_status_dump("FRAGWB", (const volatile u32 *)frag_job_page);
 	__asm__ volatile("dmb oshld" ::: "memory");
 	for (u32 i = 0; i < width * height; i++) {
 		u32 value = fb[i];
