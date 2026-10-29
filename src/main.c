@@ -17,6 +17,7 @@ typedef __builtin_va_list va_list;
 #include "ufs_test.h"
 #include "touch_test.h"
 #include "battery_test.h"
+#include "gpu_test.h"
 
 #ifndef RAMOOPS_LOG
 #define RAMOOPS_LOG 1
@@ -33,6 +34,9 @@ typedef __builtin_va_list va_list;
 #ifndef BATTERY_TEST
 #define BATTERY_TEST 0
 #endif
+#ifndef GPU_TEST
+#define GPU_TEST 0
+#endif
 #ifndef CHARGER_WRITE_TEST
 #define CHARGER_WRITE_TEST 0
 #endif
@@ -45,6 +49,9 @@ typedef __builtin_va_list va_list;
 #endif
 #ifndef PSCI_RESET_TIMER
 #define PSCI_RESET_TIMER 1
+#endif
+#ifndef VISUAL_HOLD_SECONDS
+#define VISUAL_HOLD_SECONDS 0
 #endif
 
 #define FB_BASE               0xFDFFF000UL
@@ -93,10 +100,10 @@ typedef __builtin_va_list va_list;
 #endif
 /* WDT_DISABLE_AT_HANDOFF=1: stop the watchdog before a long-running path so a
  * multi-minute kernel boot or a halted diagnostic is not reset. Default on for
- * XNU_PAYLOAD=1 and BATTERY_TEST=1; the short auto-reset test builds keep the
- * watchdog as a safety net. */
+ * XNU_PAYLOAD=1, BATTERY_TEST=1 and GPU_TEST=1; the short auto-reset test builds
+ * keep the watchdog as a safety net. */
 #ifndef WDT_DISABLE_AT_HANDOFF
-#define WDT_DISABLE_AT_HANDOFF (XNU_PAYLOAD || BATTERY_TEST)
+#define WDT_DISABLE_AT_HANDOFF (XNU_PAYLOAD || BATTERY_TEST || GPU_TEST)
 #endif
 
 #define RD(reg) ({ u64 v_; __asm__ volatile("mrs %0, " #reg : "=r"(v_)); v_; })
@@ -353,6 +360,23 @@ static __attribute__((noreturn)) void psci_system_reset(void)
     for (;;) __asm__ volatile("wfe");
 }
 #endif /* AUTO_REBOOT_TEST */
+
+#if VISUAL_HOLD_SECONDS
+/* Keep the on-screen visual card visible long enough to photograph.  This is
+ * a plain architectural-timer spin: no interrupts, no secondary CPU and no
+ * memory writes, so it cannot disturb the display or the GPU state. */
+static void visual_hold(u64 seconds)
+{
+    u64 freq, start, now;
+
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(start));
+    for (;;) {
+        __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
+        if (now - start >= freq * seconds) break;
+    }
+}
+#endif
 
 #if AUTO_REBOOT_TEST || UFS_TEST || !XNU_PAYLOAD
 static __attribute__((noreturn)) void finish_test_attempt(const char *reason)
@@ -826,6 +850,40 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
     finish_test_attempt("BATTERY probe done");
 #else
     logf("BATTERY TEST: halting (power-cycle to fastboot)");
+    for (;;) __asm__ volatile("wfe");
+#endif
+#endif
+
+#if GPU_TEST
+#if WDT_DISABLE_AT_HANDOFF
+    wdt_disable();
+#endif
+    logf("GPU TEST: Mali probe (XNU will not be loaded)");
+#if AUTO_REBOOT_TEST && PSCI_RESET_TIMER
+    /* Warm-reset backstop: if a register access hangs, cpu1 will still issue
+     * PSCI SYSTEM_RESET and preserve ramoops for the next Android boot. */
+    psci_start_reset_timer();
+#endif
+    gpu_test();
+    logf("GPU TEST: probe returned");
+#if VISUAL_HOLD_SECONDS
+    logf("VISUAL: hold %d s before PSCI SYSTEM_RESET", (u64)VISUAL_HOLD_SECONDS);
+#endif
+    gpu_visual_result();
+#if VISUAL_HOLD_SECONDS
+    visual_hold(VISUAL_HOLD_SECONDS);
+#endif
+#if AUTO_REBOOT_TEST
+#if VISUAL_HOLD_SECONDS
+    /* No log after the card: the visible result stays until the warm reset. */
+    psci_system_reset();
+#else
+    finish_test_attempt("GPU probe done");
+#endif
+#else
+#if !VISUAL_HOLD_SECONDS
+    logf("GPU TEST: halting (power-cycle to boot iOS)");
+#endif
     for (;;) __asm__ volatile("wfe");
 #endif
 #endif

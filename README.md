@@ -53,6 +53,19 @@ grep -nE 'ios-kl7|console:|HANDOFF|REBOOT:|ERROR:|PANIC:' ~/kl7-shim.log
 
 The shim currently writes to the KL7 ramoops console zone at `0x480EF000` within the `0x48090000..0x4816ffff` reserved region. This is based on the supplied KL7 DTB/kernel layout and must be revalidated if that layout changes. If `console-ramoops-0` is absent, inspect `ls /sys/fs/pstore` instead of assuming a filename.
 
+## GPU probe
+
+KL7 has a Mali-G57 MC2, not an Adreno GPU.  The read-only Mali probe and the
+current hardware register map are documented in `GPU-BRINGUP.md`.  Build the
+safe probe with:
+
+```sh
+make OUT=out-gpu-test GPU_TEST=1 GPU_POWER_TEST=0 AUTO_REBOOT_TEST=0
+```
+
+Do not flash the experimental `GPU_POWER_TEST=1` image without reading that
+document first.
+
 ## Optional XNU-container build
 
 This mode is for host-side packaging/loader experiments. Supply a real ARM64 Mach-O kernelcache accepted by `tools/mkpayload_xnu.py`; ideally also supply the genuine D22AP Apple Device Tree extracted from an iPhone X IPSW:
