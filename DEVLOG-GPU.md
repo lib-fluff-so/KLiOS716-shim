@@ -1,31 +1,62 @@
-# DEVLOG-GPU — KL7 Mali-G57 Valhall fragment clear/writeback defect
+# DEVLOG-GPU — KL7 Mali-G57 Valhall GPU bring-up
 
-## Status (2026-10-29)
+## Current status (2026-10-29, branch `gpu-going-forward`)
 
-**Fragment WB test rolled back.** After adding a single 64x64 fragment job after
-the previously passing Write Value grid, the user reported a hang with no visible
-lines. No pstore capture from that attempt is available here, so the stuck stage
-is unconfirmed. Commit `9999d5e9580031496ae55eac772a27fe8dcac9f9` restores the
-known-good matrix-only source: all output PTEs use AttrIdx=4 / `0x8c`, one
-16-address Write Value grid runs, then the existing warm reset occurs. The
-fragment job is disabled again until stage-by-stage diagnostics are added.
+**All-output write-back and the isolated fragment clear both pass on the KL7.**
+The latest device log ends with:
 
-**Text-console recovery build (2026-10-29).** The GPU test had a full-screen
-visual-card call at its entry, then redrew the whole framebuffer after each MMU
-attribute mode. That intentionally erased the early text log and could leave no
-useful stage text on screen if a later register/job operation hung. The current
-test path does not call those overlays: startup and per-address progress remain
-in the regular framebuffer console, and the same lines are mirrored to ramoops.
+```text
+GPU: WVALATTR idx=4 attr=8c pass=000000000000ffff fail=0000000000000000
+GPU: FRAGWB begin slot=0 size=64x64 attr=8c
+GPU: JS0 submit head=40086000 af=5 cfg=81300
+GPU: FRAGPROBE wb-all cacheclean rc=0 raw=20600
+GPU: FRAGPROBE wb-all w=64 h=64 rc=0 raw=1 clear=4096 sent=0 other=0
+GPU: FRAGPROBE wb-all rowmask clear=ffffffffffffffff sent=0000000000000000 mixed=0000000000000000
+GPU: FRAGWB pixels clear=4096 sent=0 other=0
+GPU: FRAGWB PASS clear=4096
+```
 
-Build: `make OUT=out-gpu-text GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0 WDT_DISABLE_AT_HANDOFF=0`
+Every one of the 16 Write Value addresses passed under output AttrIdx=4 /
+`0x8c`. The fragment clear then wrote the expected color to all 4096 pixels
+in a 64x64 linear test buffer. This is a real fragment job and write-back
+result, but it is still the clear-only path: the job does not execute a vertex
+shader or draw geometry.
 
-The seven output-page MMU attribute modes still run, with the pass/fail masks and
-the GPU virtual offset printed as text. Each mode keeps a one-second pause so
-the last progress lines can be seen. After mode 7, the shim issues PSCI
-`SYSTEM_RESET` (warm, preserves ramoops). The matrix-only path skips later
-BO/compute/fragment probes. Flash **only `boot_b`**, never `boot_a`; use the
-project's Antumbra recovery route if the B-slot boot loop prevents Android from
-starting, and retrieve `/sys/fs/pstore/console-ramoops-0` after recovery.
+The earlier rollback entry below is historical. The fragment test is enabled
+again in `gpu-going-forward`, isolated after the known-good write-back grid.
+A read-only job-header dump has now been added after the fragment job wait. It
+logs the GPU-written exception status, first-incomplete-task value, fault
+pointer, job type/index, and next-job pointer. These fields give us the next
+level of evidence when moving to a `MALLOC_VERTEX` test; this source change has
+not yet been built or run on the phone.
+
+## Immediate next milestone
+
+Reach a CPU-verifiable triangle in a linear framebuffer. The next test must use
+the Valhall v9 `MALLOC_VERTEX_JOB` (job type 11), which combines position
+shader execution, varying setup, and tiling, followed by the existing fragment
+job. It is not the older IDVS-helper descriptor from some early Mali examples.
+
+Use stage-by-stage evidence:
+1. Dump the fully populated `MALLOC_VERTEX_JOB` bytes and relevant shader
+   descriptors before submit.
+2. Read back the GPU-written job header after completion, including exception
+   status and fault pointer.
+3. Inspect the tiler heap after the job to determine whether tiler output was
+   allocated/written.
+4. Run fragment only after the vertex/tiler stage returns and the descriptors
+   can be checked. Scan the framebuffer on the CPU.
+
+The external [Noysz/panvk-g99-jm porting log](https://github.com/Noysz/panvk-g99-jm/blob/main/docs/porting-log.md)
+is a highly relevant G57/G99 reference. It records a case where a v9
+`MALLOC_VERTEX` and fragment job both report completion, yet the framebuffer
+contains only the clear color. The remaining hypotheses there include the
+position shader's actual machine code, selecting the triangle rather than
+point position-shader descriptor, vertex-array packet fields, and tiler-heap
+allocation. Do not count a job-completion bit alone as proof that geometry was
+generated.
+
+## Previous diagnostic history
 
 ## What works (proven)
 
