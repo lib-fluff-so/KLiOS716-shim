@@ -24,28 +24,31 @@ shader or draw geometry.
 
 The earlier rollback entry below is historical. The fragment test is enabled
 again in `gpu-going-forward`, isolated after the known-good write-back grid.
-A read-only job-header dump has now been added after the fragment job wait. It
-logs the GPU-written exception status, first-incomplete-task value, fault
-pointer, job type/index, and next-job pointer. These fields give us the next
-level of evidence when moving to a `MALLOC_VERTEX` test; this source change has
-not yet been built or run on the phone.
+A read-only job-header dump now runs after the fragment job wait. It logs
+the GPU-written exception status, first-incomplete-task value, fault pointer,
+job type/index, and next-job pointer.
+
+A first `MALLOC_VERTEX_JOB` baseline now follows the passing clear. It selects
+a JS slot with feature bit 12 (expected slot 1 on this G57), builds a 384-byte
+v9 job descriptor with a Vertex-stage `NOP.end` shader, and scans the tiler
+heap before/after submission. The NOP deliberately produces no expected
+geometry; this test only isolates JM routing/descriptor acceptance and records
+status/fault/heap evidence. It is new code and has not yet been built or run on
+the phone.
 
 ## Immediate next milestone
 
-Reach a CPU-verifiable triangle in a linear framebuffer. The next test must use
-the Valhall v9 `MALLOC_VERTEX_JOB` (job type 11), which combines position
-shader execution, varying setup, and tiling, followed by the existing fragment
-job. It is not the older IDVS-helper descriptor from some early Mali examples.
+First run the new `MALLOC_VERTEX_JOB` NOP baseline on-device and inspect:
+1. whether the selected JS slot accepts job type 11;
+2. the GPU-written header (exception status, first incomplete task, fault
+   pointer, type/index, next-job pointer);
+3. whether the zeroed tiler heap changes during a geometry-less job.
 
-Use stage-by-stage evidence:
-1. Dump the fully populated `MALLOC_VERTEX_JOB` bytes and relevant shader
-   descriptors before submit.
-2. Read back the GPU-written job header after completion, including exception
-   status and fault pointer.
-3. Inspect the tiler heap after the job to determine whether tiler output was
-   allocated/written.
-4. Run fragment only after the vertex/tiler stage returns and the descriptors
-   can be checked. Scan the framebuffer on the CPU.
+Then replace the Vertex NOP with a real position shader and add the minimal
+required vertex/attribute packet. Only after that should we connect the
+vertex/tiler job to the already-working clear-only fragment path, then add a
+fragment shader for a coloured triangle. This follows the v9 layout rather
+than the older IDVS-helper descriptor used by early Mali examples.
 
 The external [Noysz/panvk-g99-jm porting log](https://github.com/Noysz/panvk-g99-jm/blob/main/docs/porting-log.md)
 is a highly relevant G57/G99 reference. It records a case where a v9
