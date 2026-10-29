@@ -603,10 +603,31 @@ static const u64 compute_shader_code[] = {
 	0x7800c00000000000ULL,
 };
 
-/* Smallest possible Valhall shader: NOP.end.  If this faults, the
- * compute descriptor/pointer is wrong, not the store sequence. */
+/* Smallest possible Valhall compute shader: NOP.end. */
 static const u64 compute_nop_code[] = {
 	0x7800c00000000000ULL,
+};
+
+/*
+ * Valhall v9 position-store smoke shader, assembled from these instructions:
+ *   IADD_IMM.i32 r0, 0x0, #0x00000000
+ *   IADD_IMM.i32 r1, 0x0, #0x00000000
+ *   IADD_IMM.i32 r2, 0x0, #0x00000000
+ *   IADD_IMM.i32 r3, 0x3F800000, #0x00000000
+ *   LEA_ATTR.slot0.wait0 @r4:r5, `r59, unk:0xD
+ *   STORE.i128.pos.slot0.return @r0:r1:r2:r3, `r4, offset:0
+ *
+ * Every invocation writes a valid clip-space (0,0,0,1) position. The three
+ * vertices are intentionally coincident: this only validates position output
+ * and job acceptance; a visible triangle requires a later per-vertex input.
+ */
+static const u64 vertex_position_smoke_code[] = {
+	0x0110c000000000c0ULL,
+	0x0110c100000000c0ULL,
+	0x0110c200000000c0ULL,
+	0x0110c300000000d0ULL,
+	0x085e840400000d7bULL,
+	0x7861400839000004ULL,
 };
 static u64 bo_pool[BO_POOL_PAGES][512] __attribute__((aligned(4096)));
 static u32 bo_used;
@@ -1848,6 +1869,43 @@ gpu_fragment_run(int slot, u32 width, u32 height, const char *tag, u32 cfg)
  * Keep this diagnostic read-only and report raw values rather than guessing
  * from JOB_INT_RAWSTAT alone.
  */
+static const char *
+gpu_job_exception_name(u32 code)
+{
+	switch (code) {
+	case 0x40: return "JOB_CONFIG_FAULT";
+	case 0x41: return "JOB_POWER_FAULT";
+	case 0x42: return "JOB_READ_FAULT";
+	case 0x43: return "JOB_WRITE_FAULT";
+	case 0x44: return "JOB_AFFINITY_FAULT";
+	case 0x48: return "JOB_BUS_FAULT";
+	case 0x50: return "INSTR_INVALID_PC";
+	case 0x51: return "INSTR_INVALID_ENC";
+	case 0x52: return "INSTR_TYPE_MISMATCH";
+	case 0x53: return "INSTR_OPERAND_FAULT";
+	case 0x54: return "INSTR_TLS_FAULT";
+	case 0x55: return "INSTR_BARRIER_FAULT";
+	case 0x56: return "INSTR_ALIGN_FAULT";
+	case 0x58: return "DATA_INVALID_FAULT";
+	case 0x59: return "TILE_RANGE_FAULT";
+	case 0x5a: return "ADDRESS_RANGE_FAULT";
+	case 0x60: return "OUT_OF_MEMORY";
+	case 0x7f: return "UNKNOWN";
+	default: return "OTHER";
+	}
+}
+
+static const char *
+gpu_job_access_name(u32 access)
+{
+	switch (access) {
+	case 1: return "EXECUTE";
+	case 2: return "READ";
+	case 3: return "WRITE";
+	default: return "NONE";
+	}
+}
+
 static void
 gpu_job_status_dump(const char *tag, const volatile u32 *h)
 {
@@ -1863,6 +1921,17 @@ gpu_job_status_dump(const char *tag, const volatile u32 *h)
 	logf("GPU: JOBSTATUS %s type=%d index=%d next=%w",
 	     tag, (u64)type, (u64)index,
 	     (u64)h[6] | ((u64)h[7] << 32));
+	if (status == 1U) {
+		logf("GPU: JOBSTATUS %s decoded=DONE", tag);
+	} else if (status >= 0x40U) {
+		logf("GPU: JOBSTATUS %s decoded=%s access=%s source=%x",
+		     tag, gpu_job_exception_name(status & 0xffU),
+		     gpu_job_access_name((status >> 8) & 3U),
+		     (u64)(status >> 16));
+	} else {
+		logf("GPU: JOBSTATUS %s decoded=NONFAULT status=%x",
+		     tag, (u64)status);
+	}
 }
 
 static int
@@ -2030,9 +2099,9 @@ gpu_tiler_heap_scan(const char *tag)
 }
 
 static int
-gpu_malloc_vertex_nop_test(u32 js_present)
+gpu_malloc_vertex_position_smoke_test(u32 js_present)
 {
-	volatile u32 *shader_code = (volatile u32 *)shader_nop_page;
+	volatile u64 *shader_code = (volatile u64 *)shader_nop_page;
 	volatile u32 *ds_desc = (volatile u32 *)out_page;
 	volatile u32 *blend_desc = (volatile u32 *)out_page2;
 	u32 raw = 0;
@@ -2057,9 +2126,12 @@ gpu_malloc_vertex_nop_test(u32 js_present)
 	for (u32 i = 0; i < 32768; i++)
 		tiler_data_page[i] = 0;
 
-	shader_code[0] = (u32)compute_nop_code[0];
-	shader_code[1] = (u32)(compute_nop_code[0] >> 32);
+	for (u32 i = 0; i < sizeof(vertex_position_smoke_code) /
+			     sizeof(vertex_position_smoke_code[0]); i++)
+		shader_code[i] = vertex_position_smoke_code[i];
 	build_shader_desc_stage(shader_desc_page, GPU_VA_SHADER_NOP, 3U);
+	((volatile u32 *)shader_desc_page)[1] = 1U << 11;	/* preload linear ID in r59 */
+	dsb_sy();
 	ds_desc[0] = 7U;	/* Descriptor Type::Depth/stencil */
 	ds_desc[4] = 1U << 22;	/* Depth cull enable, matching primitive state */
 	blend_desc[0] = 0U;	/* blending disabled */
@@ -2068,8 +2140,10 @@ gpu_malloc_vertex_nop_test(u32 js_present)
 	build_tiler_context(tiler_ctx_page, GPU_VA_TILER_HEAP, 64U, 64U);
 	build_malloc_vertex_nop_job(job_page);
 
-	logf("GPU: MALLOCV start slot=%d job=%x shader=%x code=%x",
-	     (u64)slot, GPU_VA_JOB, GPU_VA_SHADER_DESC, GPU_VA_SHADER_NOP);
+	logf("GPU: POS-SMOKE start slot=%d job=%x shader=%x code=%x words=%d preload=%x",
+	     (u64)slot, GPU_VA_JOB, GPU_VA_SHADER_DESC, GPU_VA_SHADER_NOP,
+	     (u64)(sizeof(vertex_position_smoke_code) / sizeof(vertex_position_smoke_code[0])),
+	     (u64)((volatile u32 *)shader_desc_page)[1]);
 	logf("GPU: MALLOCV hdr=%x/%x/%x/%x/%x",
 	     (u64)((volatile u32 *)job_page)[0],
 	     (u64)((volatile u32 *)job_page)[1],
@@ -2088,7 +2162,7 @@ gpu_malloc_vertex_nop_test(u32 js_present)
 		 ((u64)((volatile u32 *)job_page)[15] << 32),
 	     (u64)((volatile u32 *)job_page)[26],
 	     (u64)((volatile u32 *)job_page)[27]);
-	logf("GPU: MALLOCV position shader=%w tls=%w ds=%w blend=%w",
+	logf("GPU: POS-SMOKE position shader=%w tls=%w ds=%w blend=%w",
 	     (u64)((volatile u32 *)job_page)[74] |
 		 ((u64)((volatile u32 *)job_page)[75] << 32),
 	     (u64)((volatile u32 *)job_page)[76] |
@@ -2097,24 +2171,25 @@ gpu_malloc_vertex_nop_test(u32 js_present)
 		 ((u64)((volatile u32 *)job_page)[43] << 32),
 	     (u64)((volatile u32 *)job_page)[44] & ~0xfULL);
 
-	gpu_tiler_heap_scan("before-MALLOCV");
+	gpu_tiler_heap_scan("before-POS-SMOKE");
 	rc = run_write_value_job(slot, GPU_VA_JOB, js_present, &raw);
-	gpu_job_status_dump("MALLOCV-NOP", (const volatile u32 *)job_page);
-	logf("GPU: MALLOCV rc=%d raw=%x js=%x state=%x", (u64)rc,
-	     (u64)raw, (u64)rd32(GPU_BASE + JS_STATUS(slot)),
+	gpu_job_status_dump("POS-SMOKE", (const volatile u32 *)job_page);
+	logf("GPU: POS-SMOKE rc=%s%d raw=%x js=%x state=%x",
+	     rc < 0 ? "-" : "+", (u64)(rc < 0 ? -rc : rc), (u64)raw,
+	     (u64)rd32(GPU_BASE + JS_STATUS(slot)),
 	     (u64)rd32(GPU_BASE + JOB_INT_JS_STATE));
 	if (rc != 0) {
 		u32 mraw = rd32(GPU_BASE + MMU_INT_RAWSTAT);
 		u32 fstat = rd32(GPU_BASE + AS_FAULTSTATUS);
 		u64 faddr = (u64)rd32(GPU_BASE + AS_FAULTADDRESS_LO) |
 			    ((u64)rd32(GPU_BASE + AS_FAULTADDRESS_HI) << 32);
-		logf("GPU: MALLOCV fault mraw=%x fstat=%x faddr=%w",
+		logf("GPU: POS-SMOKE fault mraw=%x fstat=%x faddr=%w",
 		     (u64)mraw, (u64)fstat, faddr);
 		return -2;
 	}
 
-	gpu_tiler_heap_scan("after-MALLOCV");
-	logf("GPU: MALLOCV NOP JOB PASS (geometry not expected)");
+	gpu_tiler_heap_scan("after-POS-SMOKE");
+	logf("GPU: POS-SMOKE PASS (valid position output; vertices are coincident)");
 	return 0;
 }
 
@@ -2845,11 +2920,12 @@ gpu_traffic_test(void)
 		return -14;
 	}
 
-	/* First isolate the v9 MALLOC_VERTEX job/position-descriptor path. The
-	 * Vertex-stage NOP is intentional: no triangle is claimed at this stage. */
-	rc = gpu_malloc_vertex_nop_test(js_present);
+	/* Check a real position-store shader before adding per-vertex geometry.
+	 * All invocations currently emit (0,0,0,1), so no visible triangle is expected. */
+	rc = gpu_malloc_vertex_position_smoke_test(js_present);
 	if (rc != 0) {
-		logf("GPU: MALLOCV probe stopped rc=%d", (u64)rc);
+		logf("GPU: POS-SMOKE stopped rc=%s%d",
+		     rc < 0 ? "-" : "+", (u64)(rc < 0 ? -rc : rc));
 		return -15;
 	}
 	return GPU_TRAFFIC_WB_DONE;
