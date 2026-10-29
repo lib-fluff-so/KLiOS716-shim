@@ -1,0 +1,233 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -101,16 +101,42 @@
+ #define UFS_REFCLK_ACK                  0x2
+ 
+ #define IS_UIC_ERROR                    (1u << 2)
++#define IS_UIC_POWER_MODE               (1u << 4)
+ #define IS_UIC_COMMAND_COMPL            (1u << 10)
++#define HCS_UPMCRS_PWR_LOCAL            1u
++#define KL7_UFS_HS_GEAR                 3u
+ 
+ #define UIC_CMD_DME_GET                 0x01
+ #define UIC_CMD_DME_SET                 0x02
++#define UIC_CMD_DME_PEER_GET            0x03
++#define UIC_CMD_DME_PEER_SET            0x04
+ #define UIC_CMD_DME_ENABLE              0x12
+ #define UIC_CMD_DME_RESET               0x14
+ #define UIC_CMD_DME_LINK_STARTUP        0x16
+ 
+ #define PA_LOCAL_TX_LCC_ENABLE          0x155e
++#define PA_ACTIVETXDATALANES            0x1560
++#define PA_CONNECTEDTXDATALANES         0x1561
++#define PA_TXPWRSTATUS                  0x1567
++#define PA_TXGEAR                       0x1568
++#define PA_TXTERMINATION                0x1569
++#define PA_HSSERIES                     0x156a
+ #define PA_PWRMODE                      0x1571
++#define PA_ACTIVERXDATALANES            0x1580
++#define PA_CONNECTEDRXDATALANES         0x1581
++#define PA_RXPWRSTATUS                  0x1582
++#define PA_RXGEAR                       0x1583
++#define PA_RXTERMINATION                0x1584
++#define PA_MAXRXHSGEAR                  0x1587
++#define PA_PWRMODEUSERDATA0             0x15b0
++#define PA_PWRMODEUSERDATA1             0x15b1
++#define PA_PWRMODEUSERDATA2             0x15b2
++#define PA_PWRMODEUSERDATA3             0x15b3
++#define PA_PWRMODEUSERDATA4             0x15b4
++#define PA_PWRMODEUSERDATA5             0x15b5
++#define PA_TXHSADAPTTYPE                0x15d4
++#define PA_NO_ADAPT                     3
++#define PA_HS_MODE_B                    2
+ #define VS_UNIPROPOWERDOWNCONTROL       0xd0a8
+ #define VS_SAVEPOWERCONTROL             0xd0a6
+ 
+@@ -190,6 +216,7 @@
+ static struct ufs_io_interval ufsio;
+ static uint32_t ufs_spin;               /* ufsspin=1: 2 ms busy-poll; 2: poll only */
+ static bool ufs_nosync;                 /* ufsnosync=1: skip bounce cache maintenance */
++static bool ufs_hs;                     /* ufshs=1: perform the HS power change */
+ static uint32_t ufs_bench_mib;          /* ufsbench=N: read N MiB per size at attach */
+ static uint64_t ufs_last_pre_ns, ufs_last_hw_ns, ufs_last_post_ns;
+ static uint32_t ufs_last_polls;         /* phases of the most recent command */
+@@ -447,6 +474,150 @@
+ 	}
+ }
+ 
++/*
++ * v0117: the KL7 bootloader leaves UniPro in PWM (PA_PWRMODE=0x55, i.e.
++ * SLOWAUTO/SLOWAUTO).  The Android kernel then performs the standard HS
++ * power-mode change; this driver historically skipped it, which is why the
++ * link moved at PWM-G1 speed (~480 KiB/s).  The shim proved HS-G3 series B
++ * with two lanes sustains about 800 MiB/s, so use that here.
++ */
++static int
++mtk_hs_get(uint32_t opcode, uint32_t attr, const char *name, uint32_t *val)
++{
++	uint32_t v = 0;
++	uint32_t r = mtk_uic(opcode, attr << 16, 0, 0, &v);
++	printf("KL7 UFS: HS %s rc 0x%x val 0x%x\n", name, r, v);
++	if (val) {
++		*val = v;
++	}
++	return r ? EIO : 0;
++}
++
++static int
++mtk_hs_set(uint32_t attr, uint32_t val, const char *name)
++{
++	uint32_t v = 0;
++	uint32_t r = mtk_uic(UIC_CMD_DME_SET, attr << 16, 0, val, &v);
++	printf("KL7 UFS: HS set %s=%u rc 0x%x\n", name, val, r);
++	return r ? EIO : 0;
++}
++
++/*
++ * A DME_SET(PA_PWRMODE) completes in two stages: UIC_COMMAND_COMPL only says
++ * the command was accepted; IS.UIC_POWER_MODE and HCS.UPMCRS report the
++ * actual link change.  Linux's ufshcd_uic_pwr_ctrl() waits for both.
++ */
++static uint32_t
++mtk_hs_pwr_change(uint32_t mode, const char *name)
++{
++	uint32_t v = 0, is, hcs, upmcrs;
++	uint32_t r;
++
++	ufs_wr(REG_IS, IS_UIC_POWER_MODE);
++	r = mtk_uic(UIC_CMD_DME_SET, PA_PWRMODE << 16, 0, mode, &v);
++	printf("KL7 UFS: HS set %s=0x%x rc 0x%x\n", name, mode, r);
++	if (r) {
++		return r;
++	}
++	for (int i = 0; i < 10000; i++) {        /* 1 s */
++		if (ufs_rd(REG_IS) & IS_UIC_POWER_MODE) {
++			break;
++		}
++		delay(100);
++	}
++	is = ufs_rd(REG_IS);
++	hcs = ufs_rd(REG_HCS);
++	upmcrs = (hcs >> 8) & 7u;
++	ufs_wr(REG_IS, IS_UIC_POWER_MODE);
++	printf("KL7 UFS: HS %s done is 0x%x hcs 0x%x upmcrs %u\n",
++	    name, is, hcs, upmcrs);
++	if (!(is & IS_UIC_POWER_MODE)) {
++		return 0x100;
++	}
++	return upmcrs == HCS_UPMCRS_PWR_LOCAL ? 0 : (0x200u | upmcrs);
++}
++
++static int
++mtk_hs_switch(void)
++{
++	uint32_t rxlanes = 0, txlanes = 0, local = 0, peer = 0;
++	uint32_t pwr = 0, v = 0, r, gear = KL7_UFS_HS_GEAR, txgear = 0;
++
++	printf("KL7 UFS: HS enter\n");
++	if (mtk_hs_get(UIC_CMD_DME_GET, PA_CONNECTEDRXDATALANES,
++	    "connected_rx", &rxlanes) ||
++	    mtk_hs_get(UIC_CMD_DME_GET, PA_CONNECTEDTXDATALANES,
++	    "connected_tx", &txlanes)) {
++		return EIO;
++	}
++	if (mtk_hs_get(UIC_CMD_DME_GET, PA_MAXRXHSGEAR, "max_hs_local", &local) ||
++	    mtk_hs_get(UIC_CMD_DME_PEER_GET, PA_MAXRXHSGEAR, "max_hs_peer",
++	    &peer)) {
++		return EIO;
++	}
++	if (!rxlanes || !txlanes || rxlanes > 2 || txlanes > 2) {
++		printf("KL7 UFS: HS bad lanes rx %u tx %u\n", rxlanes, txlanes);
++		return EIO;
++	}
++	if (!peer) {
++		printf("KL7 UFS: HS peer has no HS gear\n");
++		return EIO;
++	}
++	if (gear > local) {
++		gear = local;
++	}
++	if (gear > peer) {
++		gear = peer;
++	}
++	if (!gear) {
++		printf("KL7 UFS: HS no usable gear\n");
++		return EIO;
++	}
++	printf("KL7 UFS: HS caps lanes %u/%u, max gear local %u peer %u, target %u\n",
++	    rxlanes, txlanes, local, peer, gear);
++
++	if (mtk_hs_set(PA_RXGEAR, gear, "rxgear") ||
++	    mtk_hs_set(PA_ACTIVERXDATALANES, rxlanes, "rxlanes") ||
++	    mtk_hs_set(PA_RXTERMINATION, 1, "rxterm") ||
++	    mtk_hs_set(PA_TXGEAR, gear, "txgear") ||
++	    mtk_hs_set(PA_ACTIVETXDATALANES, txlanes, "txlanes") ||
++	    mtk_hs_set(PA_TXTERMINATION, 1, "txterm") ||
++	    mtk_hs_set(PA_HSSERIES, PA_HS_MODE_B, "hsseries_b")) {
++		return EIO;
++	}
++
++	/* Timeout user-data is advisory; the bootloader may already set it. */
++	(void)mtk_hs_set(PA_PWRMODEUSERDATA0, 8191, "ud0");
++	(void)mtk_hs_set(PA_PWRMODEUSERDATA1, 65535, "ud1");
++	(void)mtk_hs_set(PA_PWRMODEUSERDATA2, 32767, "ud2");
++	(void)mtk_hs_set(PA_PWRMODEUSERDATA3, 8191, "ud3");
++	(void)mtk_hs_set(PA_PWRMODEUSERDATA4, 65535, "ud4");
++	(void)mtk_hs_set(PA_PWRMODEUSERDATA5, 32767, "ud5");
++
++	/* FAST (0x1) for both directions: 0x11.  FASTAUTO would be 0x44. */
++	r = mtk_hs_pwr_change(0x11, "pwr_0x11");
++	if (r) {
++		printf("KL7 UFS: HS power change failed 0x%x, restoring PWM\n", r);
++		r = mtk_hs_pwr_change(0x55, "pwm_restore");
++		if (r) {
++			printf("KL7 UFS: HS PWM restore failed 0x%x\n", r);
++		}
++		return EIO;
++	}
++	if (mtk_hs_get(UIC_CMD_DME_GET, PA_PWRMODE, "pwr_readback", &pwr)) {
++		return EIO;
++	}
++	if (mtk_hs_get(UIC_CMD_DME_GET, PA_TXGEAR, "txgear_readback", &txgear)) {
++		return EIO;
++	}
++	(void)mtk_hs_get(UIC_CMD_DME_GET, PA_RXGEAR, "rxgear_readback", &v);
++	(void)mtk_hs_get(UIC_CMD_DME_GET, PA_TXPWRSTATUS, "txstatus", &v);
++	(void)mtk_hs_get(UIC_CMD_DME_GET, PA_RXPWRSTATUS, "rxstatus", &v);
++	printf("KL7 UFS: HS ACTIVE pwr 0x%x gear %u hcs 0x%x\n",
++	    pwr, txgear, ufs_rd(REG_HCS));
++	return 0;
++}
++
+ static int
+ mtk_ufs_init(void)
+ {
+@@ -485,6 +656,10 @@
+ 	}
+ 	r = mtk_uic(UIC_CMD_DME_GET, PA_PWRMODE << 16, 0, 0, &v);
+ 	printf("KL7 UFS: PA_PWRMODE rc 0x%x val 0x%x\n", r, v);
++	if (!link_error && ufs_hs) {
++		int hs_error = mtk_hs_switch();
++		printf("KL7 UFS: HS result %d\n", hs_error);
++	}
+ 	printf("KL7 UFS: link hcs 0x%x is 0x%x\n", ufs_rd(REG_HCS), ufs_rd(REG_IS));
+ 	return link_error ? ENXIO : 0;
+ }
+@@ -1150,14 +1325,16 @@
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	PE_parse_boot_argn("ufslun", &lun, sizeof(lun));
+-	uint32_t spin = 0, nosync = 0;
++	uint32_t spin = 0, nosync = 0, hs = 0;
+ 	PE_parse_boot_argn("ufsspin", &spin, sizeof(spin));
+ 	PE_parse_boot_argn("ufsnosync", &nosync, sizeof(nosync));
++	PE_parse_boot_argn("ufshs", &hs, sizeof(hs));
+ 	PE_parse_boot_argn("ufsbench", &ufs_bench_mib, sizeof(ufs_bench_mib));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
+ 	ufs_spin = spin;
+ 	ufs_nosync = (nosync == 1);
++	ufs_hs = (hs == 1);
+ 	if (lun > 7) {
+ 		printf("SWEET UFS: invalid ufslun=%u\n", lun);
+ 		return EINVAL;

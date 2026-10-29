@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KL7 <kl7@localhost>
+Date: Sat, 24 Oct 2026 23:10:00 +0300
+Subject: [PATCH] kl7: match AppleCLCD to the KL7 display node
+
+The KL7 ADT describes /arm-io/disp0 as tecno,kl7-display, but AppleCLCD
+only matched sweet,display.  As a result the display driver never probed,
+no IOMobileFramebuffer service was published, and SpringBoard/backboardd
+had no framebuffer to open.  Match the KL7 display-subsystem node so the
+existing SweetFramebuffer implementation registers IOMobileFramebuffer.
+
+This deliberately does not match kl7-fbcon (tecno,kl7-framebuffer): that
+root node is the early-console carrier, not a second display provider.
+---
+ iokit/KernelConfigTables.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -65,7 +65,7 @@
+     "   {"
+     "     'IOClass'         = AppleCLCD;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'sweet,display';"
++    "     'IONameMatch'     = ('sweet,display', 'tecno,kl7-display');"
+     "   },"
+     "   {"
+     "     'IOClass'         = SweetHIDButtons;"

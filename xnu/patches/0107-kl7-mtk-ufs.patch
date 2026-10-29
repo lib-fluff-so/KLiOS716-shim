@@ -1,0 +1,477 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,20 +55,73 @@
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
++#define REG_VER         0x08
+ #define REG_IS          0x20
+ #define REG_IE          0x24
+ #define REG_HCS         0x30
+ #define REG_HCE         0x34
++#define REG_UECPA       0x38
+ #define REG_UTRLBA      0x50
+ #define REG_UTRLBAU     0x54
+ #define REG_UTRLDBR     0x58
+ #define REG_UTRLCLR     0x5c
+ #define REG_UTRLRSR     0x60
++#define REG_UICCMD      0x90
++#define REG_UIC_ARG1    0x94
++#define REG_UIC_ARG2    0x98
++#define REG_UIC_ARG3    0x9c
++
++/* MediaTek vendor register (ufs-mediatek.h). */
++#define REG_UFS_REFCLK_CTRL 0x144
+ 
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
++#define HCS_UCRDY       (1u << 3)
+ #define CAP_64AS        (1u << 24)              /* 64-bit DMA addressing */
+ 
++/*
++ * MediaTek MT6789 UFS bring-up. The bootloader leaves HCE=1 but its UniPro
++ * state machine cannot be reused: a full HCI/UniPro reset plus HCE 1->0->1
++ * is required before DME_LINK_STARTUP succeeds. The KL7 device reset and
++ * reference clock are owned by the secure monitor (MTK SiP UFS control).
++ */
++#define MTK_SIP_UFS_CONTROL             0x82000276ull
++#define UFS_MTK_SIP_DEVICE_RESET        2
++#define UFS_MTK_SIP_REF_CLK_NOTIFICATION 8
++
++#define INFRACFG_AO_BASE                0x10001000ul
++#define INFRACFG_HCI_RST_SET            0x130
++#define INFRACFG_HCI_RST_CLR            0x134
++#define INFRACFG_UNIPRO_RST_SET         0x140
++#define INFRACFG_UNIPRO_RST_CLR         0x144
++#define INFRACFG_HCI_RST_BIT            15
++#define INFRACFG_UNIPRO_RST_BIT         7
++
++#define UFS_REFCLK_REQUEST              0x1
++#define UFS_REFCLK_ACK                  0x2
++
++#define IS_UIC_ERROR                    (1u << 2)
++#define IS_UIC_COMMAND_COMPL            (1u << 10)
++
++#define UIC_CMD_DME_GET                 0x01
++#define UIC_CMD_DME_SET                 0x02
++#define UIC_CMD_DME_ENABLE              0x12
++#define UIC_CMD_DME_RESET               0x14
++#define UIC_CMD_DME_LINK_STARTUP        0x16
++
++#define PA_LOCAL_TX_LCC_ENABLE          0x155e
++#define PA_PWRMODE                      0x1571
++#define VS_UNIPROPOWERDOWNCONTROL       0xd0a8
++#define VS_SAVEPOWERCONTROL             0xd0a6
++
++#define UPIU_TRANSACTION_QUERY_REQ      0x16
++#define UPIU_TRANSACTION_QUERY_RSP      0x36
++#define UPIU_QUERY_OPCODE_READ_FLAG     0x05
++#define UPIU_QUERY_OPCODE_SET_FLAG      0x06
++#define UPIU_QUERY_FUNC_STANDARD_READ   0x01
++#define UPIU_QUERY_FUNC_STANDARD_WRITE  0x81
++#define QUERY_FLAG_IDN_FDEVICEINIT      0x01
++
+ #define UFS_BLOCK       4096u
+ #define BOUNCE_SIZE     (1u << 20)
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+@@ -100,12 +153,14 @@
+ 
+ static struct {
+ 	vm_offset_t regs;
++	vm_offset_t infracfg;                   /* MTK only */
+ 	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
+ 	uint64_t dma_pa;
+ 	uint8_t lun;
+ 	uint8_t tag;
+ 	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
+ 	uint32_t secsize;                       /* logical sector size for the BSD layer */
++	bool mtk;                               /* /kl7-ufs (MediaTek MT6789) */
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
+@@ -142,6 +197,181 @@
+ }
+ 
+ /*
++ * MediaTek MT6789 bring-up. Based on the hardware-proven ufs_test.c from the
++ * KL7 shim (v7): infracfg_ao host reset, HCE 1->0->1, secure-monitor device
++ * reset and reference clock, UniPro link startup, then fDeviceInit.
++ */
++
++static uint64_t
++mtk_smc(uint64_t cmd, uint64_t val)
++{
++	register uint64_t x0 __asm__("x0") = MTK_SIP_UFS_CONTROL;
++	register uint64_t x1 __asm__("x1") = cmd;
++	register uint64_t x2 __asm__("x2") = val;
++	register uint64_t x3 __asm__("x3") = 0;
++	register uint64_t x4 __asm__("x4") = 0;
++	register uint64_t x5 __asm__("x5") = 0;
++	register uint64_t x6 __asm__("x6") = 0;
++	register uint64_t x7 __asm__("x7") = 0;
++
++	__asm__ volatile("smc #0" : "+r"(x0)
++	    : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x6), "r"(x7)
++	    : "memory");
++	return x0;
++}
++
++static uint32_t
++infracfg_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(su.infracfg + off);
++}
++
++static void
++infracfg_set(uint32_t off, uint32_t bit)
++{
++	*(volatile uint32_t *)(su.infracfg + off) = infracfg_rd(off) | (1u << bit);
++}
++
++static void
++mtk_host_reset(void)
++{
++	infracfg_set(INFRACFG_HCI_RST_SET, INFRACFG_HCI_RST_BIT);
++	infracfg_set(INFRACFG_UNIPRO_RST_SET, INFRACFG_UNIPRO_RST_BIT);
++	delay(1);
++	infracfg_set(INFRACFG_UNIPRO_RST_CLR, INFRACFG_UNIPRO_RST_BIT);
++	infracfg_set(INFRACFG_HCI_RST_CLR, INFRACFG_HCI_RST_BIT);
++	delay(1);
++}
++
++static void
++mtk_ref_clk_on(void)
++{
++	uint32_t v = ufs_rd(REG_UFS_REFCLK_CTRL);
++	printf("KL7 UFS: refclk ctrl 0x%x\n", v);
++	if ((v & (UFS_REFCLK_REQUEST | UFS_REFCLK_ACK)) ==
++	    (UFS_REFCLK_REQUEST | UFS_REFCLK_ACK)) {
++		return;
++	}
++	uint64_t s = mtk_smc(UFS_MTK_SIP_REF_CLK_NOTIFICATION, 1);
++	printf("KL7 UFS: refclk smc 0x%llx\n", s);
++	delay(1);
++	ufs_wr(REG_UFS_REFCLK_CTRL, UFS_REFCLK_REQUEST);
++	for (int i = 0; i < 10; i++) {
++		v = ufs_rd(REG_UFS_REFCLK_CTRL);
++		if (((v & UFS_REFCLK_ACK) >> 1) == (v & UFS_REFCLK_REQUEST)) {
++			break;
++		}
++		delay(1);
++	}
++	printf("KL7 UFS: refclk after 0x%x\n", v);
++}
++
++static void
++mtk_hce_cycle(void)
++{
++	if (ufs_rd(REG_HCE) & 1u) {
++		ufs_wr(REG_HCE, 0);
++		for (int i = 0; i < 10 && (ufs_rd(REG_HCE) & 1u); i++) {
++			delay(1);
++		}
++	}
++	printf("KL7 UFS: hce stop 0x%x hcs 0x%x\n", ufs_rd(REG_HCE), ufs_rd(REG_HCS));
++
++	mtk_host_reset();
++	mtk_ref_clk_on();
++
++	ufs_wr(REG_HCE, 1);
++	delay(1);
++	for (int i = 0; i < 1000 && !(ufs_rd(REG_HCE) & 1u); i++) {
++		delay(1);
++	}
++	printf("KL7 UFS: hce start 0x%x hcs 0x%x is 0x%x\n",
++	    ufs_rd(REG_HCE), ufs_rd(REG_HCS), ufs_rd(REG_IS));
++}
++
++static uint32_t
++mtk_uic(uint32_t opcode, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t *val)
++{
++	ufs_wr(REG_IS, IS_UIC_COMMAND_COMPL | IS_UIC_ERROR);
++	ufs_wr(REG_UIC_ARG1, arg1);
++	ufs_wr(REG_UIC_ARG2, arg2);
++	ufs_wr(REG_UIC_ARG3, arg3);
++	ufs_wr(REG_UICCMD, opcode & 0xff);
++
++	for (int i = 0; i < 500; i++) {
++		if (ufs_rd(REG_IS) & IS_UIC_COMMAND_COMPL) {
++			uint32_t result = ufs_rd(REG_UIC_ARG2) & 0xff;
++			if (val) {
++				*val = ufs_rd(REG_UIC_ARG3);
++			}
++			ufs_wr(REG_IS, IS_UIC_COMMAND_COMPL);
++			return result;
++		}
++		delay(1);
++	}
++	return 0x100;
++}
++
++static void
++mtk_pre_link(void)
++{
++	uint32_t v = 0, r;
++	r = mtk_uic(UIC_CMD_DME_SET, VS_UNIPROPOWERDOWNCONTROL << 16, 0, 0, &v);
++	printf("KL7 UFS: HPM rc 0x%x\n", r);
++	r = mtk_uic(UIC_CMD_DME_SET, PA_LOCAL_TX_LCC_ENABLE << 16, 0, 0, &v);
++	printf("KL7 UFS: TXLCC rc 0x%x\n", r);
++	r = mtk_uic(UIC_CMD_DME_GET, VS_SAVEPOWERCONTROL << 16, 0, 0, &v);
++	printf("KL7 UFS: SAVEPWR get rc 0x%x val 0x%x\n", r, v);
++	if (!r) {
++		r = mtk_uic(UIC_CMD_DME_SET, VS_SAVEPOWERCONTROL << 16, 0,
++		    v & ~(1u << 6), &v);
++		printf("KL7 UFS: SAVEPWR set rc 0x%x\n", r);
++	}
++}
++
++static int
++mtk_ufs_init(void)
++{
++	uint32_t cap = ufs_rd(REG_CAP), ver = ufs_rd(REG_VER);
++	uint32_t hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE);
++	uint32_t v = 0, r;
++	int link_error;
++
++	printf("KL7 UFS: cap 0x%x ver 0x%x hce 0x%x hcs 0x%x\n",
++	    cap, ver, hce, hcs);
++
++	mtk_hce_cycle();
++	printf("KL7 UFS: post-hce hcs 0x%x is 0x%x uecpa 0x%x\n",
++	    ufs_rd(REG_HCS), ufs_rd(REG_IS), ufs_rd(REG_UECPA));
++
++	uint64_t s = mtk_smc(UFS_MTK_SIP_DEVICE_RESET, 0);
++	printf("KL7 UFS: RST low rc 0x%llx\n", s);
++	delay(1);
++	s = mtk_smc(UFS_MTK_SIP_DEVICE_RESET, 1);
++	printf("KL7 UFS: RST high rc 0x%llx\n", s);
++	delay(15);
++
++	mtk_pre_link();
++	r = mtk_uic(UIC_CMD_DME_LINK_STARTUP, 0, 0, 0, &v);
++	printf("KL7 UFS: LINKSTART rc 0x%x\n", r);
++	link_error = (int)r;
++	if (r) {
++		r = mtk_uic(UIC_CMD_DME_RESET, 0, 0, 0, &v);
++		printf("KL7 UFS: DMERESET rc 0x%x\n", r);
++		r = mtk_uic(UIC_CMD_DME_ENABLE, 0, 0, 0, &v);
++		printf("KL7 UFS: DMEENABLE rc 0x%x\n", r);
++		mtk_pre_link();
++		r = mtk_uic(UIC_CMD_DME_LINK_STARTUP, 0, 0, 0, &v);
++		printf("KL7 UFS: LINKSTART2 rc 0x%x\n", r);
++		link_error = (int)r;
++	}
++	r = mtk_uic(UIC_CMD_DME_GET, PA_PWRMODE << 16, 0, 0, &v);
++	printf("KL7 UFS: PA_PWRMODE rc 0x%x val 0x%x\n", r, v);
++	printf("KL7 UFS: link hcs 0x%x is 0x%x\n", ufs_rd(REG_HCS), ufs_rd(REG_IS));
++	return link_error ? ENXIO : 0;
++}
++
++/*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+  */
+@@ -256,6 +486,109 @@
+ 	return 0;
+ }
+ 
++/*
++ * One UFS QUERY REQUEST in slot 0. Used for the fDeviceInit handshake: after
++ * a device reset every LU stays NOT READY until the host sets this flag and
++ * the device clears it.
++ */
++static int
++ufs_query_flag(uint32_t opcode, uint32_t idn, uint32_t index, uint32_t *val)
++{
++	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
++	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
++
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, sizeof(*ucd));
++
++	ucd->cmd[0] = UPIU_TRANSACTION_QUERY_REQ;
++	ucd->cmd[2] = 0;                        /* LUN 0: device management */
++	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[5] = (opcode == UPIU_QUERY_OPCODE_SET_FLAG) ?
++	    UPIU_QUERY_FUNC_STANDARD_WRITE : UPIU_QUERY_FUNC_STANDARD_READ;
++	ucd->cmd[12] = (uint8_t)opcode;
++	ucd->cmd[13] = (uint8_t)idn;
++	ucd->cmd[14] = (uint8_t)index;
++	ucd->cmd[15] = 0;
++
++	utrd->dw0 = (1u << 28) | (1u << 24);
++	utrd->dw2 = 0x0f;
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4) << 16 | (512u / 4);
++
++	if (su.cache) {
++		dma_clean(DMA_UTRL, sizeof(*utrd));
++		dma_clean(DMA_UCD, 16);
++		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
++	} else {
++		dma_sync(DMA_UTRL, sizeof(*utrd));
++		dma_sync(DMA_UCD, sizeof(*ucd));
++	}
++	__builtin_arm_dsb(0xf);
++
++	ufs_wr(REG_UTRLDBR, 1);
++	for (int i = 0; i < 1000; i++) {
++		if (!(ufs_rd(REG_UTRLDBR) & 1)) {
++			break;
++		}
++		delay(1);
++	}
++	if (ufs_rd(REG_UTRLDBR) & 1) {
++		ufs_wr(REG_UTRLCLR, ~1u);
++		printf("KL7 UFS: query op 0x%x idn 0x%x timeout\n", opcode, idn);
++		return ETIMEDOUT;
++	}
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	if (su.cache) {
++		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
++	} else {
++		dma_sync(DMA_UCD, sizeof(*ucd));
++	}
++
++	uint32_t ocs = utrd->dw2 & 0xff;
++	uint32_t value = (uint32_t)ucd->resp[20] << 24 |
++	    (uint32_t)ucd->resp[21] << 16 |
++	    (uint32_t)ucd->resp[22] << 8 | ucd->resp[23];
++	if (val) {
++		*val = value;
++	}
++	if (ocs || ucd->resp[0] != UPIU_TRANSACTION_QUERY_RSP || ucd->resp[6]) {
++		printf("KL7 UFS: query op 0x%x idn 0x%x ocs 0x%x upiu 0x%x rsp 0x%x val 0x%x\n",
++		    opcode, idn, ocs, ucd->resp[0], ucd->resp[6], value);
++		return EIO;
++	}
++	if (opcode == UPIU_QUERY_OPCODE_SET_FLAG) {
++		printf("KL7 UFS: query SET idn 0x%x val 0x%x\n", idn, value);
++	}
++	return 0;
++}
++
++static int
++ufs_complete_dev_init(void)
++{
++	uint32_t val = 0;
++	int error = ufs_query_flag(UPIU_QUERY_OPCODE_SET_FLAG,
++	    QUERY_FLAG_IDN_FDEVICEINIT, 0, &val);
++	printf("KL7 UFS: fDeviceInit SET rc %d\n", error);
++	if (error) {
++		return error;
++	}
++	for (int i = 0; i < 300; i++) {
++		error = ufs_query_flag(UPIU_QUERY_OPCODE_READ_FLAG,
++		    QUERY_FLAG_IDN_FDEVICEINIT, 0, &val);
++		if (error || !(val & 1u)) {
++			break;
++		}
++		delay(5);
++	}
++	printf("KL7 UFS: fDeviceInit poll rc %d val 0x%x\n", error, val);
++	return error;
++}
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -592,22 +925,47 @@
+ 	char want[64] = "userdata";
+ 	int error;
+ 
+-	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+-	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	/*
++	 * /kl7-ufs is the MediaTek MT6789 host (absolute 0x11270000 and the
++	 * infracfg_ao reset block); /sweet-ufs is the original Qualcomm node.
++	 */
++	if (SecureDTLookupEntry(NULL, "/kl7-ufs", &node) == kSuccess) {
++		su.mtk = true;
++	} else if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess) {
++		printf("SWEET UFS: no UFS node in the device tree\n");
++		return ENXIO;
++	}
++	if (SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+-		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
++		printf("SWEET UFS: UFS node has no usable reg property\n");
+ 		return ENXIO;
+ 	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+-	uint32_t cache = 0, wait = 0;
++	uint32_t cache = 0, wait = 0, lun = su.mtk ? 2 : 0;
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
++	PE_parse_boot_argn("ufslun", &lun, sizeof(lun));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
++	if (lun > 7) {
++		printf("SWEET UFS: invalid ufslun=%u\n", lun);
++		return EINVAL;
++	}
++	su.lun = (uint8_t)lun;
++	su.secsize = DEV_BSIZE;
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
++	if (su.mtk) {
++		if (size >= 4 * sizeof(uintptr_t)) {
++			su.infracfg = ml_io_map(reg[2], reg[3]);
++		} else {
++			su.infracfg = ml_io_map(INFRACFG_AO_BASE, 0x1000);
++		}
++	}
++	printf("SWEET UFS: %s host at 0x%llx, LUN %u\n",
++	    su.mtk ? "MediaTek MT6789" : "Qualcomm", (uint64_t)reg[0], su.lun);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET UFS: no contiguous DMA memory\n");
+@@ -618,15 +976,28 @@
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+-	su.lun = 0;
+-	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+-	error = ufs_take_over_host();
++	if (su.mtk) {
++		error = mtk_ufs_init();
++	} else {
++		error = 0;
++	}
++	if (!error) {
++		error = ufs_take_over_host();
++	}
++	if (!error && su.mtk) {
++		error = ufs_complete_dev_init();
++	}
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		/* A reset device may report unit attention or "becoming ready". */
++		for (int i = 0; i < 5; i++) {
++			error = ufs_scsi(tur, sizeof(tur), 0, false);
++			if (!error) {
++				break;
++			}
++			delay(5);
+ 		}
+ 	}
+ 	if (!error) {
+@@ -634,6 +1005,7 @@
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
++		printf("SWEET UFS: probe failed (%d)\n", error);
+ 		return error;
+ 	}
+ 

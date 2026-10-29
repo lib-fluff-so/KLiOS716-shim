@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KL7 <kl7@localhost>
+Date: Fri, 23 Oct 2026 23:50:00 +0300
+Subject: [PATCH] kl7: do not wait for a missing IORTC during bsd_init
+
+KL7 has no RTC node and nothing publishes an IORTC resource, so
+IOKitInitializeTime() sleeps for the full 30-second waitForService()
+timeout.  Skip the wait for SWEET; the calendar falls back to the epoch
+until a real RTC driver exists.
+---
+ iokit/Kernel/IOStartIOKit.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -77,9 +77,9 @@
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
+ // RTC is not present on this target
+-#ifndef BCM2837
++#if !defined(BCM2837) && !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif
+ #if defined(__i386__) || defined(__x86_64__)

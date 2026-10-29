@@ -1,0 +1,119 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -237,10 +237,10 @@
+ {
+ 	infracfg_set(INFRACFG_HCI_RST_SET, INFRACFG_HCI_RST_BIT);
+ 	infracfg_set(INFRACFG_UNIPRO_RST_SET, INFRACFG_UNIPRO_RST_BIT);
+-	delay(1);
++	delay(100);                             /* delay() takes microseconds */
+ 	infracfg_set(INFRACFG_UNIPRO_RST_CLR, INFRACFG_UNIPRO_RST_BIT);
+ 	infracfg_set(INFRACFG_HCI_RST_CLR, INFRACFG_HCI_RST_BIT);
+-	delay(1);
++	delay(100);
+ }
+ 
+ static void
+@@ -254,14 +254,14 @@
+ 	}
+ 	uint64_t s = mtk_smc(UFS_MTK_SIP_REF_CLK_NOTIFICATION, 1);
+ 	printf("KL7 UFS: refclk smc 0x%llx\n", s);
+-	delay(1);
++	delay(10);
+ 	ufs_wr(REG_UFS_REFCLK_CTRL, UFS_REFCLK_REQUEST);
+-	for (int i = 0; i < 10; i++) {
++	for (int i = 0; i < 30; i++) {           /* 3 ms */
+ 		v = ufs_rd(REG_UFS_REFCLK_CTRL);
+ 		if (((v & UFS_REFCLK_ACK) >> 1) == (v & UFS_REFCLK_REQUEST)) {
+ 			break;
+ 		}
+-		delay(1);
++		delay(100);
+ 	}
+ 	printf("KL7 UFS: refclk after 0x%x\n", v);
+ }
+@@ -271,8 +271,8 @@
+ {
+ 	if (ufs_rd(REG_HCE) & 1u) {
+ 		ufs_wr(REG_HCE, 0);
+-		for (int i = 0; i < 10 && (ufs_rd(REG_HCE) & 1u); i++) {
+-			delay(1);
++		for (int i = 0; i < 100 && (ufs_rd(REG_HCE) & 1u); i++) {
++			delay(100);             /* 10 ms */
+ 		}
+ 	}
+ 	printf("KL7 UFS: hce stop 0x%x hcs 0x%x\n", ufs_rd(REG_HCE), ufs_rd(REG_HCS));
+@@ -281,9 +281,9 @@
+ 	mtk_ref_clk_on();
+ 
+ 	ufs_wr(REG_HCE, 1);
+-	delay(1);
++	delay(600);
+ 	for (int i = 0; i < 1000 && !(ufs_rd(REG_HCE) & 1u); i++) {
+-		delay(1);
++		delay(1000);                    /* 1 s */
+ 	}
+ 	printf("KL7 UFS: hce start 0x%x hcs 0x%x is 0x%x\n",
+ 	    ufs_rd(REG_HCE), ufs_rd(REG_HCS), ufs_rd(REG_IS));
+@@ -298,7 +298,7 @@
+ 	ufs_wr(REG_UIC_ARG3, arg3);
+ 	ufs_wr(REG_UICCMD, opcode & 0xff);
+ 
+-	for (int i = 0; i < 500; i++) {
++	for (int i = 0; i < 5000; i++) {         /* 500 ms */
+ 		if (ufs_rd(REG_IS) & IS_UIC_COMMAND_COMPL) {
+ 			uint32_t result = ufs_rd(REG_UIC_ARG2) & 0xff;
+ 			if (val) {
+@@ -307,7 +307,7 @@
+ 			ufs_wr(REG_IS, IS_UIC_COMMAND_COMPL);
+ 			return result;
+ 		}
+-		delay(1);
++		delay(100);
+ 	}
+ 	return 0x100;
+ }
+@@ -346,10 +346,10 @@
+ 
+ 	uint64_t s = mtk_smc(UFS_MTK_SIP_DEVICE_RESET, 0);
+ 	printf("KL7 UFS: RST low rc 0x%llx\n", s);
+-	delay(1);
++	delay(20);
+ 	s = mtk_smc(UFS_MTK_SIP_DEVICE_RESET, 1);
+ 	printf("KL7 UFS: RST high rc 0x%llx\n", s);
+-	delay(15);
++	delay(15000);                           /* 15 ms */
+ 
+ 	mtk_pre_link();
+ 	r = mtk_uic(UIC_CMD_DME_LINK_STARTUP, 0, 0, 0, &v);
+@@ -528,11 +528,11 @@
+ 	__builtin_arm_dsb(0xf);
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
+-	for (int i = 0; i < 1000; i++) {
++	for (int i = 0; i < 1000; i++) {         /* 1 s */
+ 		if (!(ufs_rd(REG_UTRLDBR) & 1)) {
+ 			break;
+ 		}
+-		delay(1);
++		delay(1000);
+ 	}
+ 	if (ufs_rd(REG_UTRLDBR) & 1) {
+ 		ufs_wr(REG_UTRLCLR, ~1u);
+@@ -583,7 +583,7 @@
+ 		if (error || !(val & 1u)) {
+ 			break;
+ 		}
+-		delay(5);
++		delay(5000);                    /* 5 ms */
+ 	}
+ 	printf("KL7 UFS: fDeviceInit poll rc %d val 0x%x\n", error, val);
+ 	return error;
+@@ -997,7 +997,7 @@
+ 			if (!error) {
+ 				break;
+ 			}
+-			delay(5);
++			delay(5000);            /* 5 ms */
+ 		}
+ 	}
+ 	if (!error) {

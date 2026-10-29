@@ -1,0 +1,88 @@
+From d2776aefbec7e72d32d96ef45c1b0ed80405d56a Mon Sep 17 00:00:00 2001
+From: KL7 <kl7@localhost>
+Date: Fri, 23 Oct 2026 21:56:06 +0300
+Subject: [PATCH] kl7: replay the early console text into ramoops
+
+sweet_early_putc keeps a 16K BSS copy; kl7_ramoops_probe() writes it into the
+ramoops ring ahead of the normal console stream.
+---
+ osfmk/arm64/sweet_early.c | 20 ++++++++++++++++++++
+ osfmk/arm64/sweet_early.h |  1 +
+ pexpert/arm/pe_serial.c   | 14 ++++++++++++++
+ 3 files changed, 35 insertions(+)
+
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 233506c..4d4f293 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -30,6 +30,23 @@ extern unsigned char iso_font[256 * 16];
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
+ 
++/*
++ * KL7: keep a copy of the bootstrap console text (BSS, no allocation) so that
++ * kl7_ramoops_probe() (pe_serial.c) can replay it into ramoops once the
++ * ramoops zone can be mapped. Everything printed before serial_init() would
++ * otherwise exist only on the screen.
++ */
++#define EARLY_LOG_SIZE 16384u
++static char early_log[EARLY_LOG_SIZE];
++static unsigned int early_log_len;
++
++void
++sweet_early_log_get(const char **text, unsigned int *len)
++{
++	*text = early_log;
++	*len = early_log_len;
++}
++
+ static void
+ sweet_early_clear_row(void)
+ {
+@@ -47,6 +64,9 @@ sweet_early_putc(char c)
+ 	if (early_disabled) {
+ 		return;
+ 	}
++	if (early_log_len < EARLY_LOG_SIZE) {
++		early_log[early_log_len++] = c;
++	}
+ 	if (!early_started) {
+ 		early_started = 1;
+ 		sweet_early_clear_row();
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index d7a25f2..0e50f73 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -11,6 +11,7 @@ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
++void sweet_early_log_get(const char **text, unsigned int *len);
+ void sweet_early_disable(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index b67bbdc..1b227f7 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -799,6 +799,20 @@ kl7_ramoops_probe(void)
+ 	}
+ 	kl7_rb_cap = cap;
+ 	kl7_rb = b;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		static const char esep[] = "\n--- xnu early console ---\n";
++		const char *early;
++		unsigned int early_len;
++		for (unsigned int i = 0; i < sizeof(esep) - 1; i++) {
++			kl7_ramoops_putc((uint8_t)esep[i]);
++		}
++		sweet_early_log_get(&early, &early_len);
++		for (unsigned int i = 0; i < early_len; i++) {
++			kl7_ramoops_putc((uint8_t)early[i]);
++		}
++	}
++#endif
+ 	static const char sep[] = "\n--- xnu console ---\n";
+ 	for (unsigned int i = 0; i < sizeof(sep) - 1; i++) {
+ 		kl7_ramoops_putc((uint8_t)sep[i]);

@@ -1,0 +1,208 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -169,6 +169,113 @@
+ 	bool ready;
+ } su;
+ 
++/*
++ * v0115: I/O accounting. The process sampler calls sweet_ufs_stats_dump()
++ * every interval; the numbers are the deltas since the previous call, so
++ * "SMP --- sample N" and "SMP UFSIO: ..." describe the same 45 s window.
++ * slow_printed is cumulative and only caps the "slow command" console lines.
++ */
++struct ufs_io_interval {
++	uint64_t cmds, bytes, ns, max_ns;
++	uint64_t rd_cmds, rd_bytes, rd_ns, rd_max_ns;
++	uint64_t wr_cmds, wr_bytes, wr_ns, wr_max_ns;
++	uint64_t sync_cmds, sync_ns, sync_max_ns;
++	uint64_t other_cmds;
++	uint64_t lock_ns, lock_max_ns;
++	uint64_t sleepable_cmds, spin_cmds;
++	uint64_t hist[5];
++	uint64_t slow, slow_printed;
++};
++static struct ufs_io_interval ufsio;
++static bool ufs_spin;                   /* boot-arg ufsspin=1: busy-poll, never sleep */
++
++#define SPIN_MAX_NS     (2ull * NSEC_PER_MSEC)
++#define SLOW_NS         (20ull * NSEC_PER_MSEC)
++
++static void
++ufs_account(uint32_t op, uint32_t len, uint64_t t0)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	ufsio.cmds++;
++	ufsio.bytes += len;
++	ufsio.ns += ns;
++	if (ns > ufsio.max_ns) {
++		ufsio.max_ns = ns;
++	}
++	switch (op) {
++	case 0x28:                                          /* READ(10) */
++		ufsio.rd_cmds++;
++		ufsio.rd_bytes += len;
++		ufsio.rd_ns += ns;
++		if (ns > ufsio.rd_max_ns) {
++			ufsio.rd_max_ns = ns;
++		}
++		break;
++	case 0x2a:                                          /* WRITE(10) */
++		ufsio.wr_cmds++;
++		ufsio.wr_bytes += len;
++		ufsio.wr_ns += ns;
++		if (ns > ufsio.wr_max_ns) {
++			ufsio.wr_max_ns = ns;
++		}
++		break;
++	case 0x35:                                          /* SYNCHRONIZE CACHE(10) */
++		ufsio.sync_cmds++;
++		ufsio.sync_ns += ns;
++		if (ns > ufsio.sync_max_ns) {
++			ufsio.sync_max_ns = ns;
++		}
++		break;
++	default:
++		ufsio.other_cmds++;
++		break;
++	}
++	uint32_t h = len >= (256u << 10) ? 4 : len >= (64u << 10) ? 3 :
++	    len >= (16u << 10) ? 2 : len >= 4096 ? 1 : 0;
++	ufsio.hist[h]++;
++	if (ns >= SLOW_NS) {
++		ufsio.slow++;
++		if (ufsio.slow_printed < 200) {
++			ufsio.slow_printed++;
++			printf("SWEET UFS: slow op 0x%02x len %u us %llu\n",
++			    op, len, ns / NSEC_PER_USEC);
++		}
++	}
++}
++
++void sweet_ufs_stats_dump(const char *tag);
++
++void
++sweet_ufs_stats_dump(const char *tag)
++{
++	struct ufs_io_interval s;
++	memcpy(&s, &ufsio, sizeof(s));
++	bzero(&ufsio, sizeof(ufsio));
++	ufsio.slow_printed = s.slow_printed;
++	printf("%s UFSIO: cmds %llu %lluK avg %lluus max %lluus"
++	    " | rd %llu %lluK avg %lluus max %lluus"
++	    " | wr %llu %lluK avg %lluus max %lluus"
++	    " | sync %llu avg %lluus max %lluus | other %llu"
++	    " | lockwait %lluus max %lluus | sleepable %llu spin %llu"
++	    " | hist <4K %llu <16K %llu <64K %llu <256K %llu >=256K %llu"
++	    " | slow %llu\n",
++	    tag, s.cmds, s.bytes >> 10,
++	    s.cmds ? s.ns / s.cmds / NSEC_PER_USEC : 0, s.max_ns / NSEC_PER_USEC,
++	    s.rd_cmds, s.rd_bytes >> 10,
++	    s.rd_cmds ? s.rd_ns / s.rd_cmds / NSEC_PER_USEC : 0,
++	    s.rd_max_ns / NSEC_PER_USEC,
++	    s.wr_cmds, s.wr_bytes >> 10,
++	    s.wr_cmds ? s.wr_ns / s.wr_cmds / NSEC_PER_USEC : 0,
++	    s.wr_max_ns / NSEC_PER_USEC,
++	    s.sync_cmds,
++	    s.sync_cmds ? s.sync_ns / s.sync_cmds / NSEC_PER_USEC : 0,
++	    s.sync_max_ns / NSEC_PER_USEC, s.other_cmds,
++	    s.lock_ns / NSEC_PER_USEC, s.lock_max_ns / NSEC_PER_USEC,
++	    s.sleepable_cmds, s.spin_cmds,
++	    s.hist[0], s.hist[1], s.hist[2], s.hist[3], s.hist[4], s.slow);
++}
++
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
+ 
+@@ -381,6 +488,7 @@
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
++	uint64_t t0 = mach_absolute_time();
+ 
+ 	assert(len <= BOUNCE_SIZE);
+ 	bzero(utrd, sizeof(*utrd));
+@@ -445,12 +553,20 @@
+ 		nanoseconds_to_absolutetime(CMD_SPIN_NS, &spin_until);
+ 		spin_until += mach_absolute_time();
+ 		nanoseconds_to_absolutetime(CMD_SLEEP_NS, &sleep_interval);
++		ufsio.sleepable_cmds++;
++	}
++	uint64_t spin_end = 0;
++	if (ufs_spin) {
++		nanoseconds_to_absolutetime(SPIN_MAX_NS, &spin_end);
++		spin_end += mach_absolute_time();
++		ufsio.spin_cmds++;
+ 	}
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+ 			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
++			ufs_account(cdb[0], len, t0);
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {
+@@ -460,6 +576,9 @@
+ 			    TIMEOUT_URGENCY_SYS_CRITICAL, wake, 0) == THREAD_WAITING) {
+ 				thread_block(THREAD_CONTINUE_NULL);
+ 			}
++		} else if (ufs_spin && now < spin_end) {
++			/* ufsspin=1: poll the doorbell instead of letting delay()
++			 * block this thread until the next timer wakeup. */
+ 		} else {
+ 			delay(1);
+ 		}
+@@ -478,6 +597,7 @@
+ 	}
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
++	ufs_account(cdb[0], len, t0);
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+ 		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+@@ -763,7 +883,14 @@
+ 		goto done;
+ 	}
+ 
++	uint64_t lock0 = mach_absolute_time();
+ 	lck_mtx_lock(&sweet_ufs_lock);
++	uint64_t lock_ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - lock0, &lock_ns);
++	ufsio.lock_ns += lock_ns;
++	if (lock_ns > ufsio.lock_max_ns) {
++		ufsio.lock_max_ns = lock_ns;
++	}
+ 	for (uint32_t done = 0; done < count;) {
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / UFS_BLOCK;
+@@ -947,8 +1074,11 @@
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	PE_parse_boot_argn("ufslun", &lun, sizeof(lun));
++	uint32_t spin = 0;
++	PE_parse_boot_argn("ufsspin", &spin, sizeof(spin));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
++	ufs_spin = (spin == 1);
+ 	if (lun > 7) {
+ 		printf("SWEET UFS: invalid ufslun=%u\n", lun);
+ 		return EINVAL;
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -23,6 +23,7 @@
+ extern task_t proc_task(proc_t);
+ extern int hz;
+ extern void sweet_sample_start(void);
++extern void sweet_ufs_stats_dump(const char *tag);
+ 
+ static char sweet_sample_names[128];
+ 
+@@ -73,6 +74,7 @@
+ 	(void)tsleep(&chan, PZERO, "sweetsmp", 45 * hz);
+ 	for (int i = 0; i < 40; i++) {
+ 		printf("SMP --- sample %d\n", i);
++		sweet_ufs_stats_dump("SMP");
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+ 		(void)tsleep(&chan, PZERO, "sweetsmp", 45 * hz);
+ 	}

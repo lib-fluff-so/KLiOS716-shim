@@ -1,5 +1,10 @@
 # XNU patch port plan: ios-sweet → KL7 / MT6789
 
+> **Historical document.** The abandoned `0082` machine-config patch is not
+> part of this repository; the real KL7 delta is `0101`-`0117`, and the
+> verified VM build uses `MACHINE_CONFIG=SWEET`. See `xnu/README.md` and
+> `xnu/HISTORY.md`.
+
 This is a triage map of the patch series in the supplied `ios-sweet` clone. It is a static review aid, **not** proof that the patches apply to a specific XNU checkout or that a kernel built from them boots. The source tree/version and build workflow must be fixed before applying anything.
 
 ## Phase 1 — make one core image build

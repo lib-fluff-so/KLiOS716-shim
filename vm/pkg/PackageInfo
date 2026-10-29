@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<pkg-info identifier="com.apple.pkg.InstallAssistant.macOSSonoma" postinstall-action="none" version="23.6.80" format-version="2" auth="root" generator-version="IASUProductGenerator-23" relocatable="true" useHFSPlusCompression="true" overwrite-permissions="true">
+    <payload numberOfFiles="1010" installKBytes="41730"/>
+    <bundle path="./Applications/Install macOS Sonoma.app" CFBundleShortVersionString="19.6.01" CFBundleVersion="19601" SourceVersion="1836120002000000" id="com.apple.InstallAssistant.macOSSonoma"/>
+    <bundle-version/>
+    <upgrade-bundle>
+        <bundle id="com.apple.InstallAssistant.macOSSonoma"/>
+    </upgrade-bundle>
+    <update-bundle/>
+    <atomic-update-bundle/>
+    <strict-identifier/>
+    <relocate/>
+    <scripts>
+        <postinstall file="./postinstall.sh" component-id="com.apple.InstallAssistant.macOSSonoma"/>
+    </scripts>
+</pkg-info>

@@ -1,0 +1,500 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 96e2354..576c505 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/kl7_fts_touch.c			standard
++bsd/dev/kl7_input.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/kl7_input.c b/bsd/dev/kl7_input.c
+new file mode 100644
+index 0000000..1c32f24
+--- /dev/null
++++ b/bsd/dev/kl7_input.c
+@@ -0,0 +1,457 @@
++/*
++ * KL7 (Tecno Spark 30 Pro, MT6789) buttons and vibration.
++ *
++ * Volume up/down are wired to the MediaTek keypad block at 0x10010000.
++ * The vendor map is: KP_MEM1 bit 0 = volume up, bit 1 = volume down,
++ * active low.  Power is a PMIC key: MT6366 TOPSTATUS bit 1, also active low.
++ *
++ * PMIC registers are accessed through the MT6789 PMIC wrapper at
++ * 0x10026000.  This is the exact mt6789_regs layout from the MediaTek BSP:
++ *   WACS2_CMD 0x880, WDATA 0x884, RDATA 0x894, VLDCLR 0x8a4,
++ *   WACS2_RDATA (FSM) 0x8a8.  It is an ARB wrapper (command = address,
++ *   FSM = WACS2_RDATA bits 1..3).
++ *
++ * Vibration is LDO_VIBR on the MT6366: enable bit 0 of LDO_VIBR_CON0
++ * (0x1d08); voltage select bits 8..11 of VIBR_ANA_CON0 (0x1e44), where
++ * selector 13 is 3.3 V.  This driver only provides a low-level pulse.
++ * The iOS haptic stack is not wired to it yet; boot-arg sweetvib=<ms>
++ * gives a one-shot hardware test pulse.
++ *
++ * All work runs on one polled kernel thread after the scheduler starts.
++ * Reads are safe; PMIC writes happen only for a requested vibration pulse
++ * and only after the MT6366 chip ID has been read back successfully.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern void sweet_hid_key(int key, int down);
++void kl7_input_init(void);
++void kl7_vibrator_pulse(unsigned ms);
++
++#define KL7_KP_PA        0x10010000u
++#define KL7_PWRAP_PA     0x10026000u
++
++#define KP_STA           0x0000u
++#define KP_MEM1          0x0004u
++#define KP_MEM2          0x0008u
++#define KP_MEM3          0x000cu
++#define KP_MEM4          0x0010u
++#define KP_MEM5          0x0014u
++#define KP_DEBOUNCE      0x0018u
++#define KP_SEL           0x0020u
++#define KP_EN            0x0024u
++#define KP_DEBOUNCE_VAL  0x0400u
++
++#define PWRAP_INIT_DONE2       0x0000u
++#define PWRAP_WACS2_CMD        0x0880u
++#define PWRAP_SWINF_2_WDATA    0x0884u
++#define PWRAP_SWINF_2_RDATA    0x0894u
++#define PWRAP_WACS2_VLDCLR     0x08a4u
++#define PWRAP_WACS2_RDATA      0x08a8u
++
++#define MT6358_SWCID           0x000au
++#define MT6358_TOPSTATUS       0x0028u
++#define MT6358_LDO_VIBR_CON0   0x1d08u
++#define MT6358_VIBR_ANA_CON0   0x1e44u
++#define MT6366_CHIP_ID         0x66u
++#define MT6358_CHIP_ID         0x58u
++#define MT6358_LDO_VIBR_EN     0x0001u
++#define MT6358_VIBR_VSEL_SHIFT 8u
++#define MT6358_VIBR_VSEL_MASK  0x0f00u
++#define MT6358_VIBR_VSEL_3V3   13u
++
++#define KL7_KEY_POWER          0
++#define KL7_KEY_VOLUME_UP      1
++#define KL7_KEY_VOLUME_DOWN    2
++#define KL7_KEY_COUNT          3
++
++#define KL7_POLL_MS            20u
++#define KL7_STABLE_SAMPLES     2u
++#define KL7_PMIC_TIMEOUT_US    10000u
++
++static struct {
++	vm_offset_t kp;
++	vm_offset_t pwrap;
++	bool started;
++	bool keys_enabled;
++	bool keypad_ok;
++	bool pmic_ok;
++	bool vib_on;
++	uint16_t swcid;
++	uint16_t initial_topstatus;
++	uint16_t initial_vibr_con0;
++	uint16_t initial_vibr_ana;
++	unsigned vib_boot_ms;
++} kl7;
++
++static volatile unsigned kl7_vib_request_ms;
++static unsigned kl7_vib_ticks;
++static int kl7_sleep_chan;
++
++static uint16_t
++kp_rd(uint32_t off)
++{
++	uint16_t v = *(volatile uint16_t *)(kl7.kp + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++kp_wr(uint32_t off, uint16_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint16_t *)(kl7.kp + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static uint32_t
++pwrap_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(kl7.pwrap + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++pwrap_wr(uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(kl7.pwrap + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static bool
++pwrap_wait_state(uint32_t want)
++{
++	for (unsigned i = 0; i < KL7_PMIC_TIMEOUT_US; ++i) {
++		uint32_t v = pwrap_rd(PWRAP_WACS2_RDATA);
++		if (((v >> 1) & 7u) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++pwrap_read16(uint16_t adr, uint16_t *val)
++{
++	if (!pwrap_wait_state(0)) {
++		return false;
++	}
++	pwrap_wr(PWRAP_WACS2_CMD, adr);
++	if (!pwrap_wait_state(6)) {
++		pwrap_wr(PWRAP_WACS2_VLDCLR, 1);
++		return false;
++	}
++	*val = (uint16_t)(pwrap_rd(PWRAP_SWINF_2_RDATA) & 0xffffu);
++	pwrap_wr(PWRAP_WACS2_VLDCLR, 1);
++	return true;
++}
++
++static bool
++pwrap_write16(uint16_t adr, uint16_t val)
++{
++	if (!pwrap_wait_state(0)) {
++		return false;
++	}
++	pwrap_wr(PWRAP_SWINF_2_WDATA, val);
++	pwrap_wr(PWRAP_WACS2_CMD, (1u << 29) | adr);
++	/* The vendor driver does not wait for a write completion here. */
++	return true;
++}
++
++static void
++kl7_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&kl7_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++kl7_pmic_init(void)
++{
++	uint32_t init = pwrap_rd(PWRAP_INIT_DONE2);
++	uint32_t rdata = pwrap_rd(PWRAP_WACS2_RDATA);
++	uint16_t swcid = 0, topstatus = 0;
++
++	printf("KL7 PMIC: mt6789 pwrap init_done2=%#x rdata=%#x fsm=%u sync=%u\n",
++	    init, rdata, (rdata >> 1) & 7u, !!(rdata & (1u << 20)));
++	if (!pwrap_read16(MT6358_SWCID, &swcid)) {
++		printf("KL7 PMIC: SWCID read failed; power/vibration disabled\n");
++		return false;
++	}
++	uint8_t chip = (uint8_t)(swcid >> 8);
++	if (chip != MT6366_CHIP_ID && chip != MT6358_CHIP_ID) {
++		printf("KL7 PMIC: unexpected SWCID=%#x chip=%#x; power/vibration disabled\n",
++		    swcid, chip);
++		return false;
++	}
++	if (!pwrap_read16(MT6358_TOPSTATUS, &topstatus)) {
++		printf("KL7 PMIC: TOPSTATUS read failed; power/vibration disabled\n");
++		return false;
++	}
++	kl7.swcid = swcid;
++	kl7.initial_topstatus = topstatus;
++	(void)pwrap_read16(MT6358_LDO_VIBR_CON0, &kl7.initial_vibr_con0);
++	(void)pwrap_read16(MT6358_VIBR_ANA_CON0, &kl7.initial_vibr_ana);
++	printf("KL7 PMIC: chip=%#x swcid=%#x topstatus=%#x vibr_con0=%#x vibr_ana=%#x\n",
++	    chip, swcid, topstatus, kl7.initial_vibr_con0, kl7.initial_vibr_ana);
++	return true;
++}
++
++static bool
++kl7_keypad_init(void)
++{
++	uint16_t en = kp_rd(KP_EN);
++	uint16_t deb = kp_rd(KP_DEBOUNCE);
++	uint16_t sel = kp_rd(KP_SEL);
++	uint16_t sta = kp_rd(KP_STA);
++	uint16_t mem1 = kp_rd(KP_MEM1);
++
++	printf("KL7 INPUT: keypad en=%#x deb=%#x sel=%#x sta=%#x mem1=%#x\n",
++	    en, deb, sel, sta, mem1);
++	if (!(en & 1u)) {
++		/* The vendor driver writes both values in probe. */
++		kp_wr(KP_DEBOUNCE, KP_DEBOUNCE_VAL);
++		kp_wr(KP_EN, 1);
++		__asm__ volatile("dsb osh" ::: "memory");
++		en = kp_rd(KP_EN);
++		deb = kp_rd(KP_DEBOUNCE);
++		printf("KL7 INPUT: keypad enabled en=%#x deb=%#x\n", en, deb);
++	}
++	if (!(en & 1u)) {
++		printf("KL7 INPUT: keypad did not enable; volume keys disabled\n");
++		return false;
++	}
++	return true;
++}
++
++static bool
++kl7_vibrator_set(bool on)
++{
++	uint16_t con0, ana = 0;
++	if (!kl7.pmic_ok) {
++		return false;
++	}
++	if (on) {
++		if (!pwrap_read16(MT6358_VIBR_ANA_CON0, &ana)) {
++			printf("KL7 VIBR: VIBR_ANA_CON0 read failed\n");
++			return false;
++		}
++		uint16_t new_ana = (uint16_t)((ana & ~MT6358_VIBR_VSEL_MASK) |
++		    (MT6358_VIBR_VSEL_3V3 << MT6358_VIBR_VSEL_SHIFT));
++		if (new_ana != ana && !pwrap_write16(MT6358_VIBR_ANA_CON0, new_ana)) {
++			printf("KL7 VIBR: VIBR_ANA_CON0 write failed\n");
++			return false;
++		}
++		ana = new_ana;
++	}
++	if (!pwrap_read16(MT6358_LDO_VIBR_CON0, &con0)) {
++		if (on) {
++			printf("KL7 VIBR: LDO_VIBR_CON0 read failed\n");
++			return false;
++		}
++		/* Fail safe: never leave the motor enabled if a stop read fails. */
++		if (pwrap_write16(MT6358_LDO_VIBR_CON0, 0)) {
++			printf("KL7 VIBR: off, forced CON0=0 after read failure\n");
++			return true;
++		}
++		printf("KL7 VIBR: LDO_VIBR_CON0 read/write failed on stop\n");
++		return false;
++	}
++	uint16_t new_con0 = on ? (uint16_t)(con0 | MT6358_LDO_VIBR_EN) :
++	    (uint16_t)(con0 & ~MT6358_LDO_VIBR_EN);
++	if (new_con0 != con0 && !pwrap_write16(MT6358_LDO_VIBR_CON0, new_con0)) {
++		printf("KL7 VIBR: LDO_VIBR_CON0 write failed\n");
++		return false;
++	}
++	if (on) {
++		printf("KL7 VIBR: on con0=%#x->%#x ana=%#x\n", con0, new_con0, ana);
++	} else {
++		printf("KL7 VIBR: off con0=%#x->%#x\n", con0, new_con0);
++	}
++	return true;
++}
++
++void
++kl7_vibrator_pulse(unsigned ms)
++{
++	if (ms != 0) {
++		kl7_vib_request_ms = ms;
++	}
++}
++
++static void
++kl7_input_thread(void *arg, wait_result_t result)
++{
++	bool pressed[KL7_KEY_COUNT] = {false, false, false};
++	bool pending[KL7_KEY_COUNT] = {false, false, false};
++	unsigned stable[KL7_KEY_COUNT] = {0, 0, 0};
++	unsigned errors = 0;
++	(void)arg;
++	(void)result;
++
++	/* Let the rest of the late boot work settle before touching PMIC. */
++	kl7_wait(1000);
++
++	kl7.kp = ml_io_map(KL7_KP_PA, 0x1000);
++	kl7.pwrap = ml_io_map(KL7_PWRAP_PA, 0x1000);
++	printf("KL7 INPUT: mapped keypad=%#lx pwrap=%#lx\n",
++	    (unsigned long)kl7.kp, (unsigned long)kl7.pwrap);
++
++	if (kl7.kp != 0) {
++		kl7.keypad_ok = kl7_keypad_init();
++	}
++	if (kl7.pwrap != 0) {
++		kl7.pmic_ok = kl7_pmic_init();
++	}
++	if (kl7.vib_boot_ms != 0) {
++		if (kl7.pmic_ok) {
++			kl7_vibrator_pulse(kl7.vib_boot_ms);
++		} else {
++			printf("KL7 VIBR: boot test skipped, PMIC unavailable\n");
++		}
++	}
++	if (kl7.kp == 0 && kl7.pwrap == 0) {
++		printf("KL7 INPUT: no MMIO mapped; stopping\n");
++		(void)thread_terminate(current_thread());
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++
++	for (;;) {
++		uint16_t mem1 = 0xffffu, topstatus = 0;
++		bool keypad_read = false, pmic_read = false;
++		bool update[KL7_KEY_COUNT] = {false, false, false};
++		bool raw[KL7_KEY_COUNT] = {false, false, false};
++
++		if (kl7.keys_enabled && kl7.keypad_ok) {
++			mem1 = kp_rd(KP_MEM1);
++			/* All-zero is a disabled/bad keypad, not all keys pressed. */
++			if (mem1 != 0x0000u) {
++				raw[KL7_KEY_VOLUME_UP] = !(mem1 & 1u);
++				raw[KL7_KEY_VOLUME_DOWN] = !(mem1 & 2u);
++				keypad_read = true;
++			}
++		}
++		if (kl7.keys_enabled && kl7.pmic_ok) {
++			if (pwrap_read16(MT6358_TOPSTATUS, &topstatus)) {
++				raw[KL7_KEY_POWER] = !(topstatus & 2u);
++				pmic_read = true;
++			}
++		}
++
++		if (kl7.keys_enabled) {
++			update[KL7_KEY_VOLUME_UP] = keypad_read;
++			update[KL7_KEY_VOLUME_DOWN] = keypad_read;
++			update[KL7_KEY_POWER] = pmic_read;
++			if ((!keypad_read && kl7.keypad_ok) || (!pmic_read && kl7.pmic_ok)) {
++				if ((errors++ % 250u) == 0) {
++					printf("KL7 INPUT: read error keypad=%d pmic=%d mem1=%#x top=%#x\n",
++					    keypad_read, pmic_read, mem1, topstatus);
++				}
++			} else {
++				errors = 0;
++			}
++			for (int k = 0; k < KL7_KEY_COUNT; ++k) {
++				if (!update[k]) {
++					continue;
++				}
++				if (raw[k] != pending[k]) {
++					pending[k] = raw[k];
++					stable[k] = 0;
++					continue;
++				}
++				if (stable[k] < KL7_STABLE_SAMPLES) {
++					stable[k]++;
++				}
++				if (stable[k] >= KL7_STABLE_SAMPLES && pressed[k] != raw[k]) {
++					pressed[k] = raw[k];
++					printf("KL7 INPUT: key=%d down=%d mem1=%#x top=%#x\n",
++					    k, pressed[k], mem1, topstatus);
++					sweet_hid_key(k, pressed[k]);
++				}
++			}
++		}
++
++		unsigned request = kl7_vib_request_ms;
++		if (request != 0) {
++			kl7_vib_request_ms = 0;
++			/* One extra poll interval accounts for the start sample. */
++			kl7_vib_ticks = (request + KL7_POLL_MS - 1) / KL7_POLL_MS + 1;
++		}
++		if (kl7_vib_ticks != 0) {
++			if (!kl7.vib_on) {
++				if (!kl7_vibrator_set(true)) {
++					kl7_vib_ticks = 0;
++				} else {
++					kl7.vib_on = true;
++				}
++			}
++			if (kl7_vib_ticks != 0) {
++				kl7_vib_ticks--;
++				if (kl7_vib_ticks == 0 && kl7.vib_on) {
++					if (kl7_vibrator_set(false)) {
++						kl7.vib_on = false;
++					} else {
++						/* Retry the stop rather than leave the motor on. */
++						kl7_vib_ticks = 1;
++					}
++				}
++			}
++		}
++
++		kl7_wait(KL7_POLL_MS);
++	}
++}
++
++void
++kl7_input_init(void)
++{
++	int enabled = 1;
++	int vib_ms = 0;
++	thread_t thread;
++
++	if (kl7.started) {
++		return;
++	}
++	kl7.started = true;
++	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweetvib", &vib_ms, sizeof(vib_ms));
++	if (vib_ms < 0) {
++		vib_ms = 0;
++	}
++	if (vib_ms > 5000) {
++		vib_ms = 5000;
++	}
++	kl7.keys_enabled = enabled != 0;
++	kl7.vib_boot_ms = (unsigned)vib_ms;
++	if (!kl7.keys_enabled) {
++		printf("KL7 INPUT: keys disabled (sweetkeys=0)\n");
++	}
++	if (!kl7.keys_enabled && vib_ms == 0) {
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(kl7_input_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("KL7 INPUT: kernel_thread_start failed %d\n", kr);
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 9c4f9ce..39b9add 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void kl7_input_init(void);
+ extern void kl7_fts_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+@@ -1422,10 +1423,11 @@ sweet_ufs_init(void)
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+-	sweet_keys_init();
+ 	if (su.mtk) {
++		kl7_input_init();
+ 		kl7_fts_touch_init();
+ 	} else {
++		sweet_keys_init();
+ 		sweet_touch_init();
+ 	}
+ 	sweet_usb_probe();

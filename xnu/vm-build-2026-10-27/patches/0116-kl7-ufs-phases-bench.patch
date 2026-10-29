@@ -1,0 +1,188 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -183,11 +183,16 @@
+ 	uint64_t other_cmds;
+ 	uint64_t lock_ns, lock_max_ns;
+ 	uint64_t sleepable_cmds, spin_cmds;
++	uint64_t pre_ns, hw_ns, post_ns, polls;
+ 	uint64_t hist[5];
+ 	uint64_t slow, slow_printed;
+ };
+ static struct ufs_io_interval ufsio;
+-static bool ufs_spin;                   /* boot-arg ufsspin=1: busy-poll, never sleep */
++static uint32_t ufs_spin;               /* ufsspin=1: 2 ms busy-poll; 2: poll only */
++static bool ufs_nosync;                 /* ufsnosync=1: skip bounce cache maintenance */
++static uint32_t ufs_bench_mib;          /* ufsbench=N: read N MiB per size at attach */
++static uint64_t ufs_last_pre_ns, ufs_last_hw_ns, ufs_last_post_ns;
++static uint32_t ufs_last_polls;         /* phases of the most recent command */
+ 
+ #define SPIN_MAX_NS     (2ull * NSEC_PER_MSEC)
+ #define SLOW_NS         (20ull * NSEC_PER_MSEC)
+@@ -274,6 +279,12 @@
+ 	    s.lock_ns / NSEC_PER_USEC, s.lock_max_ns / NSEC_PER_USEC,
+ 	    s.sleepable_cmds, s.spin_cmds,
+ 	    s.hist[0], s.hist[1], s.hist[2], s.hist[3], s.hist[4], s.slow);
++	/* Short second line: survives console interleaving far better. */
++	printf("%s UFSPH: pre %lluus hw %lluus post %lluus polls %llu\n",
++	    tag,
++	    s.cmds ? s.pre_ns / s.cmds / NSEC_PER_USEC : 0,
++	    s.cmds ? s.hw_ns / s.cmds / NSEC_PER_USEC : 0,
++	    s.cmds ? s.post_ns / s.cmds / NSEC_PER_USEC : 0, s.polls);
+ }
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+@@ -533,7 +544,7 @@
+ 		dma_sync(DMA_UTRL, sizeof(*utrd));
+ 		dma_sync(DMA_UCD, sizeof(*ucd));
+ 	}
+-	if (len) {
++	if (len && !ufs_nosync) {
+ 		if (su.cache && write) {
+ 			dma_clean(DMA_BOUNCE, len);
+ 		} else {
+@@ -542,6 +553,7 @@
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 
++	uint64_t t_pre = mach_absolute_time();
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+@@ -561,7 +573,9 @@
+ 		spin_end += mach_absolute_time();
+ 		ufsio.spin_cmds++;
+ 	}
++	uint32_t polls = 0;
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
++		polls++;
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+@@ -576,13 +590,15 @@
+ 			    TIMEOUT_URGENCY_SYS_CRITICAL, wake, 0) == THREAD_WAITING) {
+ 				thread_block(THREAD_CONTINUE_NULL);
+ 			}
+-		} else if (ufs_spin && now < spin_end) {
+-			/* ufsspin=1: poll the doorbell instead of letting delay()
+-			 * block this thread until the next timer wakeup. */
++		} else if (ufs_spin && (ufs_spin > 1 || now < spin_end)) {
++			/* ufsspin=1: poll the doorbell for 2 ms instead of letting
++			 * delay() block until the next timer wakeup; ufsspin=2:
++			 * poll until completion, never sleep. */
+ 		} else {
+ 			delay(1);
+ 		}
+ 	}
++	uint64_t t_hw = mach_absolute_time();
+ 	__builtin_arm_dsb(0xf);
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
+ 
+@@ -592,10 +608,24 @@
+ 	} else {
+ 		dma_sync(DMA_UCD, sizeof(*ucd));
+ 	}
+-	if (len && !(su.cache && write)) {
++	if (len && !(su.cache && write) && !ufs_nosync) {
+ 		dma_sync(DMA_BOUNCE, len);
+ 	}
+ 
++	uint64_t t_end = mach_absolute_time();
++	uint64_t pre_ns = 0, hw_ns = 0, post_ns = 0;
++	absolutetime_to_nanoseconds(t_pre - t0, &pre_ns);
++	absolutetime_to_nanoseconds(t_hw - t_pre, &hw_ns);
++	absolutetime_to_nanoseconds(t_end - t_hw, &post_ns);
++	ufsio.pre_ns += pre_ns;
++	ufsio.hw_ns += hw_ns;
++	ufsio.post_ns += post_ns;
++	ufsio.polls += polls;
++	ufs_last_pre_ns = pre_ns;
++	ufs_last_hw_ns = hw_ns;
++	ufs_last_post_ns = post_ns;
++	ufs_last_polls = polls;
++
+ 	uint32_t ocs = utrd->dw2 & 0xff;
+ 	ufs_account(cdb[0], len, t0);
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+@@ -1043,6 +1073,52 @@
+ 	.d_type       = D_DISK,
+ };
+ 
++/*
++ * v0116: raw read benchmark, boot-arg ufsbench=N. Each size is read for at
++ * least 4 commands (N MiB in total per size) with and without the bounce
++ * buffer cache maintenance. Timing never includes console output: the last
++ * command's phases are kept in ufs_last_* and printed afterwards.
++ */
++static void
++ufs_bench_pass(uint32_t mib, bool nosync)
++{
++	static const uint32_t sizes[] = { 4096, 16384, 65536, 262144, 1048576 };
++	uint64_t base = su.first_block + (1ull << 30) / UFS_BLOCK;
++	uint64_t limit = su.first_block + su.nblocks;
++
++	ufs_nosync = nosync;
++	for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
++		uint32_t size = sizes[i];
++		uint32_t blocks = size / UFS_BLOCK;
++		uint32_t cmds = (mib << 20) / size;
++		if (cmds < 4) {
++			cmds = 4;
++		}
++		if (base + (uint64_t)cmds * blocks > limit) {
++			break;
++		}
++		uint64_t t0 = mach_absolute_time();
++		int err = 0;
++		for (uint32_t c = 0; c < cmds; c++) {
++			err = ufs_read_blocks(base + (uint64_t)c * blocks, blocks);
++			if (err) {
++				break;
++			}
++		}
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		uint64_t bytes = (uint64_t)cmds * size;
++		printf("SWEET UFS BENCH: %s %u x%u %llu KiB/s %llu us/cmd"
++		    " pre %llu hw %llu post %llu polls %u err %d\n",
++		    nosync ? "nosync" : "sync", size, cmds,
++		    ns ? bytes / 1024 * 1000000000ull / ns : 0,
++		    cmds ? ns / cmds / 1000 : 0,
++		    ufs_last_pre_ns / NSEC_PER_USEC, ufs_last_hw_ns / NSEC_PER_USEC,
++		    ufs_last_post_ns / NSEC_PER_USEC, ufs_last_polls, err);
++	}
++	ufs_nosync = false;
++}
++
+ static int
+ sweet_ufs_init(void)
+ {
+@@ -1074,11 +1150,14 @@
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	PE_parse_boot_argn("ufslun", &lun, sizeof(lun));
+-	uint32_t spin = 0;
++	uint32_t spin = 0, nosync = 0;
+ 	PE_parse_boot_argn("ufsspin", &spin, sizeof(spin));
++	PE_parse_boot_argn("ufsnosync", &nosync, sizeof(nosync));
++	PE_parse_boot_argn("ufsbench", &ufs_bench_mib, sizeof(ufs_bench_mib));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
+-	ufs_spin = (spin == 1);
++	ufs_spin = spin;
++	ufs_nosync = (nosync == 1);
+ 	if (lun > 7) {
+ 		printf("SWEET UFS: invalid ufslun=%u\n", lun);
+ 		return EINVAL;
+@@ -1156,6 +1235,12 @@
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	if (ufs_bench_mib) {
++		printf("SWEET UFS BENCH: %u MiB per size, spin %u\n", ufs_bench_mib, ufs_spin);
++		ufs_bench_pass(ufs_bench_mib, false);
++		ufs_bench_pass(ufs_bench_mib, true);
++		printf("SWEET UFS BENCH: done\n");
++	}
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */

@@ -1,0 +1,727 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..96e2354 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/kl7_fts_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/kl7_fts_touch.c b/bsd/dev/kl7_fts_touch.c
+new file mode 100644
+index 0000000..8afe02f
+--- /dev/null
++++ b/bsd/dev/kl7_fts_touch.c
+@@ -0,0 +1,684 @@
++/*
++ * KL7 (Tecno Spark 30 Pro, MT6789) FocalTech FT3519 touch screen.
++ *
++ * The controller sits on SPI1 at 0x11010000, CS0:
++ *   SCK=GPIO34, CS=GPIO35, MOSI=GPIO36, MISO=GPIO37 (pinmux function 1)
++ *   RESET=GPIO116, IRQ=GPIO9, AVDD=GPIO61
++ *
++ * This is the same register-level path validated by the KL7 shim:
++ * the bootloader leaves the SPI1 parent clock and IFRAO gate enabled,
++ * so only the gate is explicitly deasserted here.  The MTK FIFO is
++ * 32 bytes wide; the 71-byte FTS report is read as 32/32/7-byte PIO
++ * chunks with CS held between chunks and a 2 ms settle after ACT.
++ *
++ * FTS report (register 0x01, 62 bytes): [0] dummy, [1] point count,
++ * points at [2 + 6*i]: XH(event[7:6]) XL YH(id[7:4]) YL AREA PRE.
++ * Raw axes are 16x the panel: X max 17279, Y max 38975.
++ *
++ * The driver reports through the existing SweetHIDTouch service:
++ * sweet_hid_touch(finger, down, x, y), with finger = FTS tracking id.
++ * Y is scaled from the 2436-pixel panel to the service's 2400-unit
++ * range so the normalized coordinate covers the whole display.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void kl7_fts_touch_init(void);
++
++#define KL7_GPIO_PA       0x10005000u
++#define KL7_TOP_PA        0x10000000u
++#define KL7_INFRA_PA      0x10001000u
++#define KL7_SPI1_PA       0x11010000u
++
++#define KL7_GPIO_BANK(n)      ((uint32_t)(n) / 32u)
++#define KL7_GPIO_BIT(n)       ((uint32_t)(n) % 32u)
++#define KL7_GPIO_DIR(bank)    (0x0000u + (uint32_t)(bank) * 0x10u)
++#define KL7_GPIO_DOUT(bank)   (0x0100u + (uint32_t)(bank) * 0x10u)
++#define KL7_GPIO_DIN(bank)    (0x0200u + (uint32_t)(bank) * 0x10u)
++#define KL7_GPIO_MODE(pin)    (0x0300u + ((uint32_t)(pin) / 8u) * 0x10u)
++#define KL7_GPIO_MODE_SHIFT(pin) (((uint32_t)(pin) % 8u) * 4u)
++
++#define KL7_TOP_CLK_CFG6      0x0070u
++#define KL7_IFRAO_SPI1_CLR    0x00a8u
++#define KL7_IFRAO_SPI1_STA    0x00acu
++#define KL7_IFRAO_SPI1_BIT    (1u << 6)
++
++#define KL7_SPI_CFG0          0x0000u
++#define KL7_SPI_CFG1          0x0004u
++#define KL7_SPI_TX_DATA       0x0010u
++#define KL7_SPI_RX_DATA       0x0014u
++#define KL7_SPI_CMD           0x0018u
++#define KL7_SPI_STATUS0       0x001cu
++#define KL7_SPI_STATUS1       0x0020u
++#define KL7_SPI_PAD_SEL       0x0024u
++#define KL7_SPI_CFG2          0x0028u
++
++#define KL7_SPI_ACT           (1u << 0)
++#define KL7_SPI_RST           (1u << 2)
++#define KL7_SPI_PAUSE_EN      (1u << 4)
++#define KL7_SPI_TXMSBF        (1u << 12)
++#define KL7_SPI_RXMSBF        (1u << 13)
++#define KL7_SPI_FINISH_IE     (1u << 16)
++#define KL7_SPI_PAUSE_IE      (1u << 17)
++#define KL7_SPI_FINISH        (1u << 0)
++#define KL7_SPI_PAUSE         (1u << 1)
++
++#define KL7_SPI_PIN_FIRST     34u
++#define KL7_SPI_PIN_LAST      37u
++#define KL7_SPI_PIN_FUNC      1u
++#define KL7_RESET_GPIO        116u
++#define KL7_IRQ_GPIO          9u
++#define KL7_AVDD_GPIO         61u
++
++#define KL7_FTS_CMD_READ      0xa0u
++#define KL7_FTS_REG_TOUCH     0x01u
++#define KL7_FTS_REG_CHIP_ID_H 0xa3u
++#define KL7_FTS_REG_CHIP_ID_L 0x9fu
++#define KL7_FTS_REG_FW_VER    0xa6u
++#define KL7_FTS_REG_POWER     0xa5u
++#define KL7_FTS_CHIP_ID_H     0x54u
++#define KL7_FTS_CHIP_ID_L     0x52u
++
++#define KL7_FTS_MAX_POINTS    10u
++#define KL7_FTS_BUF_SIZE      96u
++#define KL7_FTS_DATA_OFF      7u
++#define KL7_FTS_REPORT_LEN    62u
++
++/* mtk_spi_prepare_transfer() values for the bootloader-selected parent. */
++#define KL7_SPI_SCK_TIME      18u
++#define KL7_SPI_CS_TIME       36u
++
++static struct {
++	vm_offset_t gpio, top, infra, spi;
++	bool started;
++	uint32_t active;
++	int x[KL7_FTS_MAX_POINTS];
++	int y[KL7_FTS_MAX_POINTS];
++	uint32_t last_status;
++} st;
++
++static int kl7_touch_sleep_chan;
++
++static uint32_t
++kl7_gpio_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(st.gpio + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++kl7_gpio_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(st.gpio + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static uint32_t
++kl7_spi_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(st.spi + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++kl7_spi_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(st.spi + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static uint32_t
++kl7_infra_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(st.infra + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++kl7_infra_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(st.infra + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++kl7_touch_wait(unsigned ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&kl7_touch_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++kl7_gpio_mode(uint32_t pin, uint32_t fn)
++{
++	uint32_t off = KL7_GPIO_MODE(pin);
++	uint32_t shift = KL7_GPIO_MODE_SHIFT(pin);
++	uint32_t v = kl7_gpio_rd(off);
++
++	v &= ~(0xfu << shift);
++	v |= (fn & 0xfu) << shift;
++	kl7_gpio_wr(off, v);
++}
++
++static void
++kl7_gpio_dir(uint32_t pin, bool out)
++{
++	uint32_t off = KL7_GPIO_DIR(KL7_GPIO_BANK(pin));
++	uint32_t bit = KL7_GPIO_BIT(pin);
++	uint32_t v = kl7_gpio_rd(off);
++
++	if (out) {
++		v |= 1u << bit;
++	} else {
++		v &= ~(1u << bit);
++	}
++	kl7_gpio_wr(off, v);
++}
++
++static void
++kl7_gpio_set(uint32_t pin, bool value)
++{
++	uint32_t off = KL7_GPIO_DOUT(KL7_GPIO_BANK(pin));
++	uint32_t bit = KL7_GPIO_BIT(pin);
++	uint32_t v = kl7_gpio_rd(off);
++
++	if (value) {
++		v |= 1u << bit;
++	} else {
++		v &= ~(1u << bit);
++	}
++	kl7_gpio_wr(off, v);
++}
++
++static void
++kl7_spi_cs_deassert(void)
++{
++	uint32_t cmd = kl7_spi_rd(KL7_SPI_CMD);
++
++	cmd &= ~(KL7_SPI_PAUSE_EN | KL7_SPI_ACT);
++	kl7_spi_wr(KL7_SPI_CMD, cmd);
++	delay(2);
++	kl7_spi_wr(KL7_SPI_CMD, cmd | KL7_SPI_RST);
++	delay(2);
++	kl7_spi_wr(KL7_SPI_CMD, cmd & ~KL7_SPI_RST);
++}
++
++/* One full-duplex SPI packet, mode 0, MSB first (len <= 32). */
++static int
++kl7_spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
++{
++	uint32_t i, w, cmd, status;
++
++	if (len == 0u || len > 32u) {
++		return -1;
++	}
++
++	cmd = kl7_spi_rd(KL7_SPI_CMD);
++	kl7_spi_wr(KL7_SPI_CMD, cmd | KL7_SPI_RST);
++	delay(2);
++	kl7_spi_wr(KL7_SPI_CMD, cmd & ~KL7_SPI_RST);
++	delay(2);
++
++	kl7_spi_wr(KL7_SPI_CMD, KL7_SPI_TXMSBF | KL7_SPI_RXMSBF |
++	    KL7_SPI_FINISH_IE | KL7_SPI_PAUSE_IE | KL7_SPI_PAUSE_EN);
++	kl7_spi_wr(KL7_SPI_PAD_SEL, 0u);
++	kl7_spi_wr(KL7_SPI_CFG2,
++	    (KL7_SPI_SCK_TIME - 1u) | ((KL7_SPI_SCK_TIME - 1u) << 16));
++	kl7_spi_wr(KL7_SPI_CFG0,
++	    (KL7_SPI_CS_TIME - 1u) | ((KL7_SPI_CS_TIME - 1u) << 16));
++	kl7_spi_wr(KL7_SPI_CFG1,
++	    (KL7_SPI_CS_TIME - 1u) | ((len - 1u) << 16));
++
++	for (i = 0u; i < len; i += 4u) {
++		w = (uint32_t)tx[i];
++		if (i + 1u < len) {
++			w |= (uint32_t)tx[i + 1u] << 8;
++		}
++		if (i + 2u < len) {
++			w |= (uint32_t)tx[i + 2u] << 16;
++		}
++		if (i + 3u < len) {
++			w |= (uint32_t)tx[i + 3u] << 24;
++		}
++		kl7_spi_wr(KL7_SPI_TX_DATA, w);
++	}
++
++	cmd = kl7_spi_rd(KL7_SPI_CMD);
++	kl7_spi_wr(KL7_SPI_CMD, cmd | KL7_SPI_ACT);
++
++	status = 0u;
++	for (i = 0u; i < 100000u; i++) {
++		status = kl7_spi_rd(KL7_SPI_STATUS0);
++		if (status & (KL7_SPI_FINISH | KL7_SPI_PAUSE)) {
++			break;
++		}
++		delay(1);
++	}
++	if ((status & (KL7_SPI_FINISH | KL7_SPI_PAUSE)) == 0u) {
++		st.last_status = status;
++		kl7_spi_cs_deassert();
++		return -2;
++	}
++
++	for (i = 0u; i < len; i += 4u) {
++		w = kl7_spi_rd(KL7_SPI_RX_DATA);
++		rx[i] = (uint8_t)w;
++		if (i + 1u < len) {
++			rx[i + 1u] = (uint8_t)(w >> 8);
++		}
++		if (i + 2u < len) {
++			rx[i + 2u] = (uint8_t)(w >> 16);
++		}
++		if (i + 3u < len) {
++			rx[i + 3u] = (uint8_t)(w >> 24);
++		}
++	}
++
++	kl7_spi_cs_deassert();
++	return 0;
++}
++
++/*
++ * The MTK FIFO holds 32 bytes, so a 71-byte FTS packet is split into
++ * 32/32/7-byte chunks with CS held between chunks.  ACT clears before the
++ * FIFO has actually been clocked out and STATUS0 is not reliable here;
++ * the validated shim waits 2 ms after ACT before draining each chunk.
++ */
++static int
++kl7_spi_xfer_long(const uint8_t *tx, uint8_t *rx, uint32_t len)
++{
++	uint32_t off, chunk, i, w;
++
++	if (len == 0u || len > KL7_FTS_BUF_SIZE) {
++		return -1;
++	}
++
++	w = kl7_spi_rd(KL7_SPI_CMD);
++	kl7_spi_wr(KL7_SPI_CMD, w | KL7_SPI_RST);
++	delay(2);
++	kl7_spi_wr(KL7_SPI_CMD, w & ~KL7_SPI_RST);
++	delay(2);
++
++	kl7_spi_wr(KL7_SPI_CMD, KL7_SPI_TXMSBF | KL7_SPI_RXMSBF |
++	    KL7_SPI_FINISH_IE | KL7_SPI_PAUSE_IE | KL7_SPI_PAUSE_EN);
++	kl7_spi_wr(KL7_SPI_PAD_SEL, 0u);
++	kl7_spi_wr(KL7_SPI_CFG2,
++	    (KL7_SPI_SCK_TIME - 1u) | ((KL7_SPI_SCK_TIME - 1u) << 16));
++	kl7_spi_wr(KL7_SPI_CFG0,
++	    (KL7_SPI_CS_TIME - 1u) | ((KL7_SPI_CS_TIME - 1u) << 16));
++
++	for (off = 0u; off < len; off += chunk) {
++		chunk = len - off;
++		if (chunk > 32u) {
++			chunk = 32u;
++		}
++
++		kl7_spi_wr(KL7_SPI_CFG1,
++		    (KL7_SPI_CS_TIME - 1u) | ((chunk - 1u) << 16));
++
++		for (i = 0u; i < chunk; i += 4u) {
++			w = (uint32_t)tx[off + i];
++			if (i + 1u < chunk) {
++				w |= (uint32_t)tx[off + i + 1u] << 8;
++			}
++			if (i + 2u < chunk) {
++				w |= (uint32_t)tx[off + i + 2u] << 16;
++			}
++			if (i + 3u < chunk) {
++				w |= (uint32_t)tx[off + i + 3u] << 24;
++			}
++			kl7_spi_wr(KL7_SPI_TX_DATA, w);
++		}
++
++		w = kl7_spi_rd(KL7_SPI_CMD);
++		kl7_spi_wr(KL7_SPI_CMD, w | KL7_SPI_ACT);
++		delay(2000);
++
++		for (i = 0u; i < chunk; i += 4u) {
++			w = kl7_spi_rd(KL7_SPI_RX_DATA);
++			rx[off + i] = (uint8_t)w;
++			if (i + 1u < chunk) {
++				rx[off + i + 1u] = (uint8_t)(w >> 8);
++			}
++			if (i + 2u < chunk) {
++				rx[off + i + 2u] = (uint8_t)(w >> 16);
++			}
++			if (i + 3u < chunk) {
++				rx[off + i + 3u] = (uint8_t)(w >> 24);
++			}
++		}
++	}
++
++	kl7_spi_cs_deassert();
++	return 0;
++}
++
++static int
++kl7_fts_read(uint8_t reg, uint8_t *val, uint32_t n)
++{
++	uint8_t tx[KL7_FTS_BUF_SIZE];
++	uint8_t rx[KL7_FTS_BUF_SIZE];
++	uint32_t i, pkt_len;
++	int err;
++
++	if (n == 0u || n > KL7_FTS_REPORT_LEN) {
++		return -1;
++	}
++	pkt_len = 4u + 3u + n + 2u;
++	if (pkt_len > KL7_FTS_BUF_SIZE) {
++		return -1;
++	}
++
++	for (i = 0u; i < KL7_FTS_BUF_SIZE; i++) {
++		tx[i] = 0u;
++		rx[i] = 0u;
++	}
++	tx[0] = reg;
++	tx[1] = KL7_FTS_CMD_READ;
++	tx[2] = 0u;
++	tx[3] = (uint8_t)n;
++
++	err = pkt_len > 32u ? kl7_spi_xfer_long(tx, rx, pkt_len) :
++	    kl7_spi_xfer(tx, rx, pkt_len);
++	if (err) {
++		return err;
++	}
++
++	st.last_status = rx[3];
++	for (i = 0u; i < n; i++) {
++		val[i] = rx[KL7_FTS_DATA_OFF + i];
++	}
++
++	/* FTS requires CS high for at least 150 us between transfers. */
++	delay(200);
++	return 0;
++}
++
++static void
++kl7_touch_report(uint32_t mask, const int *x, const int *y)
++{
++	for (uint32_t id = 0u; id < KL7_FTS_MAX_POINTS; id++) {
++		uint32_t bit = 1u << id;
++
++		if (mask & bit) {
++			if (!(st.active & bit) || x[id] != st.x[id] ||
++			    y[id] != st.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			st.x[id] = x[id];
++			st.y[id] = y[id];
++		} else if (st.active & bit) {
++			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++		}
++	}
++	st.active = mask;
++}
++
++static int
++kl7_fts_report(void)
++{
++	uint8_t buf[KL7_FTS_REPORT_LEN];
++	int px[KL7_FTS_MAX_POINTS];
++	int py[KL7_FTS_MAX_POINTS];
++	uint32_t mask = 0u, seen = 0u, down = 0u, up = 0u;
++	uint32_t i, n;
++	int err;
++
++	err = kl7_fts_read(KL7_FTS_REG_TOUCH, buf, sizeof(buf));
++	if (err) {
++		return err;
++	}
++
++	/* Report count is the low nibble of byte 1; byte 0 is dummy. */
++	n = buf[1] & 0x0fu;
++	if (n > KL7_FTS_MAX_POINTS) {
++		return EIO;
++	}
++	if (n == 0u) {
++		/* No active contacts: release anything left from the last frame. */
++		kl7_touch_report(0u, st.x, st.y);
++		return 0;
++	}
++
++	/*
++	 * Android's ft3519 parser walks all ten records and stops at the
++	 * first unused one (its YH high nibble is greater than 9).  The
++	 * count is a sanity bound, not the loop bound; a release record is
++	 * still present in the prefix even when it is no longer counted.
++	 */
++	for (i = 0u; i < KL7_FTS_MAX_POINTS; i++) {
++		const uint8_t *p = buf + 2u + 6u * i;
++		uint32_t xh = p[0], xl = p[1], yh = p[2];
++		uint32_t yl = p[3], area = p[4], pre = p[5];
++		uint32_t id, event, raw_x, raw_y, sx, sy, hid_y;
++
++		event = xh >> 6;
++		/*
++		 * Unused FTS records have a 0xn? YH sentinel (high nibble > 9)
++		 * and a zero area.  Both were observed in the KL7 shim logs;
++		 * stopping here keeps stale slots out of the HID stream.  An up
++		 * record may carry no area, so only apply the area sentinel to
++		 * down/move records.
++		 */
++		if (yh > 0x9fu || (area == 0u && event != 1u)) {
++			break;
++		}
++		/*
++		 * Count is the number of active (down/move) contacts, not the
++		 * number of records: release records also live in the prefix.
++		 * Ignore extra down records past the count instead of turning
++		 * stale slots into ghost fingers.
++		 */
++		if (event != 1u && down >= n) {
++			continue;
++		}
++
++		id = yh >> 4;
++		if (id >= KL7_FTS_MAX_POINTS || (seen & (1u << id))) {
++			return EIO;
++		}
++		seen |= 1u << id;
++
++		if (event == 1u) {
++			up++;
++			continue;       /* UP record: release via touch_report */
++		}
++
++		raw_x = (xl << 3) | ((xh & 0x0fu) << 11) |
++		    ((xh >> 5) & 1u) | ((area >> 5) & 6u);
++		raw_y = (yl << 4) | ((yh & 0x0fu) << 12) |
++		    ((area >> 2) & 0x0cu) | ((xh >> 3) & 2u) |
++		    ((pre >> 7) & 1u);
++		if (raw_x > 17279u || raw_y > 38975u) {
++			return EIO;
++		}
++
++		sx = raw_x / 16u;
++		sy = raw_y / 16u;
++		if (sx > 1079u || sy > 2435u) {
++			return EIO;
++		}
++		hid_y = (sy * 2400u) / 2436u;
++		if (hid_y > 2399u) {
++			hid_y = 2399u;
++		}
++
++		mask |= 1u << id;
++		px[id] = (int)sx;
++		py[id] = (int)hid_y;
++		down++;
++	}
++
++	/*
++	 * A frame with neither a down nor an up record is a truncated/stale
++	 * prefix: keep the current contacts.  An up-only frame releases all.
++	 */
++	if (down == 0u && up == 0u) {
++		return EIO;
++	}
++
++	kl7_touch_report(mask, px, py);
++	return 0;
++}
++
++static bool
++kl7_touch_map(void)
++{
++	st.gpio = ml_io_map(KL7_GPIO_PA, 0x1000);
++	st.top = ml_io_map(KL7_TOP_PA, 0x1000);
++	st.infra = ml_io_map(KL7_INFRA_PA, 0x1000);
++	st.spi = ml_io_map(KL7_SPI1_PA, 0x1000);
++	return st.gpio && st.top && st.infra && st.spi;
++}
++
++static void
++kl7_touch_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 1;
++	unsigned errors = 0;
++	uint8_t idh = 0u, idl = 0u, fw = 0u, pm = 0u;
++	uint32_t top_cfg6, ifrao_sta;
++	int err;
++
++	(void)arg;
++	(void)result;
++
++	(void)PE_parse_boot_argn("kl7touchdelay", &delay_s, sizeof(delay_s));
++	if (delay_s > 60u) {
++		delay_s = 60u;
++	}
++	printf("KL7 TOUCH: starting in %u s\n", delay_s);
++	if (delay_s) {
++		kl7_touch_wait(delay_s * 1000u);
++	}
++
++	if (!kl7_touch_map()) {
++		printf("KL7 TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++
++	top_cfg6 = *(volatile uint32_t *)(st.top + KL7_TOP_CLK_CFG6);
++	ifrao_sta = kl7_infra_rd(KL7_IFRAO_SPI1_STA);
++	printf("KL7 TOUCH: top cfg6=%#x ifrao=%#x; enabling SPI1 gate\n",
++	    top_cfg6, ifrao_sta);
++	kl7_infra_wr(KL7_IFRAO_SPI1_CLR, KL7_IFRAO_SPI1_BIT);
++	delay(100);
++	printf("KL7 TOUCH: ifrao after gate=%#x\n",
++	    kl7_infra_rd(KL7_IFRAO_SPI1_STA));
++
++	for (uint32_t pin = KL7_SPI_PIN_FIRST; pin <= KL7_SPI_PIN_LAST; pin++) {
++		kl7_gpio_mode(pin, KL7_SPI_PIN_FUNC);
++	}
++	kl7_gpio_mode(KL7_AVDD_GPIO, 0u);
++	kl7_gpio_mode(KL7_RESET_GPIO, 0u);
++	kl7_gpio_mode(KL7_IRQ_GPIO, 0u);
++	kl7_gpio_dir(KL7_IRQ_GPIO, false);
++
++	kl7_gpio_set(KL7_AVDD_GPIO, true);
++	kl7_gpio_dir(KL7_AVDD_GPIO, true);
++	kl7_touch_wait(2);
++	kl7_gpio_set(KL7_RESET_GPIO, false);
++	kl7_gpio_dir(KL7_RESET_GPIO, true);
++	kl7_touch_wait(10);
++	kl7_gpio_set(KL7_RESET_GPIO, true);
++	kl7_touch_wait(150);
++
++	err = -1;
++	for (uint32_t i = 0u; i < 5u; i++) {
++		idh = 0u;
++		idl = 0u;
++		err = kl7_fts_read(KL7_FTS_REG_CHIP_ID_H, &idh, 1u);
++		if (err == 0) {
++			err = kl7_fts_read(KL7_FTS_REG_CHIP_ID_L, &idl, 1u);
++		}
++		printf("KL7 TOUCH: probe%d err=%d st=%#x id=%02x:%02x\n",
++		    (int)i, err, st.last_status, idh, idl);
++		if (err == 0 && idh == KL7_FTS_CHIP_ID_H &&
++		    idl == KL7_FTS_CHIP_ID_L) {
++			break;
++		}
++		kl7_touch_wait(50);
++	}
++
++	if (err || idh != KL7_FTS_CHIP_ID_H || idl != KL7_FTS_CHIP_ID_L) {
++		printf("KL7 TOUCH: no FT3519 (err=%d id=%02x:%02x); stopping\n",
++		    err, idh, idl);
++		goto out;
++	}
++
++	(void)kl7_fts_read(KL7_FTS_REG_FW_VER, &fw, 1u);
++	(void)kl7_fts_read(KL7_FTS_REG_POWER, &pm, 1u);
++	printf("KL7 TOUCH: FT3519 ready fw=%#x pm=%#x, polling\n", fw, pm);
++
++	st.active = 0u;
++	while (1) {
++		err = kl7_fts_report();
++		if (err) {
++			if ((errors++ % 100u) == 0u) {
++				printf("KL7 TOUCH: report err=%d st=%#x\n",
++				    err, st.last_status);
++			}
++			if (errors == 10u) {
++				/* Persistent bad reads: do not leave fingers stuck. */
++				kl7_touch_report(0u, st.x, st.y);
++			}
++		} else {
++			errors = 0u;
++		}
++		kl7_touch_wait(10);
++	}
++
++out:
++	kl7_touch_report(0u, st.x, st.y);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++kl7_fts_touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	kern_return_t kr;
++
++	if (st.started) {
++		return;
++	}
++	st.started = true;
++
++	(void)PE_parse_boot_argn("kl7touch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("KL7 TOUCH: disabled (kl7touch=0)\n");
++		return;
++	}
++
++	kr = kernel_thread_start(kl7_touch_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("KL7 TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 1329411..79ed2c1 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void kl7_fts_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -1030,7 +1031,11 @@ sweet_ufs_init(void)
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+-	sweet_touch_init();
++	if (su.mtk) {
++		kl7_fts_touch_init();
++	} else {
++		sweet_touch_init();
++	}
+ 	sweet_usb_probe();
+ 	return 0;
+ }
