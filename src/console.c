@@ -242,6 +242,72 @@ void console_visual_result(const unsigned int *gpu_pixels,
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
+static void visual_hex32(u32 value, char out[9])
+{
+    static const char digits[] = "0123456789ABCDEF";
+
+    for (u32 i = 0; i < 8u; i++)
+        out[i] = digits[(value >> ((7u - i) * 4u)) & 0xfu];
+    out[8] = 0;
+}
+
+static void visual_hex64(u64 value, char out[17])
+{
+    static const char digits[] = "0123456789ABCDEF";
+
+    for (u32 i = 0; i < 16u; i++)
+        out[i] = digits[(value >> ((15u - i) * 4u)) & 0xfu];
+    out[16] = 0;
+}
+
+/* Draw one flush-mode result on the panel. The caller holds it for one
+ * second before starting the next mode. */
+void console_gpu_mode_result(unsigned int mode, unsigned int total,
+                             unsigned int config, unsigned long passmask,
+                             unsigned long failmask, unsigned int error)
+{
+    static const u32 mode_bars[8] = {
+        0xFFF0F0F0u, 0xFFFFFF30u, 0xFF30FFFFu, 0xFF30FF30u,
+        0xFFFF30FFu, 0xFFFF3030u, 0xFF3030FFu, 0xFF101010u,
+    };
+    char mode_line[] = "MODE 0 / 0";
+    char config_hex[9];
+    char pass_hex[17];
+    char fail_hex[17];
+    u32 status_color;
+
+    mode_line[5] = (mode < 10u) ? (char)('0' + mode) : '?';
+    mode_line[9] = (total < 10u) ? (char)('0' + total) : '?';
+    visual_hex32(config, config_hex);
+    visual_hex64(passmask, pass_hex);
+    visual_hex64(failmask, fail_hex);
+    status_color = error ? VIS_RED : (failmask ? VIS_RED : VIS_GREEN);
+
+    visual_fill(0, 0, 0, FB_WIDTH, FB_HEIGHT, VIS_BG);
+    for (u32 i = 0; i < 8u; i++)
+        visual_fill(0, i * 135u, 0, 135u, 96u, mode_bars[i]);
+
+    visual_text(0, 24, 140, "GPU FLUSH MATRIX", 4, VIS_WHITE, VIS_BG);
+    visual_text(0, 24, 300, mode_line, 4, VIS_YELLOW, VIS_BG);
+    visual_text(0, 24, 460, "JS_CONFIG 0x", 3, VIS_WHITE, VIS_BG);
+    visual_text(0, 310, 460, config_hex, 3, VIS_YELLOW, VIS_BG);
+
+    visual_fill(0, 24, 650, 720, 180, status_color);
+    if (error)
+        visual_text(0, 56, 710, "JOB ERROR", 5, VIS_WHITE, status_color);
+    else if (failmask)
+        visual_text(0, 56, 710, "FAIL", 6, VIS_WHITE, status_color);
+    else
+        visual_text(0, 56, 710, "PASS", 6, VIS_BG, status_color);
+
+    visual_text(0, 24, 1050, "PASS MASK", 3, VIS_WHITE, VIS_BG);
+    visual_text(0, 270, 1050, pass_hex, 3, VIS_GREEN, VIS_BG);
+    visual_text(0, 24, 1200, "FAIL MASK", 3, VIS_WHITE, VIS_BG);
+    visual_text(0, 270, 1200, fail_hex, 3, VIS_RED, VIS_BG);
+    visual_text(0, 24, 2250, "RESET AFTER FINAL MODE", 3, VIS_WHITE, VIS_BG);
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
 
 /* Touch crosshairs: full-width horizontal + full-height vertical lines.
  * The pixels under every old line are saved, so moving the fingers

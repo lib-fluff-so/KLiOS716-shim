@@ -7,11 +7,13 @@
 `main` branch console. Previously it drew page B at `FB_ALT_OFFSET = 1230 * stride`
 (0xFE519E00) which is NOT the scanned page — nothing was visible.
 
-Build: `make OUT=out-gpu-visual GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0 VISUAL_HOLD_SECONDS=45`
+Build: `make OUT=out-gpu-flush-matrix GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0`
 
-Flash: **only `boot_b`**, never `boot_a`. Ends with PSCI `SYSTEM_RESET` (warm, keeps
-ramoops), then `fastboot reboot` to return to Android. Read `/sys/fs/pstore/console-ramoops-0`
-with `su -c "cat ..."` after Android boots.
+Each of the seven JS_CONFIG modes is shown full-screen for one second with its pass/fail
+mask. After mode 7, the shim immediately issues PSCI `SYSTEM_RESET` (warm, keeps ramoops).
+This matrix-only path skips later BO/compute/fragment probes so they do not overwrite the
+final result card. Flash **only `boot_b`**, never `boot_a`; then `fastboot reboot`
+to return to Android and read `/sys/fs/pstore/console-ramoops-0`.
 
 ## What works (proven)
 
@@ -83,7 +85,13 @@ Every job completed with `raw=1`, yet stores at the failing offsets left the sen
 untouched. This proves the parity signature is not exclusive to the fragment clear-only
 path or its FBD. It points to a shared layer below the FBD, still to be identified.
 
-## Next discriminator: Write Value job-slot flush matrix (source added; hardware result pending)
+## Write Value job-slot flush matrix (source updated; hardware result pending)
+
+Each mode draws a full-screen result card showing its mode number, JS_CONFIG, pass mask and
+fail mask for one second. The old 45-second post-test hold has been removed. After the seventh
+card, the targeted test path returns straight to PSCI SYSTEM_RESET, preserving ramoops and
+leaving the final card visible until reset. The matrix boot intentionally does not continue
+into the later BO/compute/fragment tests.
 
 `gpu_write_value_grid_test()` now repeats the same 16 targets under seven JS_CONFIG modes,
 varying start and end flush controls while keeping the target page, values, slot and job

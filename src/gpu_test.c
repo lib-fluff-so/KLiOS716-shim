@@ -554,6 +554,7 @@ mfg_gate_on(void)
 #define GPU_WAIT_SHORT_US	200000ULL
 #define GPU_WAIT_JOB_US		5000000ULL
 #define BO_POOL_PAGES		16
+#define GPU_TRAFFIC_MATRIX_DONE	1
 
 #define MMU_PTE_TABLE		(0x400ULL | 0x3ULL)
 #define MMU_PTE_PAGE		(0x400ULL | 0x300ULL | 0x50ULL | 0x7ULL)
@@ -2126,7 +2127,8 @@ run_write_value_job(int slot, u64 job_va, u32 js_present, u32 *raw_out)
  * of address bits [10:8] twice while staying inside the mapped output page.
  */
 static int
-gpu_write_value_grid_once(int slot, u32 js_present, u32 config)
+gpu_write_value_grid_once(int slot, u32 js_present, u32 config,
+                           u32 mode, u32 total_modes)
 {
 	const u32 count = 16;
 	const u64 sentinel = 0x5a5a5a5a5a5a5a5aULL;
@@ -2154,6 +2156,9 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 config)
 			logf("GPU: WVALGRID cfg=%x job offset=%x rc=%d raw=%x",
 			     (u64)config, offset, (u64)rc, (u64)raw);
 			gpu_js_config_override = 0;
+			console_gpu_mode_result(mode, total_modes, config, passmask,
+			                        failmask, 1);
+			delay_us(1000000ULL);
 			return -1;
 		}
 
@@ -2179,12 +2184,14 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 config)
 		logf("GPU: WVALGRID cfg=%x first offset=%x raw=%x got=%w want=%w",
 		     (u64)config, first_off, (u64)first_raw, first_got,
 		     first_want);
-		return 1;
+	} else {
+		logf("GPU: WVALGRID PASS cfg=%x n=%d stride=%x",
+		     (u64)config, (u64)count, 0x100ULL);
 	}
 
-	logf("GPU: WVALGRID PASS cfg=%x n=%d stride=%x",
-	     (u64)config, (u64)count, 0x100ULL);
-	return 0;
+	console_gpu_mode_result(mode, total_modes, config, passmask, failmask, 0);
+	delay_us(1000000ULL);
+	return failmask ? 1 : 0;
 }
 
 static int
@@ -2205,14 +2212,14 @@ gpu_write_value_grid_test(int slot, u32 js_present)
 		0x83300U, /* start clean+invalidate, end clean+invalidate */
 		0x80000U, /* no start or end flush */
 	};
-	for (u32 i = 0; i < sizeof(configs) / sizeof(configs[0]); i++) {
-		int rc = gpu_write_value_grid_once(slot, js_present, configs[i]);
+	u32 total_modes = sizeof(configs) / sizeof(configs[0]);
 
-		if (rc < 0) {
-			logf("GPU: WVALGRID matrix stopped at cfg=%x",
-			     (u64)configs[i]);
+	for (u32 i = 0; i < total_modes; i++) {
+		int rc = gpu_write_value_grid_once(slot, js_present, configs[i],
+		                                  i + 1u, total_modes);
+
+		if (rc < 0)
 			return -1;
-		}
 	}
 	return 0;
 }
@@ -2513,11 +2520,13 @@ gpu_traffic_test(void)
 	}
 	logf("GPU: WRITE VALUE PASS");
 
-	rc = gpu_write_value_grid_test((int)slot, js_present);
-	if (rc < 0) {
-		logf("GPU: WVALGRID STOP after a job error");
-		return -8;
-	}
+	/*
+	 * This boot is dedicated to the seven-mode flush matrix. The per-mode
+	 * card has been shown for one second; return so main resets before later
+	 * probes can overwrite the final result card.
+	 */
+	(void)gpu_write_value_grid_test((int)slot, js_present);
+	return GPU_TRAFFIC_MATRIX_DONE;
 
 	rc = gpu_bo_test((int)slot, js_present);
 	if (rc != 0) {
@@ -2694,8 +2703,14 @@ gpu_test(void)
 
 	log_gpu_id();
 #if GPU_POWER_TEST
-	if (gpu_traffic_test() != 0)
-		logf("GPU: traffic test stopped before completion");
+	{
+		int traffic_rc = gpu_traffic_test();
+
+		if (traffic_rc == GPU_TRAFFIC_MATRIX_DONE)
+			return;
+		if (traffic_rc != 0)
+			logf("GPU: traffic test stopped before completion");
+	}
 #endif
 	logf("GPU TEST: done");
 }

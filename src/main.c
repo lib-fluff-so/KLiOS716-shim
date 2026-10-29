@@ -50,9 +50,6 @@ typedef __builtin_va_list va_list;
 #ifndef PSCI_RESET_TIMER
 #define PSCI_RESET_TIMER 1
 #endif
-#ifndef VISUAL_HOLD_SECONDS
-#define VISUAL_HOLD_SECONDS 0
-#endif
 
 #define FB_BASE               0xFDFFF000UL
 #define FB_STRIDE             4352u
@@ -360,23 +357,6 @@ static __attribute__((noreturn)) void psci_system_reset(void)
     for (;;) __asm__ volatile("wfe");
 }
 #endif /* AUTO_REBOOT_TEST */
-
-#if VISUAL_HOLD_SECONDS
-/* Keep the on-screen visual card visible long enough to photograph.  This is
- * a plain architectural-timer spin: no interrupts, no secondary CPU and no
- * memory writes, so it cannot disturb the display or the GPU state. */
-static void visual_hold(u64 seconds)
-{
-    u64 freq, start, now;
-
-    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
-    __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(start));
-    for (;;) {
-        __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
-        if (now - start >= freq * seconds) break;
-    }
-}
-#endif
 
 #if AUTO_REBOOT_TEST || UFS_TEST || !XNU_PAYLOAD
 static __attribute__((noreturn)) void finish_test_attempt(const char *reason)
@@ -865,25 +845,13 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
     psci_start_reset_timer();
 #endif
     gpu_test();
-    logf("GPU TEST: probe returned");
-#if VISUAL_HOLD_SECONDS
-    logf("VISUAL: hold %d s before PSCI SYSTEM_RESET", (u64)VISUAL_HOLD_SECONDS);
-#endif
-    gpu_visual_result();
-#if VISUAL_HOLD_SECONDS
-    visual_hold(VISUAL_HOLD_SECONDS);
-#endif
 #if AUTO_REBOOT_TEST
-#if VISUAL_HOLD_SECONDS
-    /* No log after the card: the visible result stays until the warm reset. */
+    /* The flush matrix displays every mode for one second. Do not draw or
+     * log over the final mode; reset immediately after gpu_test returns. */
     psci_system_reset();
 #else
-    finish_test_attempt("GPU probe done");
-#endif
-#else
-#if !VISUAL_HOLD_SECONDS
+    logf("GPU TEST: probe returned");
     logf("GPU TEST: halting (power-cycle to boot iOS)");
-#endif
     for (;;) __asm__ volatile("wfe");
 #endif
 #endif
