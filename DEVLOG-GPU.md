@@ -90,6 +90,37 @@ Every job completed with `raw=1`, yet stores at the failing offsets left the sen
 untouched. This proves the parity signature is not exclusive to the fragment clear-only
 path or its FBD. It points to a shared layer below the FBD, still to be identified.
 
+## WB output-mapping isolation build — source committed (2026-10-29)
+
+The next test is now isolated in source. It sets AttrIdx=4 / AS_MEMATTR byte
+`0x8c` for all six GPU-visible output mappings: `GPU_VA_OUT` (PTE 1),
+`GPU_VA_OUT2` (PTE 3), and the four framebuffer pages (PTEs 4–7).
+Job, shader, tiler, and descriptor pages retain AttrIdx=5 / `0x4c`.
+The seven-mode loop is removed from this build; it runs one 16-address
+Write Value grid with the all-output WB mapping, then returns to the existing
+warm-reset path. BO/multislot/compute/fragment tests remain unreachable.
+
+Relevant source commits:
+- `109bd02562af65f291541e098db78c389b5b34ff` — change output PTEs and grid.
+- `6fe000c181109780c621e61ed0aa4578068a94ef` — update isolated-test marker.
+- `c4850a881f23a47cd73ba0fe62d36714f8fc2b32` — update reset comment.
+
+Build:
+
+```sh
+make OUT=out-gpu-wb-all GPU_TEST=1 GPU_POWER_TEST=1 \
+  AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0 WDT_DISABLE_AT_HANDOFF=0
+```
+
+Expected diagnostic line after setup:
+`GPU: WVALATTR setup idx=4 attr=8c out=... out2=...`
+followed by `GPU: WVALATTR FB PTE=... memattr=...` and the final
+`GPU: WVALATTR idx=4 attr=8c pass=... fail=...`.
+
+This source change is not yet hardware-validated. Install only to `boot_b`
+through the existing Antumbra route, never Fastboot and never `boot_a`.
+After recovery, collect `/sys/fs/pstore/console-ramoops-0`.
+
 ## Output-page MMU attribute matrix — completed on KL7 (2026-10-29)
 
 The text-console build completed all seven modes on-device. Every Write Value job in the
@@ -123,9 +154,9 @@ Build used:
 make OUT=out-gpu-text GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0 WDT_DISABLE_AT_HANDOFF=0
 ```
 
-Next step: apply write-back `0x8c` to all GPU output/framebuffer mappings, but keep this
-matrix-only test path. Do not re-enable BO/compute/fragment probes until the mapping change
-has been tested on its own.
+The follow-up build above applies `0x8c` to every output/framebuffer mapping
+while retaining only one 16-address grid. Do not re-enable BO/compute/fragment
+probes until that hardware run has been inspected.
 
 ## FBD layout (from Mesa v9.xml, matches our code)
 
