@@ -260,8 +260,7 @@ static void visual_hex64(u64 value, char out[17])
     out[16] = 0;
 }
 
-/* Draw one flush-mode result on the panel. The caller holds it for one
- * second before starting the next mode. */
+/* Draw one GPU output-memory-attribute result on the panel. */
 void console_gpu_mode_result(unsigned int mode, unsigned int total,
                              unsigned int config, unsigned long passmask,
                              unsigned long failmask, unsigned int error)
@@ -287,7 +286,7 @@ void console_gpu_mode_result(unsigned int mode, unsigned int total,
     for (u32 i = 0; i < 8u; i++)
         visual_fill(0, i * 135u, 0, 135u, 96u, mode_bars[i]);
 
-    visual_text(0, 24, 140, "GPU MMU ATTR MATRIX", 4, VIS_WHITE, VIS_BG);
+    visual_text(0, 24, 140, "GPU OUTPUT ATTR TEST", 4, VIS_WHITE, VIS_BG);
     visual_text(0, 24, 300, mode_line, 4, VIS_YELLOW, VIS_BG);
     visual_text(0, 24, 460, "PTE IDX/ATTR 0x", 3, VIS_WHITE, VIS_BG);
     visual_text(0, 390, 460, config_hex, 3, VIS_YELLOW, VIS_BG);
@@ -304,7 +303,7 @@ void console_gpu_mode_result(unsigned int mode, unsigned int total,
     visual_text(0, 270, 1050, pass_hex, 3, VIS_GREEN, VIS_BG);
     visual_text(0, 24, 1200, "FAIL MASK", 3, VIS_WHITE, VIS_BG);
     visual_text(0, 270, 1200, fail_hex, 3, VIS_RED, VIS_BG);
-    visual_text(0, 24, 2250, "RESET AFTER FINAL MODE", 3, VIS_WHITE, VIS_BG);
+    visual_text(0, 24, 2250, "CONTINUING GPU TESTS", 3, VIS_WHITE, VIS_BG);
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
