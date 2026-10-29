@@ -614,7 +614,9 @@ static u64 bo_job_pages[16];
 /* Set for one fragment run to exercise the vendor r32p1 JS_CONFIG
  * flush-reduction and job-chain bits. */
 static u32 gpu_js_vendor_cfg;
-/* Nonzero only while the Write Value flush-mode matrix is running. */
+/* Current AS0 memory-attribute table, indexed by the PTE AttrIdx field. */
+static u64 gpu_memattr_table = MMU_MEMATTR_NC_ALL;
+/* Retained for independent JS_CONFIG experiments; zero for the MMU-attribute test. */
 static u32 gpu_js_config_override;
 
 static void build_write_value_job(u64 *page, u64 target, u64 value);
@@ -1061,8 +1063,9 @@ mmu_enable_as0(void)
 
 	wr32(GPU_BASE + AS_TRANSTAB_LO, (u32)tt);
 	wr32(GPU_BASE + AS_TRANSTAB_HI, (u32)(tt >> 32));
-	wr32(GPU_BASE + AS_MEMATTR_LO, (u32)MMU_MEMATTR_NC_ALL);
-	wr32(GPU_BASE + AS_MEMATTR_HI, (u32)(MMU_MEMATTR_NC_ALL >> 32));
+	gpu_memattr_table = MMU_MEMATTR_NC_ALL;
+	wr32(GPU_BASE + AS_MEMATTR_LO, (u32)gpu_memattr_table);
+	wr32(GPU_BASE + AS_MEMATTR_HI, (u32)(gpu_memattr_table >> 32));
 	wr32(GPU_BASE + AS_TRANSCFG_LO, cfg);
 	wr32(GPU_BASE + AS_TRANSCFG_HI, 0);
 	dsb_sy();
@@ -1192,6 +1195,48 @@ mmu_unmap_page(u64 va)
 	*entry = 0;
 	dsb_sy();
 	return mmu_flush_pt();
+}
+
+/*
+ * Change only GPU_VA_OUT's AttrIdx and matching AS_MEMATTR byte.
+ * Job/descriptor pages remain AttrIdx=5 with 0x4c non-cacheable memory.
+ */
+static int
+gpu_output_memattr_set(u32 index, u32 attr)
+{
+	u64 mask;
+	u32 lo, hi;
+
+	if (index > 7U || attr > 0xffU)
+		return -1;
+
+	/* Drain any prior write-back mode before changing its interpretation. */
+	if (gpu_clean_inv_caches() != 0)
+		return -5;
+
+	mask = 0xffULL << (index * 8U);
+	gpu_memattr_table = (gpu_memattr_table & ~mask) |
+			    ((u64)attr << (index * 8U));
+	pt_l3[1] = (pt_l3[1] & ~(7ULL << 2)) | ((u64)index << 2);
+	dsb_sy();
+
+	/* Invalidate the old translation before publishing the new AttrIdx. */
+	if (mmu_flush_pt() != 0)
+		return -2;
+
+	wr32(GPU_BASE + AS_MEMATTR_LO, (u32)gpu_memattr_table);
+	wr32(GPU_BASE + AS_MEMATTR_HI, (u32)(gpu_memattr_table >> 32));
+	dsb_sy();
+	if (as_command(AS_COMMAND_UPDATE) != 0)
+		return -3;
+	if (as_wait_idle(GPU_WAIT_SHORT_US) != 0)
+		return -4;
+
+	lo = rd32(GPU_BASE + AS_MEMATTR_LO);
+	hi = rd32(GPU_BASE + AS_MEMATTR_HI);
+	logf("GPU: WVALATTR setup idx=%d attr=%x pte=%x memattr=%x/%x",
+	     (u64)index, (u64)attr, pt_l3[1], (u64)lo, (u64)hi);
+	return 0;
 }
 
 static int
@@ -2127,8 +2172,8 @@ run_write_value_job(int slot, u64 job_va, u32 js_present, u32 *raw_out)
  * of address bits [10:8] twice while staying inside the mapped output page.
  */
 static int
-gpu_write_value_grid_once(int slot, u32 js_present, u32 config,
-                           u32 mode, u32 total_modes)
+gpu_write_value_grid_once(int slot, u32 js_present, u32 attr_index,
+                          u32 attr_value, u32 mode, u32 total_modes)
 {
 	const u32 count = 16;
 	const u64 sentinel = 0x5a5a5a5a5a5a5a5aULL;
@@ -2136,10 +2181,23 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 config,
 	u64 passmask = 0, failmask = 0;
 	u64 first_off = 0, first_got = 0, first_want = 0;
 	u32 first_raw = 0;
+	u32 mode_id = (attr_index << 8) | attr_value;
 	int rc;
 
-	gpu_js_config_override = config;
-	logf("GPU: WVALGRID begin cfg=%x", (u64)config);
+	/* Keep the normal JS_CONFIG; vary only the output PTE attributes. */
+	gpu_js_config_override = 0;
+	logf("GPU: WVALATTR begin mode=%d idx=%d attr=%x",
+	     (u64)mode, (u64)attr_index, (u64)attr_value);
+	rc = gpu_output_memattr_set(attr_index, attr_value);
+	if (rc != 0) {
+		logf("GPU: WVALATTR setup error=%d idx=%d attr=%x",
+		     (u64)rc, (u64)attr_index, (u64)attr_value);
+		console_gpu_mode_result(mode, total_modes, mode_id,
+		                        passmask, failmask, 1);
+		delay_us(1000000ULL);
+		return -1;
+	}
+
 	for (u32 i = 0; i < count; i++)
 		out[i * 32U] = sentinel;
 	dsb_sy();
@@ -2153,11 +2211,11 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 config,
 		build_write_value_job(job_page, GPU_VA_OUT + offset, want);
 		rc = run_write_value_job(slot, GPU_VA_JOB, js_present, &raw);
 		if (rc != 0) {
-			logf("GPU: WVALGRID cfg=%x job offset=%x rc=%d raw=%x",
-			     (u64)config, offset, (u64)rc, (u64)raw);
-			gpu_js_config_override = 0;
-			console_gpu_mode_result(mode, total_modes, config, passmask,
-			                        failmask, 1);
+			logf("GPU: WVALATTR idx=%d attr=%x job offset=%x rc=%d raw=%x",
+			     (u64)attr_index, (u64)attr_value, offset,
+			     (u64)rc, (u64)raw);
+			console_gpu_mode_result(mode, total_modes, mode_id,
+			                        passmask, failmask, 1);
 			delay_us(1000000ULL);
 			return -1;
 		}
@@ -2177,19 +2235,16 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 config,
 		}
 	}
 
-	gpu_js_config_override = 0;
-	logf("GPU: WVALGRID cfg=%x pass=%w fail=%w",
-	     (u64)config, passmask, failmask);
+	logf("GPU: WVALATTR mode=%d idx=%d attr=%x pass=%w fail=%w",
+	     (u64)mode, (u64)attr_index, (u64)attr_value, passmask, failmask);
 	if (failmask != 0) {
-		logf("GPU: WVALGRID cfg=%x first offset=%x raw=%x got=%w want=%w",
-		     (u64)config, first_off, (u64)first_raw, first_got,
-		     first_want);
-	} else {
-		logf("GPU: WVALGRID PASS cfg=%x n=%d stride=%x",
-		     (u64)config, (u64)count, 0x100ULL);
+		logf("GPU: WVALATTR first idx=%d attr=%x offset=%x raw=%x got=%w want=%w",
+		     (u64)attr_index, (u64)attr_value, first_off,
+		     (u64)first_raw, first_got, first_want);
 	}
 
-	console_gpu_mode_result(mode, total_modes, config, passmask, failmask, 0);
+	console_gpu_mode_result(mode, total_modes, mode_id,
+	                        passmask, failmask, 0);
 	delay_us(1000000ULL);
 	return failmask ? 1 : 0;
 }
@@ -2197,27 +2252,30 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 config,
 static int
 gpu_write_value_grid_test(int slot, u32 js_present)
 {
-	/*
-	 * Start flush uses 0=no action, 1=clean, 2=INV_SHADER_OTHER,
-	 * 3=clean+invalidate. End flush supports no action, clean, or
-	 * clean+invalidate on this JM. Keep thread priority at 8 and vary
-	 * only the flush controls.
-	 */
-	static const u32 configs[] = {
-		0x81300U, /* baseline: start clean+invalidate, end clean */
-		0x81000U, /* no start flush, end clean */
-		0x81100U, /* start clean, end clean */
-		0x81200U, /* start invalidate, end clean */
-		0x80300U, /* start clean+invalidate, no end flush */
-		0x83300U, /* start clean+invalidate, end clean+invalidate */
-		0x80000U, /* no start or end flush */
+	struct gpu_memattr_mode {
+		u32 index;
+		u32 attr;
 	};
-	u32 total_modes = sizeof(configs) / sizeof(configs[0]);
+	/*
+	 * Modes 1-4 keep output memory NC (0x4c) while changing AttrIdx.
+	 * Modes 5-7 make only the output page write-back, varying allocation.
+	 * All job and descriptor pages remain on the original NC AttrIdx=5.
+	 */
+	static const struct gpu_memattr_mode modes[] = {
+		{ 5U, 0x4cU }, /* current baseline */
+		{ 4U, 0x4cU }, /* same NC, different PTE AttrIdx */
+		{ 6U, 0x4cU }, /* same NC, different PTE AttrIdx */
+		{ 7U, 0x4cU }, /* same NC, different PTE AttrIdx */
+		{ 4U, 0x88U }, /* write-back, implementation-defined allocation */
+		{ 4U, 0x8cU }, /* write-back, no read/write allocation */
+		{ 4U, 0x8fU }, /* write-back, read/write allocation */
+	};
+	u32 total_modes = sizeof(modes) / sizeof(modes[0]);
 
 	for (u32 i = 0; i < total_modes; i++) {
-		int rc = gpu_write_value_grid_once(slot, js_present, configs[i],
+		int rc = gpu_write_value_grid_once(slot, js_present,
+		                                  modes[i].index, modes[i].attr,
 		                                  i + 1u, total_modes);
-
 		if (rc < 0)
 			return -1;
 	}
@@ -2521,7 +2579,7 @@ gpu_traffic_test(void)
 	logf("GPU: WRITE VALUE PASS");
 
 	/*
-	 * This boot is dedicated to the seven-mode flush matrix. The per-mode
+	 * This boot is dedicated to the seven-mode MMU-attribute matrix. The per-mode
 	 * card has been shown for one second; return so main resets before later
 	 * probes can overwrite the final result card.
 	 */

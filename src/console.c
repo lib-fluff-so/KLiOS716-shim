@@ -287,10 +287,10 @@ void console_gpu_mode_result(unsigned int mode, unsigned int total,
     for (u32 i = 0; i < 8u; i++)
         visual_fill(0, i * 135u, 0, 135u, 96u, mode_bars[i]);
 
-    visual_text(0, 24, 140, "GPU FLUSH MATRIX", 4, VIS_WHITE, VIS_BG);
+    visual_text(0, 24, 140, "GPU MMU ATTR MATRIX", 4, VIS_WHITE, VIS_BG);
     visual_text(0, 24, 300, mode_line, 4, VIS_YELLOW, VIS_BG);
-    visual_text(0, 24, 460, "JS_CONFIG 0x", 3, VIS_WHITE, VIS_BG);
-    visual_text(0, 310, 460, config_hex, 3, VIS_YELLOW, VIS_BG);
+    visual_text(0, 24, 460, "PTE IDX/ATTR 0x", 3, VIS_WHITE, VIS_BG);
+    visual_text(0, 390, 460, config_hex, 3, VIS_YELLOW, VIS_BG);
 
     visual_fill(0, 24, 650, 720, 180, status_color);
     if (error)

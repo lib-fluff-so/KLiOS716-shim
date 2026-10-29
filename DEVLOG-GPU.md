@@ -7,9 +7,9 @@
 `main` branch console. Previously it drew page B at `FB_ALT_OFFSET = 1230 * stride`
 (0xFE519E00) which is NOT the scanned page — nothing was visible.
 
-Build: `make OUT=out-gpu-flush-matrix GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0`
+Build: `make OUT=out-gpu-memattr GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0`
 
-Each of the seven JS_CONFIG modes is shown full-screen for one second with its pass/fail
+Each of the seven output-page MMU attribute modes is shown full-screen for one second with its pass/fail
 mask. After mode 7, the shim immediately issues PSCI `SYSTEM_RESET` (warm, keeps ramoops).
 This matrix-only path skips later BO/compute/fragment probes so they do not overwrite the
 final result card. Flash **only `boot_b`**, never `boot_a`; then `fastboot reboot`
@@ -86,33 +86,28 @@ Every job completed with `raw=1`, yet stores at the failing offsets left the sen
 untouched. This proves the parity signature is not exclusive to the fragment clear-only
 path or its FBD. It points to a shared layer below the FBD, still to be identified.
 
-## Write Value job-slot flush matrix (source updated; hardware result pending)
+## Output-page MMU attribute matrix (source updated; hardware result pending)
 
-Each mode draws a full-screen result card showing its mode number, JS_CONFIG, pass mask and
-fail mask for one second. The old 45-second post-test hold has been removed. After the seventh
-card, the targeted test path returns straight to PSCI SYSTEM_RESET, preserving ramoops and
-leaving the final card visible until reset. The matrix boot intentionally does not continue
-into the later BO/compute/fragment tests.
+The prior JS_CONFIG flush-mode matrix was reported to show the same FAIL result in every
+mode. The targeted test now varies only the output page's PTE AttrIdx and matching AS_MEMATTR
+entry. Each of seven modes draws its pass/fail mask full-screen for one second; after mode 7,
+main issues warm PSCI `SYSTEM_RESET`. Later BO/compute/fragment probes are skipped.
 
-`gpu_write_value_grid_test()` now repeats the same 16 targets under seven JS_CONFIG modes,
-varying start and end flush controls while keeping the target page, values, slot and job
-descriptor unchanged:
+Modes 1-4 keep the output memory type non-cacheable (`0x4c`) while selecting different PTE
+AttrIdx values. Modes 5-7 apply write-back attributes (`0x88`, `0x8c`, `0x8f`) only to the
+output page. The job descriptor, job page, and other mapped buffers remain on the original
+non-cacheable AttrIdx=5. Each run logs the selected AttrIdx, attribute byte, PTE value, full
+AS_MEMATTR register pair, and the 16-address pass/fail masks.
 
-| Config | Start flush | End flush |
-|---|---|---|
-| `0x81300` | clean+invalidate | clean |
-| `0x81000` | none | clean |
-| `0x81100` | clean | clean |
-| `0x81200` | INV_SHADER_OTHER | clean |
-| `0x80300` | clean+invalidate | none |
-| `0x83300` | clean+invalidate | clean+invalidate |
-| `0x80000` | none | none |
+Build:
 
-Each run logs `GPU: WVALGRID cfg=... pass=... fail=...`. If changing flush mode changes
-the address mask, the job-slot cache/flush path is implicated. If every mode reproduces
-`6969/9696`, the next experiment should vary GPU MMU memory attributes or the physical
-target layout rather than the fragment FBD. Hardware result is pending until this image
-is built and run on KL7.
+```sh
+make OUT=out-gpu-memattr GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0
+```
+
+Flash **only `boot_b`**, never `boot_a`. After Android returns, read
+`/sys/fs/pstore/console-ramoops-0`. Hardware results are pending until this image is built
+and run on KL7.
 
 
 ## FBD layout (from Mesa v9.xml, matches our code)
