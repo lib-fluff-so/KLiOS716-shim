@@ -156,12 +156,12 @@ path that does not have the parity bug.
 
 ## Files
 
-- `src/console.c` — `console_visual_result()`, `visual_card()`, draws at FB_BASE + 0 full screen
-- `src/console.h` — `console_visual_result()` declaration
-- `src/gpu_test.c` — fragment probes, `gpu_fragment_run()`, `gpu_fragment_unique()`, row-mask diagnostics
+- `src/console.c` — panel diagnostics and one-second per-mode result card
+- `src/console.h` — console visual-result declarations
+- `src/gpu_test.c` — flush-mode matrix, fragment probes, row-mask diagnostics
 - `src/gpu_test.h` — GPU test header
-- `src/main.c` — GPU test integration, 45s visual hold, PSCI reset path
-- `Makefile` — GPU_TEST, GPU_POWER_TEST, VISUAL_HOLD_SECONDS switches
+- `src/main.c` — GPU test integration and immediate PSCI reset after the matrix
+- `Makefile` — GPU_TEST and GPU_POWER_TEST build switches
 - `GPU-BRINGUP.md` — proven GPU stages, register map, safety contract
 - `GPU-ACCELERATION-PLAN.md` — GPU stack roadmap
 - `RECOVERY-NOTES.txt` — KL7 slot retry, PSCI reset, fastboot recovery rules
@@ -169,11 +169,11 @@ path that does not have the parity bug.
 ## Build/flash commands
 
 ```sh
-# Build visual diagnostic
-make OUT=out-gpu-visual GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0 VISUAL_HOLD_SECONDS=45
+# Build seven-mode flush matrix (one second per result, then warm reset)
+make OUT=out-gpu-flush-matrix GPU_TEST=1 GPU_POWER_TEST=1 AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0
 
 # Flash only boot_b (device in fastboot/LK)
-fastboot flash boot_b out-gpu-visual/shim_b.img
+fastboot flash boot_b out-gpu-flush-matrix/shim_b.img
 fastboot --set-active=b
 fastboot reboot
 
