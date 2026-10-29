@@ -68,8 +68,9 @@ writeback-drop, not a scrambling.
 
 Key observation: `noclean` (clean-pixel write enable = 0) produces ZERO writeback. So the
 clean-pixel/fast-clear path IS active and IS writing — but it drops half the rows. MSAA4
-does not change that mask. The defect is currently isolated to this clear-only fragment
-result; the address-grid probe below checks the ordinary Write Value job path next.
+does not change that mask. The subsequent Write Value grid reproduces the same parity mask
+on ordinary GPU jobs, so the defect is not isolated to the clear-only fragment/FBD path.
+The next discriminator is the job-slot flush matrix.
 
 ## Write Value address grid result (2026-10-29)
 
