@@ -140,10 +140,25 @@ entries remain `0x4c`.
 This confirms the complete mapping setup does not break Write Value output and
 eliminates the prior `6969/9696` mask for this Write Value grid. The grid writes
 to `GPU_VA_OUT`; it does **not** itself test fragment writeback to the framebuffer.
-Next diagnostic: one isolated 64x64 fragment clear with the same WB mappings,
-without the previous size sweep, unique-pixel matrix, BO, multislot, or compute tests.
-A full `clear=ffffffffffffffff sent=0000000000000000 mixed=0000000000000000`
-row mask would establish full framebuffer clear-writeback for this case.
+
+The next isolated source path has now been added in commit
+`e758340417f633eb0750b3e471c4219e5b1f15aa`: after the 16-address grid passes,
+it submits exactly one 64x64 clear-only fragment job tagged `wb-all`, scans all
+4096 pixels, and reports `GPU: FRAGWB PASS clear=4096` only if every pixel
+matches the clear color. It avoids the old size sweep and unique-pixel tests,
+and still skips BO, multislot, and compute. This follow-up code has not yet been
+built or run on the device.
+
+Build:
+
+```sh
+make OUT=out-gpu-frag-wb GPU_TEST=1 GPU_POWER_TEST=1 \\
+  AUTO_REBOOT_TEST=1 PSCI_RESET_TIMER=0 WDT_DISABLE_AT_HANDOFF=0
+```
+
+Expected framebuffer result if the WB change fixes the clear-writeback defect:
+`GPU: FRAGPROBE wb-all rowmask clear=ffffffffffffffff sent=0000000000000000 mixed=0000000000000000`
+and `GPU: FRAGWB PASS clear=4096`.
 
 ## Output-page MMU attribute matrix — completed on KL7 (2026-10-29)
 
