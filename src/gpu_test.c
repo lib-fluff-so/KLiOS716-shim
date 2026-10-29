@@ -554,7 +554,7 @@ mfg_gate_on(void)
 #define GPU_WAIT_SHORT_US	200000ULL
 #define GPU_WAIT_JOB_US		5000000ULL
 #define BO_POOL_PAGES		16
-#define GPU_TRAFFIC_MATRIX_DONE	1
+#define GPU_TRAFFIC_WB_DONE	1
 
 #define MMU_PTE_TABLE		(0x400ULL | 0x3ULL)
 #define MMU_PTE_PAGE		(0x400ULL | 0x300ULL | 0x50ULL | 0x7ULL)
@@ -1198,29 +1198,31 @@ mmu_unmap_page(u64 va)
 }
 
 /*
- * Change only GPU_VA_OUT's AttrIdx and matching AS_MEMATTR byte.
- * Job/descriptor pages remain AttrIdx=5 with 0x4c non-cacheable memory.
+ * Apply the proven write-back attribute (AttrIdx=4, 0x8c) to every
+ * GPU-visible output target: OUT, OUT2, and all four framebuffer pages.
+ * Job and descriptor mappings remain AttrIdx=5 with 0x4c non-cacheable memory.
  */
 static int
-gpu_output_memattr_set(u32 index, u32 attr)
+gpu_output_memattr_set_writeback(void)
 {
-	u64 mask;
+	const u32 index = 4U;
+	const u32 attr = 0x8cU;
+	u64 mask = 0xffULL << (index * 8U);
 	u32 lo, hi;
 
-	if (index > 7U || attr > 0xffU)
-		return -1;
-
-	/* Drain any prior write-back mode before changing its interpretation. */
+	/* Drain memory traffic before changing the output memory type. */
 	if (gpu_clean_inv_caches() != 0)
 		return -5;
 
-	mask = 0xffULL << (index * 8U);
 	gpu_memattr_table = (gpu_memattr_table & ~mask) |
 			    ((u64)attr << (index * 8U));
 	pt_l3[1] = (pt_l3[1] & ~(7ULL << 2)) | ((u64)index << 2);
+	pt_l3[3] = (pt_l3[3] & ~(7ULL << 2)) | ((u64)index << 2);
+	for (u32 i = 4; i <= 7; i++)
+		pt_l3[i] = (pt_l3[i] & ~(7ULL << 2)) | ((u64)index << 2);
 	dsb_sy();
 
-	/* Invalidate the old translation before publishing the new AttrIdx. */
+	/* Invalidate every changed translation before publishing AS_MEMATTR. */
 	if (mmu_flush_pt() != 0)
 		return -2;
 
@@ -1234,8 +1236,10 @@ gpu_output_memattr_set(u32 index, u32 attr)
 
 	lo = rd32(GPU_BASE + AS_MEMATTR_LO);
 	hi = rd32(GPU_BASE + AS_MEMATTR_HI);
-	logf("GPU: WVALATTR setup idx=%d attr=%x pte=%x memattr=%x/%x",
-	     (u64)index, (u64)attr, pt_l3[1], (u64)lo, (u64)hi);
+	logf("GPU: WVALATTR setup idx=4 attr=8c out=%x out2=%x",
+	     pt_l3[1], pt_l3[3]);
+	logf("GPU: WVALATTR FB PTE=%x/%x/%x/%x memattr=%x/%x",
+	     pt_l3[4], pt_l3[5], pt_l3[6], pt_l3[7], (u64)lo, (u64)hi);
 	return 0;
 }
 
@@ -2167,13 +2171,11 @@ run_write_value_job(int slot, u64 job_va, u32 js_present, u32 *raw_out)
 }
 
 /*
- * Discriminate a fragment-only writeback defect from an address-dependent
- * failure in the basic GPU job write path.  The 16 targets span all values
- * of address bits [10:8] twice while staying inside the mapped output page.
+ * Test the known-good write-back attribute across all output mappings.
+ * The 16 targets span address bits [10:8] twice within GPU_VA_OUT.
  */
 static int
-gpu_write_value_grid_once(int slot, u32 js_present, u32 attr_index,
-                          u32 attr_value, u32 mode, u32 total_modes)
+gpu_write_value_grid_once(int slot, u32 js_present)
 {
 	const u32 count = 16;
 	const u64 sentinel = 0x5a5a5a5a5a5a5a5aULL;
@@ -2183,14 +2185,11 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 attr_index,
 	u32 first_raw = 0;
 	int rc;
 
-	/* Keep the normal JS_CONFIG; vary only the output PTE attributes. */
 	gpu_js_config_override = 0;
-	logf("GPU: WVALATTR begin mode=%d/%d idx=%d attr=%x",
-	     (u64)mode, (u64)total_modes, (u64)attr_index, (u64)attr_value);
-	rc = gpu_output_memattr_set(attr_index, attr_value);
+	logf("GPU: WVALATTR begin idx=4 attr=8c out/out2/fb");
+	rc = gpu_output_memattr_set_writeback();
 	if (rc != 0) {
-		logf("GPU: WVALATTR setup error=%d idx=%d attr=%x",
-		     (u64)rc, (u64)attr_index, (u64)attr_value);
+		logf("GPU: WVALATTR setup error=%d", (u64)rc);
 		delay_us(1000000ULL);
 		return -1;
 	}
@@ -2205,13 +2204,12 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 attr_index,
 		u64 got;
 		u32 raw = 0;
 
-		logf("GPU: WVALATTR m=%d offset=%x start", (u64)mode, offset);
+		logf("GPU: WVALATTR offset=%x start", offset);
 		build_write_value_job(job_page, GPU_VA_OUT + offset, want);
 		rc = run_write_value_job(slot, GPU_VA_JOB, js_present, &raw);
 		if (rc != 0) {
-			logf("GPU: WVALATTR idx=%d attr=%x job offset=%x rc=%d raw=%x",
-			     (u64)attr_index, (u64)attr_value, offset,
-			     (u64)rc, (u64)raw);
+			logf("GPU: WVALATTR job offset=%x rc=%d raw=%x",
+			     offset, (u64)rc, (u64)raw);
 			delay_us(1000000ULL);
 			return -1;
 		}
@@ -2231,12 +2229,10 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 attr_index,
 		}
 	}
 
-	logf("GPU: WVALATTR mode=%d idx=%d attr=%x pass=%w fail=%w",
-	     (u64)mode, (u64)attr_index, (u64)attr_value, passmask, failmask);
+	logf("GPU: WVALATTR idx=4 attr=8c pass=%w fail=%w", passmask, failmask);
 	if (failmask != 0) {
-		logf("GPU: WVALATTR first idx=%d attr=%x offset=%x raw=%x got=%w want=%w",
-		     (u64)attr_index, (u64)attr_value, first_off,
-		     (u64)first_raw, first_got, first_want);
+		logf("GPU: WVALATTR first offset=%x raw=%x got=%w want=%w",
+		     first_off, (u64)first_raw, first_got, first_want);
 	}
 
 	delay_us(1000000ULL);
@@ -2246,34 +2242,7 @@ gpu_write_value_grid_once(int slot, u32 js_present, u32 attr_index,
 static int
 gpu_write_value_grid_test(int slot, u32 js_present)
 {
-	struct gpu_memattr_mode {
-		u32 index;
-		u32 attr;
-	};
-	/*
-	 * Modes 1-4 keep output memory NC (0x4c) while changing AttrIdx.
-	 * Modes 5-7 make only the output page write-back, varying allocation.
-	 * All job and descriptor pages remain on the original NC AttrIdx=5.
-	 */
-	static const struct gpu_memattr_mode modes[] = {
-		{ 5U, 0x4cU }, /* current baseline */
-		{ 4U, 0x4cU }, /* same NC, different PTE AttrIdx */
-		{ 6U, 0x4cU }, /* same NC, different PTE AttrIdx */
-		{ 7U, 0x4cU }, /* same NC, different PTE AttrIdx */
-		{ 4U, 0x88U }, /* write-back, implementation-defined allocation */
-		{ 4U, 0x8cU }, /* write-back, no read/write allocation */
-		{ 4U, 0x8fU }, /* write-back, read/write allocation */
-	};
-	u32 total_modes = sizeof(modes) / sizeof(modes[0]);
-
-	for (u32 i = 0; i < total_modes; i++) {
-		int rc = gpu_write_value_grid_once(slot, js_present,
-		                                  modes[i].index, modes[i].attr,
-		                                  i + 1u, total_modes);
-		if (rc < 0)
-			return -1;
-	}
-	return 0;
+	return gpu_write_value_grid_once(slot, js_present);
 }
 
 static int
@@ -2573,9 +2542,8 @@ gpu_traffic_test(void)
 	logf("GPU: WRITE VALUE PASS");
 
 	/*
-	 * This boot is dedicated to the seven-mode MMU-attribute matrix. Keep all
-	 * status on the normal text console so a stalled GPU operation leaves the
-	 * last progress line visible instead of replacing it with a full-screen card.
+	 * This boot isolates write-back output mappings. Keep status on the normal
+	 * text console so a stalled GPU operation leaves the last progress line visible.
 	 */
 	rc = gpu_write_value_grid_test((int)slot, js_present);
 	if (rc != 0) {
