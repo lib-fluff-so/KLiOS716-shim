@@ -14,6 +14,7 @@ layout for the v9 `MALLOC_VERTEX_JOB` aggregate.
 
 Useful references:
 
+- [HelioDarwin (Infinix Note 12 2023 / X676C, MT6789): Mali JM user-client patch](https://github.com/squeeeezy/HelioDarwin/blob/x676c/xnu/patches/0189-x676c-malimetal-jm-gpu-userclient.patch)
 - [Noysz/panvk-g99-jm: v9 draw porting log](https://github.com/Noysz/panvk-g99-jm/blob/main/docs/porting-log.md)
 - [Noysz/panvk-g99-jm: triangle draw test](https://github.com/Noysz/panvk-g99-jm/blob/main/tests/graphics/triangle_draw_test_v2.c)
 - [JimVulkan/mali-panvk: v9 Job Manager draw implementation](https://github.com/JimVulkan/mali-panvk/blob/main/src/panfrost/vulkan/jm/panvk_v9_cmd_draw.c)
@@ -47,6 +48,20 @@ The exact packed fields must be generated or checked against the matching v9
 genxml definitions, not assembled by guessing offsets. The currently available
 shim uses raw word arrays, so a first implementation should dump all 384 bytes
 after construction and before submission.
+
+HelioDarwin targets the Infinix X676C, also MT6789 + Mali-G57 r0p1, so
+its power/register/descriptor notes are unusually close to KL7. Its patch
+explicitly documents the expected JM layout as slot 0 for fragment and slot 1
+for vertex/tiler/compute, and defines the v9 job type as 11. The patch itself
+states hardware execution remains unvalidated, so treat it as a register and
+layout reference, not proof of a working renderer.
+
+The current branch now adds a deliberately limited `MALLOC_VERTEX_JOB`
+baseline after the known-good fragment clear. It uses job type 11, JS feature
+bit 12, a 384-byte descriptor, and a Vertex-stage (value 3) `NOP.end`
+shader. It is not supposed to draw anything. Its purpose is to establish
+whether the JM accepts the vertex descriptor and to report the job header plus
+the tiler-heap occupancy. This probe has not yet been built or run on KL7.
 
 The existing shim already has:
 - AS0 with 4-level, 48-bit GPU page tables;
