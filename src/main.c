@@ -28,6 +28,9 @@ typedef __builtin_va_list va_list;
 #define AUTO_REBOOT_TEST 1
 #endif
 #endif
+#ifndef PSCI_RESET_TIMER
+#define PSCI_RESET_TIMER 1
+#endif
 
 #define FB_BASE               0xFDFFF000UL
 #define FB_STRIDE             4352u
@@ -66,9 +69,10 @@ typedef __builtin_va_list va_list;
 /* WDT_TIMEOUT_AT_HANDOFF: arm (rather than disable) the watchdog right before
  * jumping to XNU, as a last-resort backstop. LENGTH ticks are 1/2048 s:
  * 0x5000 = 10 s, 0xf000 = 30 s (the MT6789 reads back 0xf000, i.e. the write
- * is ignored, so the real reset always comes from the PSCI timer below). */
+ * is ignored, so the real reset always comes from the optional PSCI timer). */
 #ifndef WDT_TIMEOUT_AT_HANDOFF
-/* WDT is disabled at handoff: the PSCI timer on cpu1 is the only reset source.
+/* WDT is disabled at handoff. With PSCI_RESET_TIMER=1 the timer on cpu1 is the
+ * only reset source; with it disabled there is no automatic reset at all.
  * A watchdog reset loses DRAM/ramoops, so it must never fire first. */
 #define WDT_TIMEOUT_AT_HANDOFF 0u
 #endif
@@ -248,6 +252,7 @@ static __attribute__((unused)) void wdt_arm(u32 ticks)
     wdt_report("armed");
 }
 
+#if PSCI_RESET_TIMER
 /* PSCI 1.0 (DT /psci method = "smc"). Start a secondary core in a tiny timer
  * loop that issues SYSTEM_RESET after a delay. A PSCI reset is clean: it keeps
  * DRAM (and therefore the ramoops/pstore ring) across the reboot, unlike a
@@ -288,13 +293,14 @@ static __attribute__((naked, noreturn)) void psci_reset_timer(void)
         "b 1b\n");
 }
 
-static void psci_start_reset_timer(void)
+static __attribute__((unused)) void psci_start_reset_timer(void)
 {
     u64 entry = (u64)(unsigned long)&psci_reset_timer;
     u64 rc = psci_smc(PSCI_CPU_ON, PSCI_RESET_CPU_MPIDR, entry, 0);
     logf("psci cpu_on(mpidr=%x entry=%x) -> %x", PSCI_RESET_CPU_MPIDR,
          entry, rc);
 }
+#endif /* PSCI_RESET_TIMER */
 
 #if WDT_DISABLE_AT_HANDOFF
 static __attribute__((unused)) void wdt_disable(void)
@@ -665,7 +671,7 @@ static int load_xnu(const u8 *dtb, u32 dtb_size, u64 initrd_start,
     u64 entry_pa = p.phys_base + entry_delta;
     logf("boot_args rev2: PA=%x ADT=%x+%x", boot_args_pa, adt_pa, p.adt_size);
     logf("XNU entry: PA=%x x0=%x", entry_pa, boot_args_pa);
-#if XNU_PAYLOAD
+#if XNU_PAYLOAD && PSCI_RESET_TIMER
     psci_start_reset_timer();
 #endif
 #if WDT_TIMEOUT_AT_HANDOFF
@@ -673,8 +679,13 @@ static int load_xnu(const u8 *dtb, u32 dtb_size, u64 initrd_start,
 #elif WDT_DISABLE_AT_HANDOFF
     wdt_disable();
 #endif
+#if PSCI_RESET_TIMER
     logf("HANDOFF: MMU off, caches off, secondaries untouched (cpu1 has the "
          "reset timer)");
+#else
+    logf("HANDOFF: MMU off, caches off, all CPUs handed to XNU; "
+         "watchdog disabled, no reset timer");
+#endif
     transfer_to_payload(entry_pa, boot_args_pa);
 }
 #endif
