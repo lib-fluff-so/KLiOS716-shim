@@ -784,8 +784,12 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
     (void)x1;
     (void)x2;
     (void)x3;
-    ramoops_init();
+    /* Put the panel first so ramoops_init() cannot hide the earliest
+     * visible checkpoint. If the panel clears and this line appears but the
+     * normal log never starts, the stall is inside ramoops_init(). */
     console_init();
+    console_write("EARLY: console ready\n", sizeof("EARLY: console ready\n") - 1u);
+    ramoops_init();
     logf("ios-kl7 shim v0.10.0");
     logf("console: framebuffer + ramoops");
     wdt_report("entry");
