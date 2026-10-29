@@ -2,6 +2,14 @@
 
 ## Status (2026-10-29)
 
+**Fragment WB test rolled back.** After adding a single 64x64 fragment job after
+the previously passing Write Value grid, the user reported a hang with no visible
+lines. No pstore capture from that attempt is available here, so the stuck stage
+is unconfirmed. Commit `9999d5e9580031496ae55eac772a27fe8dcac9f9` restores the
+known-good matrix-only source: all output PTEs use AttrIdx=4 / `0x8c`, one
+16-address Write Value grid runs, then the existing warm reset occurs. The
+fragment job is disabled again until stage-by-stage diagnostics are added.
+
 **Text-console recovery build (2026-10-29).** The GPU test had a full-screen
 visual-card call at its entry, then redrew the whole framebuffer after each MMU
 attribute mode. That intentionally erased the early text log and could leave no
