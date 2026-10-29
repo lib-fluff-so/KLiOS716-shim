@@ -95,12 +95,12 @@ typedef __builtin_va_list va_list;
  * A watchdog reset loses DRAM/ramoops, so it must never fire first. */
 #define WDT_TIMEOUT_AT_HANDOFF 0u
 #endif
-/* WDT_DISABLE_AT_HANDOFF=1: stop the watchdog before a long-running path so a
- * multi-minute kernel boot or a halted diagnostic is not reset. Default on for
- * XNU_PAYLOAD=1, BATTERY_TEST=1 and GPU_TEST=1; the short auto-reset test builds
- * keep the watchdog as a safety net. */
+/* WDT_DISABLE_AT_HANDOFF=1: stop the watchdog before a long-running path.
+ * Keep it enabled for GPU_TEST when PSCI_RESET_TIMER=0: the GPU can hang in an
+ * MMIO/job wait, and the hardware WDT is then the only reset backstop. If the
+ * PSCI timer is enabled, it owns the clean warm reset and preserves ramoops. */
 #ifndef WDT_DISABLE_AT_HANDOFF
-#define WDT_DISABLE_AT_HANDOFF (XNU_PAYLOAD || BATTERY_TEST || GPU_TEST)
+#define WDT_DISABLE_AT_HANDOFF (XNU_PAYLOAD || BATTERY_TEST || (GPU_TEST && PSCI_RESET_TIMER))
 #endif
 
 #define RD(reg) ({ u64 v_; __asm__ volatile("mrs %0, " #reg : "=r"(v_)); v_; })
@@ -837,6 +837,8 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
 #if GPU_TEST
 #if WDT_DISABLE_AT_HANDOFF
     wdt_disable();
+#else
+    wdt_report("gpu-test-watchdog-backstop");
 #endif
     logf("GPU TEST: Mali probe (XNU will not be loaded)");
 #if AUTO_REBOOT_TEST && PSCI_RESET_TIMER
