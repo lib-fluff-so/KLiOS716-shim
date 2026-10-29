@@ -31,7 +31,7 @@ Fragment clear-only job writes only HALF the rows of the 64×64 render target.
 Row mask for 64×64: `clear=6969696969696969`, `sent=9696969696969696`.
 Clear rows (mod 8): 0, 3, 5, 6. Sent rows: 1, 2, 4, 7.
 
-**Root cause identified:** GPU writes a row iff `popcount(addr[8] ^ addr[9] ^ addr[10]) == 0`,
+**Observed address-parity signature:** GPU writes a row iff `popcount(addr[8] ^ addr[9] ^ addr[10]) == 0`,
 i.e. even parity of address bits 8,9,10. Since row stride = 256 = 2^8, row `y` starts at
 byte address `y<<8`, so the rule is `popcount(y & 7) == 0` → write, odd → skip.
 
@@ -62,11 +62,31 @@ writeback-drop, not a scrambling.
 | tile9 | effective tile size 512 px | clear=512/4096 (different pattern) |
 | tiledwb | block format = Tiled U-Interleaved | clear=576/4096, partial |
 | alloff | dither off + clean off + empty-tile on | clear=0, sent=all |
-| msaa4 | sample count = 4x (d[11] bits 0-2 = 2) | **PENDING** — flashed to boot_b, log not yet pulled |
+| msaa4 | sample count = 4x (d[11] bits 0-2 = 2) | same `6969/9696` row mask; 2048 clear / 2048 sentinel — MSAA4 does not fix it |
 
 Key observation: `noclean` (clean-pixel write enable = 0) produces ZERO writeback. So the
-clean-pixel/fast-clear path IS active and IS writing — but it drops half the rows. This is
-likely a Mali-G57/MT6789 silicon quirk in the RT-clear writeback path, or a missing FBD field.
+clean-pixel/fast-clear path IS active and IS writing — but it drops half the rows. MSAA4
+does not change that mask. The defect is currently isolated to this clear-only fragment
+result; the address-grid probe below checks the ordinary Write Value job path next.
+
+## Next discriminator: Write Value address grid (source added; hardware result pending)
+
+`gpu_write_value_grid_test()` runs after the initial `WRITE VALUE PASS` and before the
+BO / compute / fragment tests. It submits 16 ordinary Write Value jobs to
+`GPU_VA_OUT + i*0x100` (`i=0..15`), covering all combinations of address bits [10:8]
+twice within the same mapped 4 KiB output page. Every target is initialized to a sentinel,
+then receives a distinct 64-bit value; the log reports a 16-bit pass/fail mask.
+
+- Expected if the ordinary write path is healthy: `pass=000000000000ffff fail=0000000000000000`.
+- If it reproduces the same address-parity signature, expected masks are
+  `pass=0000000000006969 fail=0000000000009696` (or the reverse if the surviving parity
+  is opposite).
+
+A nonzero mismatch mask does not stop the later compute/fragment probes; a job submission
+or completion error does stop the run. The probe changes neither the FBD nor fragment
+configuration. Hardware outcome is still pending because this source has not yet been
+flashed and run on KL7.
+
 
 ## FBD layout (from Mesa v9.xml, matches our code)
 

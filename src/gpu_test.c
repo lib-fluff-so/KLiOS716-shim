@@ -2119,6 +2119,67 @@ run_write_value_job(int slot, u64 job_va, u32 js_present, u32 *raw_out)
 	return wait_job(slot, raw_out);
 }
 
+/*
+ * Discriminate a fragment-only writeback defect from an address-dependent
+ * failure in the basic GPU job write path.  The 16 targets span all values
+ * of address bits [10:8] twice while staying inside the mapped output page.
+ */
+static int
+gpu_write_value_grid_test(int slot, u32 js_present)
+{
+	const u32 count = 16;
+	const u64 sentinel = 0x5a5a5a5a5a5a5a5aULL;
+	volatile u64 *out = (volatile u64 *)out_page;
+	u64 passmask = 0, failmask = 0;
+	u64 first_off = 0, first_got = 0, first_want = 0;
+	u32 first_raw = 0;
+	int rc;
+
+	for (u32 i = 0; i < count; i++)
+		out[i * 32U] = sentinel;
+	dsb_sy();
+
+	for (u32 i = 0; i < count; i++) {
+		u64 offset = (u64)i * 0x100ULL;
+		u64 want = 0xa57e000000000000ULL | (u64)(i + 1U);
+		u64 got;
+		u32 raw = 0;
+
+		build_write_value_job(job_page, GPU_VA_OUT + offset, want);
+		rc = run_write_value_job(slot, GPU_VA_JOB, js_present, &raw);
+		if (rc != 0) {
+			logf("GPU: WVALGRID job offset=%x rc=%d raw=%x",
+			     offset, (u64)rc, (u64)raw);
+			return -1;
+		}
+
+		__asm__ volatile("dmb oshld" ::: "memory");
+		got = out[i * 32U];
+		if (got == want) {
+			passmask |= 1ULL << i;
+		} else {
+			failmask |= 1ULL << i;
+			if (failmask == (1ULL << i)) {
+				first_off = offset;
+				first_got = got;
+				first_want = want;
+				first_raw = raw;
+			}
+		}
+	}
+
+	logf("GPU: WVALGRID pass=%w fail=%w", passmask, failmask);
+	if (failmask != 0) {
+		logf("GPU: WVALGRID first offset=%x raw=%x got=%w want=%w",
+		     first_off, (u64)first_raw, first_got, first_want);
+		logf("GPU: WVALGRID MISMATCH; continuing to compute/fragment probes");
+		return 1;
+	}
+
+	logf("GPU: WVALGRID PASS n=%d stride=%x", (u64)count, 0x100ULL);
+	return 0;
+}
+
 static int
 gpu_multislot_test(int slot0, u32 js_present)
 {
@@ -2414,6 +2475,12 @@ gpu_traffic_test(void)
 		return -8;
 	}
 	logf("GPU: WRITE VALUE PASS");
+
+	rc = gpu_write_value_grid_test((int)slot, js_present);
+	if (rc < 0) {
+		logf("GPU: WVALGRID STOP after a job error");
+		return -8;
+	}
 
 	rc = gpu_bo_test((int)slot, js_present);
 	if (rc != 0) {
