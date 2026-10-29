@@ -1990,10 +1990,7 @@ gpu_fragment_wb_test(u32 js_present)
 }
 
 
-/* First v9 MALLOC_VERTEX_JOB probe. It deliberately uses a Vertex-stage
- * NOP.end shader: this validates job routing/header/position descriptor and
- * gives us a tiler-heap baseline without claiming that geometry was generated.
- * The actual triangle shader is a separate next step. */
+/* v9 MALLOC_VERTEX_JOB support plus reusable header builder. */
 static int
 find_malloc_vertex_slot(u32 present)
 {
@@ -2012,7 +2009,7 @@ find_malloc_vertex_slot(u32 present)
 }
 
 static void
-build_malloc_vertex_nop_job(u64 *page)
+build_malloc_vertex_job(u64 *page)
 {
 	volatile u32 *h = (volatile u32 *)page;
 
@@ -2138,12 +2135,20 @@ gpu_malloc_vertex_position_smoke_test(u32 js_present)
 	build_tiler_heap_desc(tiler_heap_page, GPU_VA_TILER_DATA,
 			      GPU_TILER_HEAP_SIZE);
 	build_tiler_context(tiler_ctx_page, GPU_VA_TILER_HEAP, 64U, 64U);
-	build_malloc_vertex_nop_job(job_page);
+	build_malloc_vertex_job(job_page);
 
 	logf("GPU: POS-SMOKE start slot=%d job=%x shader=%x code=%x words=%d preload=%x",
 	     (u64)slot, GPU_VA_JOB, GPU_VA_SHADER_DESC, GPU_VA_SHADER_NOP,
 	     (u64)(sizeof(vertex_position_smoke_code) / sizeof(vertex_position_smoke_code[0])),
 	     (u64)((volatile u32 *)shader_desc_page)[1]);
+	for (u32 i = 0; i < (u32)(sizeof(vertex_position_smoke_code) /
+				     sizeof(vertex_position_smoke_code[0])); i++)
+		logf("GPU: POS-SMOKE code[%d]=%w", (u64)i, shader_code[i]);
+	logf("GPU: POS-SMOKE shaderdesc=%x/%x/%w",
+	     (u64)((volatile u32 *)shader_desc_page)[0],
+	     (u64)((volatile u32 *)shader_desc_page)[1],
+	     (u64)((volatile u32 *)shader_desc_page)[2] |
+		 ((u64)((volatile u32 *)shader_desc_page)[3] << 32));
 	logf("GPU: MALLOCV hdr=%x/%x/%x/%x/%x",
 	     (u64)((volatile u32 *)job_page)[0],
 	     (u64)((volatile u32 *)job_page)[1],
