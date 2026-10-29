@@ -224,7 +224,7 @@ static int format_line(char *out, int cap, const char *fmt, va_list ap)
     return (int)(out - begin);
 }
 
-static void logf(const char *fmt, ...)
+void logf(const char *fmt, ...)
 {
     char line[160];
     va_list ap;
@@ -296,7 +296,7 @@ static __attribute__((naked, noreturn)) void psci_reset_timer(void)
         "b 1b\n");
 }
 
-static void psci_start_reset_timer(void)
+static __attribute__((unused)) void psci_start_reset_timer(void)
 {
     u64 entry = (u64)(unsigned long)&psci_reset_timer;
     u64 rc = psci_smc(PSCI_CPU_ON, PSCI_RESET_CPU_MPIDR, entry, 0);
