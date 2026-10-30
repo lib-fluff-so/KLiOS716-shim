@@ -130,6 +130,11 @@ loadertest:
 	out-test/host_loader out-test/ramdisk.cpio out-test/payload.bin
 	python3 tests/test_ramdisk.py out-test/ramdisk.cpio out-test/payload.bin
 
+androidimgtest:
+	mkdir -p $(OUT)
+	gcc -O1 -g -fsanitize=address,undefined -Wall -Wextra -Werror -std=c11 -Isrc/boot -o $(OUT)/host_android_bootimg tests/host_android_bootimg.c src/boot/android_bootimg.c
+	$(OUT)/host_android_bootimg
+
 xnutest:
 	mkdir -p $(OUT)
 	gcc -O1 -g -fsanitize=address,undefined -std=c11 -Wall -Wextra -Werror -o $(OUT)/host_xnu_payload tests/host_xnu_payload.c src/xnu_payload.c
@@ -146,4 +151,4 @@ files=["Image","Image.gz","ramdisk.cpio","shim_b.img","shim_raw_b.img"];\
 
 clean:
 	@if [ -d "$(OUT)" ]; then find "$(OUT)" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; fi
-.PHONY: all clean hosttest loadertest xnutest sizes
+.PHONY: all clean hosttest loadertest xnutest androidimgtest sizes

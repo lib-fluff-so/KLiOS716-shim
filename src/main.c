@@ -793,34 +793,54 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
 #if BATTERY_TEST
     logf("BATTERY TEST: driver API smoke test");
     battery_test();
-    logf("BATTERY TEST: finished; halted for log capture");
+#if AUTO_REBOOT_TEST
+    finish_test_attempt("battery test complete");
+#else
+    logf("BATTERY TEST: halted; no auto-reboot");
     for (;;) __asm__ volatile("wfe");
+#endif
 #endif
 
 #if TOUCH_TEST
     logf("TOUCH TEST: FTS3519 driver API smoke test");
     touch_test();
-    logf("TOUCH TEST: finished; halted for log capture");
+#if AUTO_REBOOT_TEST
+    finish_test_attempt("touch test complete");
+#else
+    logf("TOUCH TEST: halted; no auto-reboot");
     for (;;) __asm__ volatile("wfe");
+#endif
 #endif
 
 #if UFS_TEST
     logf("UFS TEST: MTK block driver smoke test");
     ufs_test();
-    logf("UFS TEST: finished; halted for log capture");
+#if AUTO_REBOOT_TEST
+    finish_test_attempt("UFS test complete");
+#else
+    logf("UFS TEST: halted; no auto-reboot");
     for (;;) __asm__ volatile("wfe");
+#endif
 #endif
 
 #if MENU_TEST
     boot_menu_test();
-    logf("BOOT MENU TEST: finished; halted");
+#if AUTO_REBOOT_TEST
+    finish_test_attempt("boot menu test complete");
+#else
+    logf("MENU TEST: halted; no auto-reboot");
     for (;;) __asm__ volatile("wfe");
+#endif
 #endif
 
 #if ANDROID_BOOT_TEST
     android_boot_test();
-    logf("ANDROID TEST: finished; halted");
+#if AUTO_REBOOT_TEST
+    finish_test_attempt("Android boot inspection complete");
+#else
+    logf("ANDROID BOOT TEST: halted; no auto-reboot");
     for (;;) __asm__ volatile("wfe");
+#endif
 #endif
 
     const u8 *dtb = (const u8 *)dtb_address;
