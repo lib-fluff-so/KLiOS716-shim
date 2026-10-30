@@ -10,7 +10,7 @@ struct fts3519_point {
     unsigned int raw_y;
     unsigned char id;
     unsigned char down;
-    unsigned char raw[6];
+    unsigned char b[6];
 };
 
 /* Initialise SPI1, power/reset FTS3519 and verify its chip ID. */
