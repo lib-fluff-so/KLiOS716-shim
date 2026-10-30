@@ -128,3 +128,16 @@ GPU: FRAGWB PASS clear=4096
 That validates write-back mapping and clear-only fragment writeback for this
 test configuration. It does not yet validate vertex shading, tiler-generated
 primitive data, or a shader-coloured triangle.
+
+
+## No-fragment position smoke packet — reference-matched fields (2026-10-30)
+
+Compared the shim's MALLOC_VERTEX_JOB against PanVK's v9 draw emitter and v9 genxml from pinned commit d896b0a9c10b92f0f9d53ef3373006b79ed709e8.
+
+For the no-secondary/no-fragment path, PanVK sets allocation to packet stride 16 and attribute stride 0. This is an internal position-packet stride, not the API vertex-buffer stride. Setting it to zero was an incorrect interpretation.
+
+The packet now uses no-FS DCD flags 0x00810183 / 0x0000ffff, a no-depth-test descriptor with word 4 0xe4c00000, and a blend descriptor with Enable=false and Internal Blend Mode=Off. The LOCAL_STORAGE descriptor is initialized with the no-workgroup-memory WLS sentinel (word1 & 0x1f == 0x1f).
+
+The six-instruction shader and its same-position output are unchanged. No vertex-input descriptors or vertex buffer have been introduced. The shader environment Resources pointer is still zero and remains an explicit verification point if the job faults.
+
+These edits match the reference packet fields; they have not yet been built or validated on KL7.
