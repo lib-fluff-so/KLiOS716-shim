@@ -619,7 +619,7 @@ static const u64 compute_nop_code[] = {
  *   IADD_IMM.i32 r1, 0x0, #0x00000000
  *   IADD_IMM.i32 r2, 0x0, #0x00000000
  *   IADD_IMM.i32 r3, 0x3F800000, #0x00000000
- *   LEA_ATTR.slot0.wait0 @r4:r5, `r59, unk:0xD
+ *   LEA_VARY.slot0.wait0 @r4:r5, `r59, unk:0xD
  *   STORE.i128.pos.slot0.return @r0:r1:r2:r3, `r4, offset:0
  *
  * Every invocation writes a valid clip-space (0,0,0,1) position. The three
@@ -1911,9 +1911,10 @@ gpu_job_exception_name(u32 code)
 static const char *
 gpu_job_access_name(u32 access)
 {
+	/* v9.xml: Exception Access enum is NONE=0, READ=1, EXECUTE=2, WRITE=3. */
 	switch (access) {
-	case 1: return "EXECUTE";
-	case 2: return "READ";
+	case 1: return "READ";
+	case 2: return "EXECUTE";
 	case 3: return "WRITE";
 	default: return "NONE";
 	}
@@ -1937,10 +1938,10 @@ gpu_job_status_dump(const char *tag, const volatile u32 *h)
 	if (status == 1U) {
 		logf("GPU: JOBSTATUS %s decoded=DONE", tag);
 	} else if (status >= 0x40U) {
-		logf("GPU: JOBSTATUS %s decoded=%s access=%s source=%x",
+		logf("GPU: JOBSTATUS %s decoded=%s access=%s source=%x raw=%x",
 		     tag, gpu_job_exception_name(status & 0xffU),
 		     gpu_job_access_name((status >> 8) & 3U),
-		     (u64)(status >> 16));
+		     (u64)(status >> 16), (u64)status);
 	} else {
 		logf("GPU: JOBSTATUS %s decoded=NONFAULT status=%x",
 		     tag, (u64)status);
