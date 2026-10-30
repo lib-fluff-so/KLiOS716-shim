@@ -177,8 +177,8 @@ static struct ucd ucd __attribute__((aligned(128)));
 static u32 last_ocs, last_st, last_upiu, last_resid;
 
 /* v0117 HS result, repeated after the bench so it stays on screen. */
-static u32 hs_local_gear, hs_peer_gear, hs_rxlanes, hs_txlanes;
-static u32 hs_final_pwr, hs_final_gear, hs_upmcrs;
+static u32 hs_rxlanes, hs_txlanes;
+static u32 hs_final_gear, hs_upmcrs;
 static int hs_active, hs_link_broken;
 static const char *hs_fail = "not_run";
 
@@ -438,8 +438,6 @@ ufs_hs_enable(void)
 		hs_fail = "max_hs_gear";
 		return;
 	}
-	hs_local_gear = local;
-	hs_peer_gear = peer;
 	if (!rxlanes || !txlanes || rxlanes > 2 || txlanes > 2) {
 		logf("UFS HS: bad lanes rx=%x tx=%x", (u64)rxlanes,
 		     (u64)txlanes);
@@ -495,7 +493,6 @@ ufs_hs_enable(void)
 		hs_fail = "pwr_readback";
 		return;
 	}
-	hs_final_pwr = pwr;
 	(void)hs_get(UIC_CMD_DME_GET, PA_TXGEAR, "txgear_readback",
 		     &hs_final_gear);
 	(void)hs_get(UIC_CMD_DME_GET, PA_RXGEAR, "rxgear_readback", &v);
