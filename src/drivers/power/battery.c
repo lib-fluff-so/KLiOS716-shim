@@ -31,7 +31,7 @@
  * applies.  The raw values are logged as well, so calibration can be added
  * after this first access check.
  */
-#include "console.h"
+#include "../../console.h"
 #include "battery.h"
 
 #ifndef CHARGER_WRITE_TEST

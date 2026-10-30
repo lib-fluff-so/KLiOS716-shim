@@ -9,6 +9,7 @@ OBJCOPY = llvm-objcopy
 OUT     ?= out
 RAMOOPS_LOG ?= 1
 BATTERY_TEST ?= 0
+TOUCH_TEST ?= 0
 XNU_PAYLOAD ?= 0
 PSCI_RESET_TIMER ?= 0
 XNU_KERNEL ?=
@@ -22,7 +23,7 @@ XNU_RAMDISK ?=
 XNU_CMDLINE ?= debug=0xc serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsroot=iosroot ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin wdt=-1 sweetfb_noconsole=1 sweetvib=300
 D22AP_ADT ?= research/ipsw-x/d22ap.adt
 
-CFLAGS += -DRAMOOPS_LOG=$(RAMOOPS_LOG) -DXNU_PAYLOAD=$(XNU_PAYLOAD) -DPSCI_RESET_TIMER=$(PSCI_RESET_TIMER) -DBATTERY_TEST=$(BATTERY_TEST)
+CFLAGS += -DRAMOOPS_LOG=$(RAMOOPS_LOG) -DXNU_PAYLOAD=$(XNU_PAYLOAD) -DPSCI_RESET_TIMER=$(PSCI_RESET_TIMER) -DBATTERY_TEST=$(BATTERY_TEST) -DTOUCH_TEST=$(TOUCH_TEST)
 ifdef WDT_DISABLE_AT_HANDOFF
 CFLAGS += -DWDT_DISABLE_AT_HANDOFF=$(WDT_DISABLE_AT_HANDOFF)
 endif
@@ -62,7 +63,7 @@ $(OUT)/vectors.o: src/vectors.S | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/handoff.o: src/handoff.S | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(OUT)/main.o: src/main.c src/console.h src/memmap.h src/loader.h src/xnu_payload.h src/tests/battery_test.h | $(OUT)
+$(OUT)/main.o: src/main.c src/console.h src/memmap.h src/loader.h src/xnu_payload.h src/tests/battery_test.h src/tests/touch_test.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/console.o: src/console.c src/console.h src/font.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -77,7 +78,14 @@ $(OUT)/battery.o: src/drivers/power/battery.c src/drivers/power/battery.h src/co
 	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/battery_test.o: src/tests/battery_test.c src/tests/battery_test.h src/drivers/power/battery.h src/console.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(OUT)/shim.elf: $(OUT)/start.o $(OUT)/vectors.o $(OUT)/handoff.o $(OUT)/main.o $(OUT)/console.o $(OUT)/memmap.o $(OUT)/loader.o $(OUT)/xnu_payload.o $(OUT)/battery.o $(OUT)/battery_test.o link.ld
+
+$(OUT)/timer.o: src/core/timer.c src/core/timer.h | $(OUT)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OUT)/fts3519.o: src/drivers/input/fts3519.c src/drivers/input/fts3519.h src/core/timer.h src/console.h | $(OUT)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OUT)/touch_test.o: src/tests/touch_test.c src/tests/touch_test.h src/drivers/input/fts3519.h src/core/timer.h src/console.h | $(OUT)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OUT)/shim.elf: $(OUT)/start.o $(OUT)/vectors.o $(OUT)/handoff.o $(OUT)/main.o $(OUT)/console.o $(OUT)/memmap.o $(OUT)/loader.o $(OUT)/xnu_payload.o $(OUT)/battery.o $(OUT)/battery_test.o $(OUT)/timer.o $(OUT)/fts3519.o $(OUT)/touch_test.o link.ld
 	$(LD) --gc-sections -nostdlib -T link.ld -o $@ $(filter %.o,$^)
 $(OUT)/Image: $(OUT)/shim.elf
 	$(OBJCOPY) -O binary $< $@
