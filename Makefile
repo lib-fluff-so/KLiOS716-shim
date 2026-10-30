@@ -91,14 +91,16 @@ $(OUT)/touch_test.o: src/tests/touch_test.c src/tests/touch_test.h src/drivers/i
 
 $(OUT)/mtk_ufs.o: src/drivers/storage/mtk_ufs.c src/drivers/storage/mtk_ufs.h src/core/timer.h src/console.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(OUT)/ufs_test.o: src/tests/ufs_test.c src/tests/ufs_test.h src/drivers/storage/mtk_ufs.h src/console.h | $(OUT)
+$(OUT)/gpt.o: src/drivers/storage/gpt.c src/drivers/storage/gpt.h src/drivers/storage/mtk_ufs.h | $(OUT)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OUT)/ufs_test.o: src/tests/ufs_test.c src/tests/ufs_test.h src/drivers/storage/mtk_ufs.h src/drivers/storage/gpt.h src/console.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OUT)/boot_menu.o: src/boot/boot_menu.c src/boot/boot_menu.h src/drivers/input/fts3519.h src/core/timer.h src/console.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/boot_menu_test.o: src/tests/boot_menu_test.c src/tests/boot_menu_test.h src/boot/boot_menu.h src/console.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(OUT)/shim.elf: $(OUT)/start.o $(OUT)/vectors.o $(OUT)/handoff.o $(OUT)/main.o $(OUT)/console.o $(OUT)/memmap.o $(OUT)/loader.o $(OUT)/xnu_payload.o $(OUT)/battery.o $(OUT)/battery_test.o $(OUT)/timer.o $(OUT)/fts3519.o $(OUT)/touch_test.o $(OUT)/mtk_ufs.o $(OUT)/ufs_test.o $(OUT)/boot_menu.o $(OUT)/boot_menu_test.o link.ld
+$(OUT)/shim.elf: $(OUT)/start.o $(OUT)/vectors.o $(OUT)/handoff.o $(OUT)/main.o $(OUT)/console.o $(OUT)/memmap.o $(OUT)/loader.o $(OUT)/xnu_payload.o $(OUT)/battery.o $(OUT)/battery_test.o $(OUT)/timer.o $(OUT)/fts3519.o $(OUT)/touch_test.o $(OUT)/mtk_ufs.o $(OUT)/gpt.o $(OUT)/ufs_test.o $(OUT)/boot_menu.o $(OUT)/boot_menu_test.o link.ld
 	$(LD) --gc-sections -nostdlib -T link.ld -o $@ $(filter %.o,$^)
 $(OUT)/Image: $(OUT)/shim.elf
 	$(OBJCOPY) -O binary $< $@

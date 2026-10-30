@@ -588,7 +588,8 @@ static u32 scsi(u32 lun, const u8 *cdb, u32 cdb_len, void *buf, u32 len)
 	last_upiu = ucd.resp[0];		/* 0x21 = RESPONSE UPIU */
 
 	last_resid = be32(ucd.resp + 12);	/* residual transfer count */
-	last_st = ucd.resp[7];			/* SCSI status */	if (last_ocs)
+	last_st = ucd.resp[7];			/* SCSI status */
+	if (last_ocs)
 		return 2;
 	if (last_upiu != 0x21)			/* RESPONSE UPIU */
 		return 3;
