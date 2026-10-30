@@ -588,24 +588,7 @@ static u32 scsi(u32 lun, const u8 *cdb, u32 cdb_len, void *buf, u32 len)
 	last_upiu = ucd.resp[0];		/* 0x21 = RESPONSE UPIU */
 
 	last_resid = be32(ucd.resp + 12);	/* residual transfer count */
-	last_st = ucd.resp[7];			/* SCSI status */
-	/*
-	 * struct utp_cmd_rsp: residual_transfer_count @12, reserved[4] @16..31,
-	 * sense_data_len (BE16) @32, sense_data[18] @34.  The sense key is
-	 * sense[2], ASC sense[12], ASCQ sense[13].
-	 */
-	last_sense_len = ((u32)ucd.resp[32] << 8) | ucd.resp[33];
-	if (last_sense_len > 18)
-		last_sense_len = 18;
-	last_sk = last_asc = last_ascq = 0;
-	if (last_sense_len >= 3)
-		last_sk = ucd.resp[34 + 2] & 0xf;
-	if (last_sense_len >= 14) {
-		last_asc = ucd.resp[34 + 12];
-		last_ascq = ucd.resp[34 + 13];
-	}
-	last_sense = last_sk << 16 | last_asc << 8 | last_ascq;
-	if (last_ocs)
+	last_st = ucd.resp[7];			/* SCSI status */	if (last_ocs)
 		return 2;
 	if (last_upiu != 0x21)			/* RESPONSE UPIU */
 		return 3;
@@ -713,28 +696,24 @@ static u32 read_blocks_one(u32 lun, u32 lba, u32 count, void *buf)
 	return scsi(lun, cdb, sizeof(cdb), buf, count * BLOCK);
 }
 
-/* Fallback only: UFS normally returns sense data inside the response UPIU. */
 
 
 
 
 
 
-/* Name the filesystem whose superblock starts at block lba (f2fs/ext4). */
-
-
-/* One line per GPT entry (4K LBA units, sizes in MiB). */
 
 
 
 
 
 
-/*
- * Read-only throughput check.  `ents` is a 2 MiB static buffer described by
- * up to 128 PRDT entries; one SCSI READ(10) moves the whole buffer, so this
- * measures sustained link throughput rather than per-command overhead.
- */
+
+
+
+
+
+
 
 
 
