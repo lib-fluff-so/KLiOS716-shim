@@ -24,7 +24,8 @@ void ufs_test(void)
     for (gpt_u32 i = 0; i < table.count; i++) {
         const struct gpt_partition *p = &table.partitions[i];
         logf("GPT: %s first=%x last=%x",
-             p->name, p->first_lba, p->last_lba);
+             p->name, (unsigned long)p->first_lba,
+             (unsigned long)p->last_lba);
     }
 
     const struct gpt_partition *boot_a = gpt_find_partition(&table, "boot_a");

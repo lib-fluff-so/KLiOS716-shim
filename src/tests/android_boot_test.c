@@ -46,7 +46,7 @@ static void inspect_boot_partition(const char *name)
     logf("ANDROID: %s v=%d kernel=%d ramdisk=%d sig=%d image=%d",
          name, (unsigned long)info.header_version,
          (unsigned long)info.kernel_size, (unsigned long)info.ramdisk_size,
-         (unsigned long)info.signature_size, (unsigned long)info.image_size);
+         (unsigned long)info.signature_size, (unsigned long)(unsigned long)info.image_size);
 
     if (info.kernel_size) {
         unsigned int block = (unsigned int)(p->first_lba +
@@ -102,9 +102,9 @@ static void inspect_vendor_partition(const char *name)
          (unsigned long)info.ramdisk_table_entries,
          (unsigned long)info.bootconfig_size);
     logf("ANDROID: %s offsets ramdisk=%x dtb=%x table=%x config=%x total=%x",
-         name, info.ramdisk_offset, info.dtb_offset,
-         info.ramdisk_table_offset, info.bootconfig_offset,
-         info.image_size);
+         name, (unsigned long)info.ramdisk_offset, (unsigned long)info.dtb_offset,
+         (unsigned long)info.ramdisk_table_offset, (unsigned long)info.bootconfig_offset,
+         (unsigned long)info.image_size);
 }
 
 void android_boot_test(void)
