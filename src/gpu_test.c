@@ -632,7 +632,7 @@ static const u64 vertex_position_smoke_code[] = {
 	0x0110c200000000c0ULL,
 	0x0110c300000000d0ULL,
 	0x085e840440000d7bULL,
-	0x1000000000000000ULL,	/* NOP.wait1: consume LEA_VARY slot 1 */
+	0x2000000000000000ULL,	/* NOP.wait1: consume LEA_BUF_IMM slot 1 */
 	0x7861400839000044ULL,
 };
 static u64 bo_pool[BO_POOL_PAGES][512] __attribute__((aligned(4096)));
@@ -2057,7 +2057,7 @@ build_malloc_vertex_job(u64 *page)
 	/* Mesa PanVK v9 no-fragment-shader defaults: force-early pixel/Z-S updates,
 	 * forward kill both ways, overdraw alpha, CCW front face, scissor bbox.
 	 * No fragment shader writes a render target, so RT mask is zero. */
-	h[32] = 0x00810183U;	/* DCD_FLAGS_0 */
+	h[32] = 0x00010183U;	/* DCD_FLAGS_0: no-FS Mesa defaults */
 	h[33] = 0x0000ffffU;	/* DCD_FLAGS_1: sample mask only */
 	h[34] = 1U;		/* Vertex Array.Packet = true */
 	h[35] = 0;
@@ -2070,8 +2070,8 @@ build_malloc_vertex_job(u64 *page)
 	 * is submitted by this probe. */
 	h[42] = (u32)GPU_VA_OUT;
 	h[43] = (u32)(GPU_VA_OUT >> 32);
-	h[44] = (u32)(GPU_VA_OUT2 | 1ULL);	/* blend count=1, address=OUT2 */
-	h[45] = (u32)(GPU_VA_OUT2 >> 32);
+	h[44] = 0;		/* no fragment shader: no blend descriptor */
+	h[45] = 0;
 
 	/* Position shader environment at byte offset 256. Four resource-table
 	 * entries are required by the v9 ABI; entry 0 points at the VS driver set. */
