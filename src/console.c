@@ -160,3 +160,9 @@ void console_draw_text(u32 x, u32 y, const char *text, u32 scale,
             break;
     }
 }
+
+void console_cursor_reset(void)
+{
+    cursor_x = 0;
+    cursor_y = 0;
+}

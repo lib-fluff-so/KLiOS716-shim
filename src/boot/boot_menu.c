@@ -86,6 +86,7 @@ int boot_menu_select(enum boot_choice *choice)
         return -2;
     }
 
+    console_cursor_reset();
     draw_menu();
     logf("BOOT MENU: waiting for touch selection");
 
