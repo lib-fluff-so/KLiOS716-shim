@@ -108,3 +108,55 @@ void console_write(const char *text, unsigned long length)
     if (!console_ready || !text) return;
     for (unsigned long i = 0; i < length; i++) put_char(text[i]);
 }
+
+
+void console_fill_rect(u32 x, u32 y, u32 width, u32 height, u32 color)
+{
+    if (!console_ready || x >= FB_WIDTH || y >= FB_HEIGHT || !width || !height)
+        return;
+    if (width > FB_WIDTH - x)
+        width = FB_WIDTH - x;
+    if (height > FB_HEIGHT - y)
+        height = FB_HEIGHT - y;
+
+    for (u32 row = 0; row < height; row++) {
+        volatile u32 *dst = pixel_ptr(x, y + row);
+        for (u32 col = 0; col < width; col++)
+            dst[col] = color;
+    }
+}
+
+void console_draw_text(u32 x, u32 y, const char *text, u32 scale,
+                       u32 foreground, u32 background)
+{
+    if (!console_ready || !text || scale == 0u || scale > 8u)
+        return;
+
+    while (*text) {
+        u8 ch = (u8)*text++;
+        if (ch < 32u || ch > 126u)
+            ch = '?';
+        const u8 *glyph = font8x16[ch - 32u];
+
+        for (u32 gy = 0; gy < 16u; gy++) {
+            for (u32 sy = 0; sy < scale; sy++) {
+                u32 py = y + gy * scale + sy;
+                if (py >= FB_HEIGHT)
+                    continue;
+                volatile u32 *dst = pixel_ptr(x, py);
+                for (u32 gx = 0; gx < 8u; gx++) {
+                    u32 color = (glyph[gy] & (0x80u >> gx)) ?
+                                foreground : background;
+                    for (u32 sx = 0; sx < scale; sx++) {
+                        u32 px = x + gx * scale + sx;
+                        if (px < FB_WIDTH)
+                            dst[gx * scale + sx] = color;
+                    }
+                }
+            }
+        }
+        x += 8u * scale;
+        if (x >= FB_WIDTH)
+            break;
+    }
+}
