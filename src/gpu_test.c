@@ -2025,7 +2025,7 @@ build_malloc_vertex_job(u64 *page)
 	h[10] = 0;	/* instance offset */
 	h[11] = 3;	/* vertices */
 	h[12] = 1;	/* instance count */
-	h[13] = 16;	/* vertex packet stride; attribute stride = 0 */
+	h[13] = 16;	/* required position-packet stride when no varying shader; attribute stride = 0 */
 
 	/* Tiler context pointer. */
 	h[14] = (u32)GPU_VA_TILER_CTX;
@@ -2039,8 +2039,11 @@ build_malloc_vertex_job(u64 *page)
 	h[31] = 0;
 
 	/* Draw state: packet mode lets hardware fill vertex-array pointer/stride. */
-	h[32] = 0x00010000U;	/* DCD_FLAGS_0 */
-	h[33] = 0x0001ffffU;	/* DCD_FLAGS_1 */
+	/* Mesa PanVK v9 no-fragment-shader defaults: force-early pixel/Z-S updates,
+	 * forward kill both ways, overdraw alpha, CCW front face, scissor bbox.
+	 * No fragment shader writes a render target, so RT mask is zero. */
+	h[32] = 0x00810183U;	/* DCD_FLAGS_0 */
+	h[33] = 0x0000ffffU;	/* DCD_FLAGS_1: sample mask only */
 	h[34] = 1U;		/* Vertex Array.Packet = true */
 	h[35] = 0;
 	h[36] = 0;
@@ -2130,8 +2133,11 @@ gpu_malloc_vertex_position_smoke_test(u32 js_present)
 	((volatile u32 *)shader_desc_page)[1] = 1U << 11;	/* preload linear ID in r59 */
 	dsb_sy();
 	ds_desc[0] = 7U;	/* Descriptor Type::Depth/stencil */
-	ds_desc[4] = 1U << 22;	/* Depth cull enable, matching primitive state */
-	blend_desc[0] = 0U;	/* blending disabled */
+	/* No depth attachment/test: clip+cull enabled, [0,1] clamp,
+	 * fixed-function depth source, ALWAYS comparison, no depth write. */
+	ds_desc[4] = (1U << 22) | (1U << 23) | (2U << 25) | (7U << 29);
+	blend_desc[0] = 0U;	/* Blend Enable=false */
+	blend_desc[2] = 3U;	/* Internal Blend Mode::Off */
 	build_tiler_heap_desc(tiler_heap_page, GPU_VA_TILER_DATA,
 			      GPU_TILER_HEAP_SIZE);
 	build_tiler_context(tiler_ctx_page, GPU_VA_TILER_HEAP, 64U, 64U);
