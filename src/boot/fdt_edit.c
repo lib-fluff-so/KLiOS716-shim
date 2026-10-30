@@ -307,3 +307,84 @@ int fdt_edit_android_chosen(const fe_u8 *src, fe_u32 source_capacity,
     *result_size = new_strings_off + new_strings_size;
     return 0;
 }
+
+
+int fdt_get_chosen_bootargs(const fe_u8 *src, fe_u32 source_capacity,
+                            char *dst, fe_u32 dst_capacity,
+                            fe_u32 *result_size)
+{
+    fe_u32 total, off_struct, off_strings, strings_size, struct_size;
+    fe_u32 depth = 0, chosen_depth = 0;
+    int chosen_found = 0;
+
+    if (!src || !dst || !dst_capacity || !result_size ||
+        source_capacity < FDT_HEADER_SIZE || be32(src) != FDT_MAGIC)
+        return -1;
+    total = be32(src + 4u);
+    off_struct = be32(src + 8u);
+    off_strings = be32(src + 12u);
+    strings_size = be32(src + 32u);
+    struct_size = be32(src + 36u);
+    if (total < FDT_HEADER_SIZE || total > source_capacity ||
+        total > FDT_MAX_SIZE || off_struct > total ||
+        struct_size > total - off_struct || off_strings > total ||
+        strings_size > total - off_strings)
+        return -2;
+
+    const fe_u8 *strings = src + off_strings;
+    const fe_u8 *p = src + off_struct;
+    const fe_u8 *end = p + struct_size;
+    while (p + 4u <= end) {
+        fe_u32 token = be32(p);
+        fe_u32 token_size = 4u;
+        if (token == FDT_BEGIN_NODE) {
+            const fe_u8 *nul = p + 4u;
+            while (nul < end && *nul) nul++;
+            if (nul == end) return -3;
+            fe_u32 name_len = (fe_u32)(nul - (p + 4u));
+            token_size += (name_len + 1u + 3u) & ~3u;
+            if (token_size > (fe_u32)(end - p)) return -3;
+            depth++;
+            if (depth == 2u && name_len == 6u &&
+                p[4] == 'c' && p[5] == 'h' && p[6] == 'o' &&
+                p[7] == 's' && p[8] == 'e' && p[9] == 'n') {
+                chosen_found = 1;
+                chosen_depth = depth;
+            }
+        } else if (token == FDT_PROP) {
+            if (p + 12u > end) return -4;
+            fe_u32 len = be32(p + 4u);
+            fe_u32 nameoff = be32(p + 8u);
+            if (len > FDT_MAX_SIZE - 3u)
+                return -4;
+            fe_u32 padded = (len + 3u) & ~3u;
+            token_size = 12u + padded;
+            if (token_size > (fe_u32)(end - p) ||
+                nameoff >= strings_size)
+                return -4;
+            if (chosen_found && depth == chosen_depth &&
+                string_equal(strings, strings_size, nameoff, "bootargs")) {
+                if (len >= dst_capacity)
+                    return -5;
+                copy_bytes((fe_u8 *)dst, p + 12u, len);
+                if (!len || dst[len - 1u] != 0)
+                    dst[len] = 0;
+                *result_size = len && dst[len - 1u] == 0 ? len - 1u : len;
+                return 0;
+            }
+        } else if (token == FDT_END_NODE) {
+            if (!depth) return -6;
+            depth--;
+        } else if (token == FDT_NOP) {
+            token_size = 4u;
+        } else if (token == FDT_END) {
+            return 1;
+        } else {
+            return -7;
+        }
+        if (token_size > (fe_u32)(end - p))
+            return -8;
+        p += token_size;
+    }
+    return 1;
+}

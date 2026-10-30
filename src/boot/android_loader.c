@@ -357,14 +357,54 @@ static int append_text(char *dst, al_u32 capacity, al_u32 *used,
     return 0;
 }
 
-static int contains_text(const char *haystack, const char *needle)
+static int token_prefix(const char *token, al_u32 length,
+                         const char *prefix)
 {
-    for (al_u32 i = 0; haystack[i]; i++) {
-        al_u32 j = 0;
-        while (needle[j] && haystack[i + j] == needle[j])
-            j++;
-        if (!needle[j])
-            return 1;
+    al_u32 n = 0;
+    while (prefix[n]) n++;
+    if (length < n) return 0;
+    for (al_u32 i = 0; i < n; i++)
+        if (token[i] != prefix[i]) return 0;
+    return 1;
+}
+
+static int bootarg_is_slot_or_stale(const char *token, al_u32 length)
+{
+    return token_prefix(token, length, "androidboot.slot_suffix=") ||
+           token_prefix(token, length, "androidboot.slot=") ||
+           token_prefix(token, length, "root=") ||
+           token_prefix(token, length, "initrd=") ||
+           token_prefix(token, length, "rdinit=");
+}
+
+static int append_bootargs_filtered(char *dst, al_u32 capacity,
+                                    al_u32 *used, const char *src,
+                                    al_u32 src_capacity)
+{
+    al_u32 size = bounded_string_length((const al_u8 *)src, src_capacity);
+    al_u32 pos = 0;
+    while (pos < size) {
+        while (pos < size &&
+               (src[pos] == ' ' || src[pos] == '\t' ||
+                src[pos] == '\r' || src[pos] == '\n'))
+            pos++;
+        al_u32 start = pos;
+        while (pos < size && src[pos] != ' ' && src[pos] != '\t' &&
+               src[pos] != '\r' && src[pos] != '\n')
+            pos++;
+        al_u32 length = pos - start;
+        if (!length || bootarg_is_slot_or_stale(src + start, length))
+            continue;
+        if (*used) {
+            if (*used >= capacity - 1u)
+                return -1;
+            dst[(*used)++] = ' ';
+        }
+        if (length > capacity - *used - 1u)
+            return -2;
+        for (al_u32 i = 0; i < length; i++)
+            dst[(*used)++] = src[start + i];
+        dst[*used] = 0;
     }
     return 0;
 }
@@ -672,23 +712,33 @@ int android_boot_run(const struct memmap_info *map,
         return -164;
 
     cmdline[0] = 0;
+    char live_cmdline[2048];
+    al_u32 live_cmdline_size = 0;
+    rc = fdt_get_chosen_bootargs((const al_u8 *)live_dtb,
+                                 live_dtb_size, live_cmdline,
+                                 sizeof(live_cmdline), &live_cmdline_size);
+    if (!rc) {
+        if (append_bootargs_filtered(cmdline, sizeof(cmdline), &cmdline_used,
+                                     live_cmdline, live_cmdline_size))
+            return -165;
+        logf("ANDROID BOOT: preserved %d live bootargs bytes",
+             (al_u64)live_cmdline_size);
+    } else if (rc != 1) {
+        return -166 + rc;
+    }
+    if (append_bootargs_filtered(cmdline, sizeof(cmdline), &cmdline_used,
+                                 (const char *)(vendor_header + 28u), 2048u) ||
+        append_bootargs_filtered(cmdline, sizeof(cmdline), &cmdline_used,
+                                 (const char *)(boot_header + 44u), 1536u))
+        return -167;
+
+    static const al_u8 slot_suffix[] = "androidboot.slot_suffix=_a";
+    static const al_u8 slot[] = "androidboot.slot=a";
     if (append_text(cmdline, sizeof(cmdline), &cmdline_used,
-                    vendor_header + 28u, 2048u) ||
+                    slot_suffix, sizeof(slot_suffix) - 1u) ||
         append_text(cmdline, sizeof(cmdline), &cmdline_used,
-                    boot_header + 44u, 1536u))
-        return -165;
-    if (!contains_text(cmdline, "androidboot.slot_suffix=")) {
-        static const al_u8 slot_suffix[] = "androidboot.slot_suffix=_a";
-        if (append_text(cmdline, sizeof(cmdline), &cmdline_used,
-                        slot_suffix, sizeof(slot_suffix) - 1u))
-            return -166;
-    }
-    if (!contains_text(cmdline, "androidboot.slot=")) {
-        static const al_u8 slot[] = "androidboot.slot=a";
-        if (append_text(cmdline, sizeof(cmdline), &cmdline_used,
-                        slot, sizeof(slot) - 1u))
-            return -167;
-    }
+                    slot, sizeof(slot) - 1u))
+        return -168;
 
     rc = fdt_edit_android_chosen((const al_u8 *)dtb_source_addr,
                                  vendor_info.dtb_size,

@@ -202,11 +202,30 @@ static int run_case(int with_chosen)
     return 0;
 }
 
+static int run_get_bootargs(void)
+{
+    unsigned char source[2048];
+    char bootargs[64];
+    unsigned int source_size = build_dtb(source, 1);
+    unsigned int bootargs_size = 0;
+    int rc = fdt_get_chosen_bootargs(source, source_size, bootargs,
+                                     sizeof(bootargs), &bootargs_size);
+    if (rc || bootargs_size != 5u || strcmp(bootargs, "old=1"))
+        return -1;
+
+    source_size = build_dtb(source, 0);
+    rc = fdt_get_chosen_bootargs(source, source_size, bootargs,
+                                 sizeof(bootargs), &bootargs_size);
+    return rc == 1 ? 0 : -2;
+}
+
 static int run_malformed_property(void)
 {
     unsigned char source[2048], output[4096];
+    char bootargs[64];
     unsigned int source_size = build_dtb(source, 1);
     unsigned int output_size = 0;
+    unsigned int bootargs_size = 0;
 
     /* root node (8 bytes), /chosen node (12 bytes), then its first property. */
     put32(source + 80u, 0xffffffffu);
@@ -214,12 +233,15 @@ static int run_malformed_property(void)
                                      sizeof(output), "console=ttyS0",
                                      0x10000000ULL, 0x10001000ULL,
                                      &output_size);
-    return rc < 0 ? 0 : -1;
+    int get_rc = fdt_get_chosen_bootargs(source, source_size, bootargs,
+                                         sizeof(bootargs), &bootargs_size);
+    return rc < 0 && get_rc < 0 ? 0 : -1;
 }
 
 int main(void)
 {
-    if (run_case(1) || run_case(0) || run_malformed_property())
+    if (run_case(1) || run_case(0) ||
+        run_get_bootargs() || run_malformed_property())
         return 1;
     puts("FDT chosen edit tests: PASS");
     return 0;
