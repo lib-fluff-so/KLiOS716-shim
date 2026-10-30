@@ -335,3 +335,23 @@ make OUT=out-gpu-test GPU_TEST=1 GPU_POWER_TEST=0 AUTO_REBOOT_TEST=0
 - Warm-reset tests end with PSCI `SYSTEM_RESET`, not fastboot/power/watchdog
 - Commit identity: `lib-fluff-so <furbythefurby123@gmail.com>`
 - Device serial: `13016374AF000229`, product `KL7`
+
+
+## Position smoke packet correction — v9 reference comparison (2026-10-30)
+
+The no-fragment MALLOC_VERTEX_JOB packet was compared against PanVK's v9
+implementation at
+https://github.com/JimVulkan/mali-panvk/blob/d896b0a9c10b92f0f9d53ef3373006b79ed709e8/src/panfrost/vulkan/jm/panvk_v9_cmd_draw.c
+and its src/panfrost/genxml/v9.xml definitions.
+
+Corrections committed to gpu-going-forward:
+
+- Allocation: vertex_packet_stride=16, vertex_attribute_stride=0. The 16-byte packet stride is the internal position-packet layout for a draw without a secondary/varying shader. It is not the application vertex-buffer stride. The prior experiment that changed it to zero confused two distinct fields.
+- No-FS DCD flags: word 32 = 0x00810183, word 33 = 0x0000ffff. This selects forward-kill both ways, force-early pixel/Z-S update, overdraw alpha, CCW front face, scissor-to-bounding-box, full sample mask, and zero fragment render-target mask.
+- Depth/stencil descriptor word 4 = 0xe4c00000: depth cull/clip enabled, depth clamp [0,1], fixed-function depth source, ALWAYS comparison, no depth write.
+- Blend descriptor: Enable=false and Internal Blend Mode=Off.
+- Local-storage descriptor: WLS Instances must contain MALI_LOCAL_STORAGE_NO_WORKGROUP_MEM; its encoded low field is 0x1f. The smoke setup now explicitly writes this sentinel and logs it.
+
+The source now logs the local-storage sentinel, depth/stencil word 4 and blend word 2 before submitting the job. The shader still emits the same position for all three invocations. No vertex buffer has been added.
+
+This is a reference-based packet correction, not a hardware result. The updated source has not yet been built or run on the KL7. The no-input position shader still supplies a zero Resources pointer; if the next run faults, that is one of the fields to inspect against the exact fault source and machine-code path rather than adding guessed descriptors.
