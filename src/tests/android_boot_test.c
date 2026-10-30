@@ -46,7 +46,7 @@ static void inspect_boot_partition(const char *name)
     logf("ANDROID: %s v=%d kernel=%d ramdisk=%d sig=%d image=%d",
          name, (unsigned long)info.header_version,
          (unsigned long)info.kernel_size, (unsigned long)info.ramdisk_size,
-         (unsigned long)info.signature_size, (unsigned long)(unsigned long)info.image_size);
+         (unsigned long)info.signature_size, (unsigned long)info.image_size);
 
     if (info.kernel_size) {
         unsigned int block = (unsigned int)(p->first_lba +
