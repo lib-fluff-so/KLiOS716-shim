@@ -2129,7 +2129,7 @@ build_v9_empty_vs_resources(void)
 
 	/* The first 16 descriptors are NULL_DESCRIPTOR (all-zero encoding).
 	 * The dummy sampler occupies descriptor 16; Type::Sampler = 1. */
-	set[16U * 8U] = 1U;
+	set[16U * 8U] = 0x02a99901U;	/* SAMPLER defaults + Type + clamp-array=false */
 
 	/* RESOURCE[0]: address=driver set, contains_descriptors=1, size=544. */
 	res[0] = (u32)GPU_VA_VS_DRIVER_SET;
@@ -2230,6 +2230,12 @@ gpu_malloc_vertex_position_smoke_test(u32 js_present)
 	     (u64)((volatile u32 *)job_page)[42] |
 		 ((u64)((volatile u32 *)job_page)[43] << 32),
 	     (u64)((volatile u32 *)job_page)[44] & ~0xfULL);
+	logf("GPU: POS-SMOKE res0=%x/%x/%x/%x sampler=%x",
+	     (u64)((volatile u32 *)res_table_page)[0],
+	     (u64)((volatile u32 *)res_table_page)[1],
+	     (u64)((volatile u32 *)res_table_page)[2],
+	     (u64)((volatile u32 *)res_table_page)[3],
+	     (u64)((volatile u32 *)vs_driver_set_page)[16U * 8U]);
 	logf("GPU: POS-SMOKE TLS no-WLS=%x DS-word4=%x blend-word2=%x",
 	     (u64)((volatile u32 *)tls_page)[1],
 	     (u64)ds_desc[4], (u64)blend_desc[2]);
