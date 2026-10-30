@@ -16,6 +16,7 @@ typedef __builtin_va_list va_list;
 #include "xnu_payload.h"
 #include "tests/battery_test.h"
 #include "tests/touch_test.h"
+#include "tests/ufs_test.h"
 
 #ifndef RAMOOPS_LOG
 #define RAMOOPS_LOG 1
@@ -28,6 +29,9 @@ typedef __builtin_va_list va_list;
 #endif
 #ifndef TOUCH_TEST
 #define TOUCH_TEST 0
+#endif
+#ifndef UFS_TEST
+#define UFS_TEST 0
 #endif
 #ifndef AUTO_REBOOT_TEST
 #if XNU_PAYLOAD
@@ -789,6 +793,13 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
     logf("TOUCH TEST: FTS3519 driver API smoke test");
     touch_test();
     logf("TOUCH TEST: finished; halted for log capture");
+    for (;;) __asm__ volatile("wfe");
+#endif
+
+#if UFS_TEST
+    logf("UFS TEST: MTK block driver smoke test");
+    ufs_test();
+    logf("UFS TEST: finished; halted for log capture");
     for (;;) __asm__ volatile("wfe");
 #endif
 
