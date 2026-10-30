@@ -2122,9 +2122,13 @@ gpu_malloc_vertex_position_smoke_test(u32 js_present)
 		out_page2[i] = 0;
 		tiler_heap_page[i] = 0;
 		tiler_ctx_page[i] = 0;
+		tls_page[i] = 0;
 	}
-	for (u32 i = 0; i < 32768; i++)
-		tiler_data_page[i] = 0;
+
+	/* PanVK allocates a LOCAL_STORAGE descriptor for every draw, even with
+	 * no shader TLS/WLS.  Its no-workgroup-memory sentinel is log2(0x80000000)
+	 * in WLS Instances, i.e. 0x1f in word 1 bits 4:0. */
+	((volatile u32 *)tls_page)[1] = 0x1fU;
 
 	for (u32 i = 0; i < sizeof(vertex_position_smoke_code) /
 			     sizeof(vertex_position_smoke_code[0]); i++)
