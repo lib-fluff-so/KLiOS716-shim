@@ -166,3 +166,46 @@ int android_vendor_boot_parse(const unsigned char *h, ab_u64 partition_size,
         return -7;
     return 0;
 }
+
+int android_vendor_boot_parse_table(const unsigned char *data,
+                                    ab_u32 table_size, ab_u32 entry_count,
+                                    ab_u32 entry_size, ab_u32 vendor_ramdisk_size,
+                                    struct android_vendor_ramdisk_table *out)
+{
+    const ab_u32 minimum_entry_size = 108u;
+
+    if (!data || !out || entry_count > ANDROID_VENDOR_RAMDISK_MAX_ENTRIES)
+        return -1;
+    if (!entry_count) {
+        if (table_size)
+            return -2;
+        out->count = 0;
+        return 0;
+    }
+    if (entry_size < minimum_entry_size ||
+        (ab_u64)entry_count * entry_size != table_size)
+        return -3;
+
+    out->count = 0;
+    for (ab_u32 i = 0; i < entry_count; i++) {
+        const unsigned char *p = data + (ab_u64)i * entry_size;
+        struct android_vendor_ramdisk_fragment *entry = &out->entries[i];
+
+        entry->size = read_le32(p + 0u);
+        entry->offset = read_le32(p + 4u);
+        entry->type = read_le32(p + 8u);
+        if (!entry->size || entry->offset > vendor_ramdisk_size ||
+            entry->size > vendor_ramdisk_size - entry->offset)
+            return -4;
+
+        for (ab_u32 c = 0; c < 32u; c++) {
+            unsigned char ch = p[12u + c];
+            entry->name[c] = (ch >= 32u && ch < 127u) ? (char)ch : 0;
+        }
+        entry->name[32] = 0;
+        for (ab_u32 j = 0; j < 16u; j++)
+            entry->board_id[j] = read_le32(p + 44u + j * 4u);
+        out->count++;
+    }
+    return 0;
+}

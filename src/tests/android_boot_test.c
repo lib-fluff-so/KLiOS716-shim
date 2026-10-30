@@ -7,6 +7,9 @@
 static struct gpt_table table;
 static unsigned char image_header[4096] __attribute__((aligned(4096)));
 static unsigned char kernel_prefix[4096] __attribute__((aligned(4096)));
+static unsigned char vendor_dtb_header[4096] __attribute__((aligned(4096)));
+static unsigned char ramdisk_table_data[65536] __attribute__((aligned(4096)));
+static struct android_vendor_ramdisk_table ramdisk_table;
 
 static const struct gpt_partition *find(const char *name)
 {
@@ -105,6 +108,62 @@ static void inspect_vendor_partition(const char *name)
          name, (unsigned long)info.ramdisk_offset, (unsigned long)info.dtb_offset,
          (unsigned long)info.ramdisk_table_offset, (unsigned long)info.bootconfig_offset,
          (unsigned long)info.image_size);
+
+    if (info.dtb_size) {
+        unsigned int dtb_lba = (unsigned int)(p->first_lba +
+                                  info.dtb_offset / 4096u);
+        rc = mtk_ufs_read_blocks(2u, dtb_lba, 1u, vendor_dtb_header);
+        if (!rc) {
+            unsigned int magic = ((unsigned int)vendor_dtb_header[0] << 24) |
+                                 ((unsigned int)vendor_dtb_header[1] << 16) |
+                                 ((unsigned int)vendor_dtb_header[2] << 8) |
+                                 (unsigned int)vendor_dtb_header[3];
+            unsigned int total = ((unsigned int)vendor_dtb_header[4] << 24) |
+                                 ((unsigned int)vendor_dtb_header[5] << 16) |
+                                 ((unsigned int)vendor_dtb_header[6] << 8) |
+                                 (unsigned int)vendor_dtb_header[7];
+            logf("ANDROID: %s DTB magic=%x total=%x declared=%x",
+                 name, (unsigned long)magic, (unsigned long)total,
+                 (unsigned long)info.dtb_size);
+        }
+    }
+
+    if (info.ramdisk_table_size) {
+        if (info.ramdisk_table_size > sizeof(ramdisk_table_data)) {
+            logf("ANDROID: %s ramdisk table too large=%x",
+                 name, (unsigned long)info.ramdisk_table_size);
+        } else {
+            unsigned int table_lba = (unsigned int)(p->first_lba +
+                                       info.ramdisk_table_offset / 4096u);
+            unsigned int blocks =
+                (info.ramdisk_table_size + 4095u) / 4096u;
+            rc = mtk_ufs_read_blocks(2u, table_lba, blocks,
+                                     ramdisk_table_data);
+            if (!rc) {
+                rc = android_vendor_boot_parse_table(
+                    ramdisk_table_data, info.ramdisk_table_size,
+                    info.ramdisk_table_entries,
+                    info.ramdisk_table_entry_size,
+                    info.vendor_ramdisk_size, &ramdisk_table);
+                if (rc) {
+                    logf("ANDROID: %s ramdisk table invalid rc=%d",
+                         name, (unsigned long)(-rc));
+                } else {
+                    for (unsigned int i = 0; i < ramdisk_table.count; i++) {
+                        const struct android_vendor_ramdisk_fragment *entry =
+                            &ramdisk_table.entries[i];
+                        logf("ANDROID: %s ramdisk[%d] type=%d name=%s off=%x size=%x",
+                             name, (unsigned long)i, (unsigned long)entry->type,
+                             entry->name, (unsigned long)entry->offset,
+                             (unsigned long)entry->size);
+                    }
+                }
+            } else {
+                logf("ANDROID: %s ramdisk table read failed rc=%d",
+                     name, (unsigned long)(-rc));
+            }
+        }
+    }
 }
 
 void android_boot_test(void)
