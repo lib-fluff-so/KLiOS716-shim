@@ -220,6 +220,8 @@ int fdt_edit_android_chosen(const fe_u8 *src, fe_u32 source_capacity,
             if (p + 12u > end) return -9;
             fe_u32 len = be32(p + 4u);
             fe_u32 nameoff = be32(p + 8u);
+            if (len > FDT_MAX_SIZE - 3u)
+                return -9;
             fe_u32 padded = (len + 3u) & ~3u;
             token_size = 12u + padded;
             if (token_size > (fe_u32)(end - p) ||

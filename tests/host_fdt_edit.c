@@ -202,9 +202,24 @@ static int run_case(int with_chosen)
     return 0;
 }
 
+static int run_malformed_property(void)
+{
+    unsigned char source[2048], output[4096];
+    unsigned int source_size = build_dtb(source, 1);
+    unsigned int output_size = 0;
+
+    /* root node (8 bytes), /chosen node (12 bytes), then its first property. */
+    put32(source + 80u, 0xffffffffu);
+    int rc = fdt_edit_android_chosen(source, source_size, output,
+                                     sizeof(output), "console=ttyS0",
+                                     0x10000000ULL, 0x10001000ULL,
+                                     &output_size);
+    return rc < 0 ? 0 : -1;
+}
+
 int main(void)
 {
-    if (run_case(1) || run_case(0))
+    if (run_case(1) || run_case(0) || run_malformed_property())
         return 1;
     puts("FDT chosen edit tests: PASS");
     return 0;
