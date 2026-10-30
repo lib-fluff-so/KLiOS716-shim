@@ -25,3 +25,5 @@ jobs:
         run: make -j2 OUT=out-menu MENU_TEST=1 AUTO_REBOOT_TEST=0 all
       - name: Compile Android metadata inspection image
         run: make -j2 OUT=out-android ANDROID_BOOT_TEST=1 AUTO_REBOOT_TEST=0 all
+      - name: Compile every driver test path together
+        run: make -j2 OUT=out-all-tests BATTERY_TEST=1 TOUCH_TEST=1 UFS_TEST=1 MENU_TEST=1 ANDROID_BOOT_TEST=1 AUTO_REBOOT_TEST=0 all
