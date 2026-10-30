@@ -102,6 +102,36 @@ static void test_vendor_v3(void)
     expect(info.image_size == 12288, "vendor v3 total size");
 }
 
+static void test_vendor_ramdisk_table(void)
+{
+    unsigned char data[216] = {0};
+    struct android_vendor_ramdisk_table table;
+
+    put32(data + 0, 4096);
+    put32(data + 4, 0);
+    put32(data + 8, 1);
+    memcpy(data + 12, "platform", 8);
+
+    put32(data + 108, 2048);
+    put32(data + 112, 4096);
+    put32(data + 116, 3);
+    memcpy(data + 120, "dlkm", 4);
+
+    expect(android_vendor_boot_parse_table(data, sizeof(data), 2, 108,
+                                            8192, &table) == 0,
+           "vendor ramdisk table parses");
+    expect(table.count == 2, "vendor ramdisk table entry count");
+    expect(strcmp(table.entries[0].name, "platform") == 0,
+           "vendor ramdisk platform name");
+    expect(table.entries[1].type == 3 &&
+           strcmp(table.entries[1].name, "dlkm") == 0,
+           "vendor ramdisk DLKM entry");
+
+    expect(android_vendor_boot_parse_table(data, sizeof(data), 2, 108,
+                                            5000, &table) < 0,
+           "out-of-bounds vendor ramdisk fragment rejected");
+}
+
 static void test_rejections(void)
 {
     unsigned char h[4096] = {0};
@@ -136,6 +166,7 @@ int main(void)
     test_boot_v3();
     test_vendor_v4();
     test_vendor_v3();
+    test_vendor_ramdisk_table();
     test_rejections();
     puts("Android boot image parser tests: PASS");
     return 0;
