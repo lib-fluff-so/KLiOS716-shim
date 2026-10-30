@@ -138,6 +138,6 @@ For the no-secondary/no-fragment path, PanVK sets allocation to packet stride 16
 
 The packet now uses no-FS DCD flags 0x00810183 / 0x0000ffff, a no-depth-test descriptor with word 4 0xe4c00000, and a blend descriptor with Enable=false and Internal Blend Mode=Off. The LOCAL_STORAGE descriptor is initialized with the no-workgroup-memory WLS sentinel (word1 & 0x1f == 0x1f).
 
-The six-instruction shader and its same-position output are unchanged. No vertex-input descriptors or vertex buffer have been introduced. The shader environment Resources pointer is still zero and remains an explicit verification point if the job faults.
+The six-instruction shader and its same-position output are unchanged. No vertex-input descriptors or vertex buffer have been introduced. The shader environment now points at a four-entry v9 RESOURCE table. RESOURCE[0] points at a 544-byte driver set (16 null ATTRIBUTE slots plus the required dummy SAMPLER); the remaining three RESOURCE entries are empty. The dummy sampler uses the v9 default descriptor fields with clamp-integer-array disabled. The table and driver set are mapped at GPU VAs 0x400c9000 and 0x400ca000. This layout is based on PanVK's implementation and is not yet hardware-validated.
 
 These edits match the reference packet fields; they have not yet been built or validated on KL7.
