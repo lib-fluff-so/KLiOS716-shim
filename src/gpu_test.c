@@ -2185,6 +2185,9 @@ gpu_malloc_vertex_position_smoke_test(u32 js_present)
 	     (u64)((volatile u32 *)job_page)[42] |
 		 ((u64)((volatile u32 *)job_page)[43] << 32),
 	     (u64)((volatile u32 *)job_page)[44] & ~0xfULL);
+	logf("GPU: POS-SMOKE TLS no-WLS=%x DS-word4=%x blend-word2=%x",
+	     (u64)((volatile u32 *)tls_page)[1],
+	     (u64)ds_desc[4], (u64)blend_desc[2]);
 
 	gpu_tiler_heap_scan("before-POS-SMOKE");
 	rc = run_write_value_job(slot, GPU_VA_JOB, js_present, &raw);
