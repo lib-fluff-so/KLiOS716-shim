@@ -549,6 +549,8 @@ mfg_gate_on(void)
 #define GPU_VA_TILER_CTX	(GPU_VA_BASE + 0x87000ULL)
 #define GPU_VA_TILER_HEAP	(GPU_VA_BASE + 0x88000ULL)
 #define GPU_VA_TILER_DATA	(GPU_VA_BASE + 0x89000ULL)
+#define GPU_VA_RES_TABLE	(GPU_VA_BASE + 0xc9000ULL)
+#define GPU_VA_VS_DRIVER_SET	(GPU_VA_BASE + 0xca000ULL)
 #define GPU_TILER_HEAP_SIZE	0x40000ULL	/* 256 KiB */
 #define GPU_VA_FB		(GPU_VA_BASE + 0x4000ULL)
 #define GPU_VA_FAULT		(GPU_VA_BASE + 0x100000ULL)
@@ -581,6 +583,9 @@ static u64 tiler_ctx_page[512] __attribute__((aligned(4096)));
 static u64 tiler_heap_page[512] __attribute__((aligned(4096)));
 /* 256 KiB tiler heap, matching the descriptor's 256 KiB chunk size. */
 static u64 tiler_data_page[32768] __attribute__((aligned(4096)));
+/* Minimal PanVK-compatible VS resource table and driver descriptor set. */
+static u64 res_table_page[512] __attribute__((aligned(4096)));
+static u64 vs_driver_set_page[512] __attribute__((aligned(4096)));
 /* 64x64 RGBA8 render target: four contiguous 4 KiB pages. */
 static u64 fb_page[2048] __attribute__((aligned(4096)));
 /* Set once the final clear-only fragment job has produced the readback that
@@ -950,10 +955,13 @@ build_page_tables(void)
 	u64 tctx = phys_addr(tiler_ctx_page);
 	u64 theap = phys_addr(tiler_heap_page);
 	u64 tdata = phys_addr(tiler_data_page);
+	u64 res = phys_addr(res_table_page);
+	u64 vs_set = phys_addr(vs_driver_set_page);
 	u64 fb = phys_addr(fb_page);
 
 	if ((l0 | l1 | l2 | l3 | job | out | job2 | out2 | shader | cjob |
-	     tls | snop | sdesc | fbd | fjob | tctx | theap | tdata | fb) &
+	     tls | snop | sdesc | fbd | fjob | tctx | theap | tdata | res |
+	     vs_set | fb) &
 	    0xfffULL) {
 		logf("GPU: page table/BO is not 4K aligned: %x %x %x",
 		     l0, job, out);
@@ -980,6 +988,8 @@ build_page_tables(void)
 		frag_job_page[i] = 0;
 		tiler_ctx_page[i] = 0;
 		tiler_heap_page[i] = 0;
+		res_table_page[i] = 0;
+		vs_driver_set_page[i] = 0;
 	}
 	for (u32 i = 0; i < 2048; i++)
 		fb_page[i] = 0;
@@ -1004,6 +1014,8 @@ build_page_tables(void)
 	pt_l3[0x88] = theap | MMU_PTE_PAGE;
 	for (u32 i = 0; i < 64; i++)
 		pt_l3[0x89 + i] = (tdata + i * 0x1000ULL) | MMU_PTE_PAGE;
+	pt_l3[0xc9] = res | MMU_PTE_PAGE;
+	pt_l3[0xca] = vs_set | MMU_PTE_PAGE;
 	pt_l3[4] = fb | MMU_PTE_PAGE;
 	pt_l3[5] = (fb + 0x1000ULL) | MMU_PTE_PAGE;
 	pt_l3[6] = (fb + 0x2000ULL) | MMU_PTE_PAGE;
@@ -1019,8 +1031,9 @@ build_page_tables(void)
 	     pt_l3[0x82], pt_l3[0x83], pt_l3[0x84]);
 	logf("GPU: PTE fbd=%x fjob=%x fb=%x/%x/%x/%x", pt_l3[0x85],
 	     pt_l3[0x86], pt_l3[4], pt_l3[5], pt_l3[6], pt_l3[7]);
-	logf("GPU: PTE tiler ctx=%x heap=%x data=%x/%x", pt_l3[0x87],
-	     pt_l3[0x88], pt_l3[0x89], pt_l3[0xc8]);
+	logf("GPU: PTE tiler ctx=%x heap=%x data=%x/%x res=%x set=%x",
+	     pt_l3[0x87], pt_l3[0x88], pt_l3[0x89], pt_l3[0xc8],
+	     pt_l3[0xc9], pt_l3[0xca]);
 	return 0;
 }
 
@@ -2058,12 +2071,12 @@ build_malloc_vertex_job(u64 *page)
 	h[44] = (u32)(GPU_VA_OUT2 | 1ULL);	/* blend count=1, address=OUT2 */
 	h[45] = (u32)(GPU_VA_OUT2 >> 32);
 
-	/* Position shader environment at byte offset 256:
-	 * resources=0, shader=GPU_VA_SHADER_DESC, TLS=GPU_VA_TLS, FAU=0. */
+	/* Position shader environment at byte offset 256. Four resource-table
+	 * entries are required by the v9 ABI; entry 0 points at the VS driver set. */
 	h[64] = 0;	/* attribute offset */
 	h[65] = 0;	/* FAU count */
-	h[72] = 0;	/* resources low */
-	h[73] = 0;	/* resources high */
+	h[72] = (u32)(GPU_VA_RES_TABLE | 4ULL);	/* resources + table count */
+	h[73] = (u32)((GPU_VA_RES_TABLE | 4ULL) >> 32);
 	h[74] = (u32)GPU_VA_SHADER_DESC;
 	h[75] = (u32)(GPU_VA_SHADER_DESC >> 32);
 	h[76] = (u32)GPU_VA_TLS;
@@ -2098,6 +2111,33 @@ gpu_tiler_heap_scan(const char *tag)
 	     tag, (u64)nonzero, (u64)first_offset, first_value);
 }
 
+/* PanVK v9's no-input VS still receives a four-entry RESOURCE table.
+ * Resource 0 points at a 17-descriptor driver set: 16 null vertex attributes
+ * followed by the mandatory dummy sampler. The remaining three RESOURCE
+ * entries are empty. PANVK_DESCRIPTOR_SIZE is 32 bytes. */
+static void
+build_v9_empty_vs_resources(void)
+{
+	volatile u32 *set = (volatile u32 *)vs_driver_set_page;
+	volatile u32 *res = (volatile u32 *)res_table_page;
+	const u32 driver_set_bytes = 17U * 32U;
+
+	for (u32 i = 0; i < 1024; i++) {
+		set[i] = 0;
+		res[i] = 0;
+	}
+
+	/* The first 16 descriptors are NULL_DESCRIPTOR (all-zero encoding).
+	 * The dummy sampler occupies descriptor 16; Type::Sampler = 1. */
+	set[16U * 8U] = 1U;
+
+	/* RESOURCE[0]: address=driver set, contains_descriptors=1, size=544. */
+	res[0] = (u32)GPU_VA_VS_DRIVER_SET;
+	res[1] = (u32)(GPU_VA_VS_DRIVER_SET >> 32) | (1U << 24);
+	res[2] = driver_set_bytes;
+	res[3] = 0;
+}
+
 static int
 gpu_malloc_vertex_position_smoke_test(u32 js_present)
 {
@@ -2123,6 +2163,8 @@ gpu_malloc_vertex_position_smoke_test(u32 js_present)
 		tiler_heap_page[i] = 0;
 		tiler_ctx_page[i] = 0;
 		tls_page[i] = 0;
+		res_table_page[i] = 0;
+		vs_driver_set_page[i] = 0;
 	}
 
 	/* PanVK allocates a LOCAL_STORAGE descriptor for every draw, even with
@@ -2142,6 +2184,7 @@ gpu_malloc_vertex_position_smoke_test(u32 js_present)
 	ds_desc[4] = (1U << 22) | (1U << 23) | (2U << 25) | (7U << 29);
 	blend_desc[0] = 0U;	/* Blend Enable=false */
 	blend_desc[2] = 3U;	/* Internal Blend Mode::Off */
+	build_v9_empty_vs_resources();
 	build_tiler_heap_desc(tiler_heap_page, GPU_VA_TILER_DATA,
 			      GPU_TILER_HEAP_SIZE);
 	build_tiler_context(tiler_ctx_page, GPU_VA_TILER_HEAP, 64U, 64U);
@@ -2177,7 +2220,9 @@ gpu_malloc_vertex_position_smoke_test(u32 js_present)
 		 ((u64)((volatile u32 *)job_page)[15] << 32),
 	     (u64)((volatile u32 *)job_page)[26],
 	     (u64)((volatile u32 *)job_page)[27]);
-	logf("GPU: POS-SMOKE position shader=%w tls=%w ds=%w blend=%w",
+	logf("GPU: POS-SMOKE resources=%w position shader=%w tls=%w ds=%w blend=%w",
+	     (u64)((volatile u32 *)job_page)[72] |
+		 ((u64)((volatile u32 *)job_page)[73] << 32),
 	     (u64)((volatile u32 *)job_page)[74] |
 		 ((u64)((volatile u32 *)job_page)[75] << 32),
 	     (u64)((volatile u32 *)job_page)[76] |
