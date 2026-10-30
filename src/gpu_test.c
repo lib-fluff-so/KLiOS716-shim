@@ -631,8 +631,8 @@ static const u64 vertex_position_smoke_code[] = {
 	0x0110c100000000c0ULL,
 	0x0110c200000000c0ULL,
 	0x0110c300000000d0ULL,
-	0x085e840400000d7bULL,
-	0x10c0000000000000ULL,	/* NOP.wait1: consume LEA_VARY slot 1 */
+	0x085e840440000d7bULL,
+	0x1000000000000000ULL,	/* NOP.wait1: consume LEA_VARY slot 1 */
 	0x7861400839000044ULL,
 };
 static u64 bo_pool[BO_POOL_PAGES][512] __attribute__((aligned(4096)));
