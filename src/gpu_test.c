@@ -614,17 +614,17 @@ static const u64 compute_nop_code[] = {
 };
 
 /*
- * Valhall v9 position-store smoke shader, assembled from these instructions:
+ * Valhall v9 position-store smoke shader:
  *   IADD_IMM.i32 r0, 0x0, #0x00000000
  *   IADD_IMM.i32 r1, 0x0, #0x00000000
  *   IADD_IMM.i32 r2, 0x0, #0x00000000
  *   IADD_IMM.i32 r3, 0x3F800000, #0x00000000
- *   LEA_VARY.slot0.wait0 @r4:r5, `r59, unk:0xD
+ *   LEA_VARY.slot1.wait0 @r4:r5, `r59, unk:0xD
+ *   NOP.wait1
  *   STORE.i128.pos.slot0.return @r0:r1:r2:r3, `r4, offset:0
  *
- * Every invocation writes a valid clip-space (0,0,0,1) position. The three
- * vertices are intentionally coincident: this only validates position output
- * and job acceptance; a visible triangle requires a later per-vertex input.
+ * LEA_VARY writes r4:r5 asynchronously on slot 1. NOP.wait1 is mandatory
+ * before STORE reads r4 as its 64-bit position-buffer address.
  */
 static const u64 vertex_position_smoke_code[] = {
 	0x0110c000000000c0ULL,
@@ -632,6 +632,7 @@ static const u64 vertex_position_smoke_code[] = {
 	0x0110c200000000c0ULL,
 	0x0110c300000000d0ULL,
 	0x085e840400000d7bULL,
+	0x10c0000000000000ULL,	/* NOP.wait1: consume LEA_VARY slot 1 */
 	0x7861400839000044ULL,
 };
 static u64 bo_pool[BO_POOL_PAGES][512] __attribute__((aligned(4096)));
