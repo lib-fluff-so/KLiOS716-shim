@@ -623,7 +623,7 @@ static const u64 compute_nop_code[] = {
  *   NOP.wait1
  *   STORE.i128.pos.slot0.return @r0:r1:r2:r3, `r4, offset:0
  *
- * LEA_VARY writes r4:r5 asynchronously on slot 1. NOP.wait1 is mandatory
+ * LEA_BUF_IMM writes r4:r5 asynchronously on slot 1. NOP.wait1 is mandatory
  * before STORE reads r4 as its 64-bit position-buffer address.
  */
 static const u64 vertex_position_smoke_code[] = {
@@ -2055,7 +2055,7 @@ build_malloc_vertex_job(u64 *page)
 
 	/* Draw state: packet mode lets hardware fill vertex-array pointer/stride. */
 	/* Mesa PanVK v9 no-fragment-shader defaults: force-early pixel/Z-S updates,
-	 * forward kill both ways, overdraw alpha, CCW front face, scissor bbox.
+	 * forward kill both ways, overdraw alpha and CCW front face.
 	 * No fragment shader writes a render target, so RT mask is zero. */
 	h[32] = 0x00010183U;	/* DCD_FLAGS_0: no-FS Mesa defaults */
 	h[33] = 0x0000ffffU;	/* DCD_FLAGS_1: sample mask only */
@@ -2065,9 +2065,8 @@ build_malloc_vertex_job(u64 *page)
 	h[38] = 0;		/* minimum Z */
 	h[39] = 0x3f800000U;	/* maximum Z = 1.0f */
 
-	/* Valid, mapped dummy depth/stencil and blend descriptors. These are
-	 * only needed to make the packet structurally complete; no fragment job
-	 * is submitted by this probe. */
+	/* Valid, mapped dummy depth/stencil descriptor. With no fragment shader,
+	 * Panfrost leaves DRAW.Blend count and pointer zero. */
 	h[42] = (u32)GPU_VA_OUT;
 	h[43] = (u32)(GPU_VA_OUT >> 32);
 	h[44] = 0;		/* no fragment shader: no blend descriptor */
