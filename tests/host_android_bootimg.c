@@ -66,9 +66,13 @@ static void test_vendor_v4(void)
     memcpy(h, "VNDRBOOT", 8);
     put32(h + 8, 4);
     put32(h + 12, 4096);
+    put32(h + 16, 0x40080000u);
+    put32(h + 20, 0x45000000u);
     put32(h + 24, 5000);
     put32(h + 2096, 2128);
     put32(h + 2100, 1000);
+    put32(h + 2104, 0x4fe00000u);
+    put32(h + 2108, 1u);
     put32(h + 2112, 216);
     put32(h + 2116, 2);
     put32(h + 2120, 108);
@@ -76,6 +80,9 @@ static void test_vendor_v4(void)
 
     expect(android_vendor_boot_parse(h, 65536, &info) == 0,
            "vendor boot v4 parses");
+    expect(info.kernel_addr == 0x40080000u, "vendor v4 kernel address");
+    expect(info.ramdisk_addr == 0x45000000u, "vendor v4 ramdisk address");
+    expect(info.dtb_addr == 0x14fe00000ULL, "vendor v4 DTB address");
     expect(info.ramdisk_offset == 4096, "vendor v4 ramdisk offset");
     expect(info.dtb_offset == 12288, "vendor v4 DTB offset");
     expect(info.ramdisk_table_offset == 16384, "vendor v4 table offset");
