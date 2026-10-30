@@ -14,6 +14,8 @@ typedef __builtin_va_list va_list;
 #include "memmap.h"
 #include "loader.h"
 #include "xnu_payload.h"
+#include "boot/boot_menu.h"
+#include "boot/android_loader.h"
 #include "tests/battery_test.h"
 #include "tests/touch_test.h"
 #include "tests/ufs_test.h"
@@ -40,6 +42,12 @@ typedef __builtin_va_list va_list;
 #endif
 #ifndef ANDROID_BOOT_TEST
 #define ANDROID_BOOT_TEST 0
+#endif
+#ifndef DUALBOOT
+#define DUALBOOT 0
+#endif
+#if DUALBOOT && !XNU_PAYLOAD
+#error "DUALBOOT=1 requires XNU_PAYLOAD=1 and an iOS kernel payload"
 #endif
 #ifndef AUTO_REBOOT_TEST
 #if XNU_PAYLOAD
@@ -856,6 +864,23 @@ void shim_main(u64 dtb_address, u64 x1, u64 x2, u64 x3, u64 shim_base)
     rc = get_initrd(dtb, dtb_size, &initrd_start, &initrd_end);
     if (rc) fail("initrd range missing, malformed, or outside RAM", rc);
     logf("initrd: %x..%x size=%x", initrd_start, initrd_end, initrd_end - initrd_start);
+
+#if DUALBOOT
+    enum boot_choice choice = BOOT_CHOICE_IOS;
+    logf("DUALBOOT: opening touchscreen selector");
+    rc = boot_menu_select(&choice);
+    if (rc)
+        fail("touchscreen boot menu failed", rc);
+    if (choice == BOOT_CHOICE_ANDROID) {
+        logf("DUALBOOT: Android slot A selected");
+        rc = android_boot_run(&memory_map, dtb_address, dtb_size,
+                              initrd_start, initrd_end, shim_base);
+        fail("Android slot A boot handoff failed", rc);
+    }
+    if (choice != BOOT_CHOICE_IOS)
+        fail("boot menu returned an invalid choice", -1);
+    logf("DUALBOOT: iOS selected; continuing XNU payload loader");
+#endif
 
     const loader_u8 *payload_file = 0;
     u32 payload_file_size = 0;

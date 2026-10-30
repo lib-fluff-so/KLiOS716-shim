@@ -20,7 +20,9 @@ jobs:
         run: |
           make clean
           make -j2 all
-          make hosttest loadertest xnutest androidimgtest
+          make hosttest loadertest xnutest androidimgtest androidkerneltest fdttest
+      - name: Compile production dualboot loader and XNU route
+        run: make -j2 OUT=out-dualboot DUALBOOT=1 XNU_PAYLOAD=1 out-dualboot/shim.elf
       - name: Compile touch-menu image
         run: make -j2 OUT=out-menu MENU_TEST=1 AUTO_REBOOT_TEST=0 all
       - name: Compile Android metadata inspection image

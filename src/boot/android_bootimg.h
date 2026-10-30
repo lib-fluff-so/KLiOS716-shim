@@ -34,6 +34,9 @@ struct android_vendor_ramdisk_table {
 
 struct android_vendor_boot_info {
     ab_u32 header_version;
+    ab_u32 kernel_addr;
+    ab_u32 ramdisk_addr;
+    ab_u64 dtb_addr;
     ab_u32 header_size;
     ab_u32 page_size;
     ab_u32 vendor_ramdisk_size;

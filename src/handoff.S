@@ -24,3 +24,31 @@ transfer_to_payload:
     isb
     br      x16
     .size transfer_to_payload, . - transfer_to_payload
+
+/* Linux arm64 Image entry: x0 = physical DTB, x1-x3 = zero.
+ * The shim was entered with MMU and caches disabled; keep that state. */
+    .balign 16
+    .globl transfer_to_linux
+    .type transfer_to_linux, %function
+transfer_to_linux:
+    mov     x16, x0
+    mov     x0, x1
+    mov     x1, xzr
+    mov     x2, xzr
+    mov     x3, xzr
+    msr     daifset, #0xf
+    dsb     sy
+    tlbi    vmalle1
+    dsb     sy
+    isb
+    mrs     x4, sctlr_el1
+    bic     x4, x4, #1
+    bic     x4, x4, #4
+    bic     x4, x4, #0x1000
+    msr     sctlr_el1, x4
+    isb
+    ic      iallu
+    dsb     sy
+    isb
+    br      x16
+    .size transfer_to_linux, . - transfer_to_linux

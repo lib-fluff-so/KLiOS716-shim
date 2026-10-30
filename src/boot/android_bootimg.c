@@ -104,6 +104,10 @@ int android_vendor_boot_parse(const unsigned char *h, ab_u64 partition_size,
     out->header_version = version;
     out->header_size = header_size;
     out->page_size = page_size;
+    out->kernel_addr = read_le32(h + 16u);
+    out->ramdisk_addr = read_le32(h + 20u);
+    out->dtb_addr = (ab_u64)read_le32(h + 2104u) |
+                    ((ab_u64)read_le32(h + 2108u) << 32);
     out->vendor_ramdisk_size = read_le32(h + 24u);
     out->dtb_size = read_le32(h + 2100u);
     out->ramdisk_table_size = version == 4u ? read_le32(h + 2112u) : 0u;
